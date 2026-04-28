@@ -1,0 +1,33 @@
+[project]
+name = "evalguard-evaluators"
+version = "0.0.1"
+description = "Built-in evaluators (heuristics, metrics, judges, providers) for EvalGuard."
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [{ name = "EvalGuard contributors" }]
+dependencies = [
+  "jsonschema>=4.21",
+  "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+openai = ["openai>=1.40"]
+
+[project.entry-points."evalguard.evaluators"]
+"heuristic.json_schema" = "evalguard_evaluators.heuristics.json_schema:JsonSchemaHeuristic"
+"heuristic.not_contains" = "evalguard_evaluators.heuristics.not_contains:NotContainsHeuristic"
+"heuristic.length" = "evalguard_evaluators.heuristics.length:LengthHeuristic"
+"judge.pointwise" = "evalguard_evaluators.judges.pointwise:PointwiseJudge"
+"judge.mock_pointwise" = "evalguard_evaluators.judges.pointwise:MockPointwiseJudge"
+
+[project.entry-points."evalguard.providers"]
+"openai" = "evalguard_evaluators.providers.openai_provider:OpenAIProvider"
+"ollama" = "evalguard_evaluators.providers.ollama_provider:OllamaProvider"
+"mock" = "evalguard_evaluators.providers.mock_provider:MockProvider"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["evalguard_evaluators"]

@@ -1,0 +1,47 @@
+version: 1
+project: quickstart-summarizer
+template: text_gen
+
+providers:
+  # Default: offline deterministic provider. Swap to `openai`, `ollama`,
+  # or any OpenAI-compatible local server by editing this block.
+  - id: mock:fake-summary
+    config:
+      mode: json_summary
+
+prompts:
+  - id: summarize_v1
+    file: prompts/summarize.md
+
+datasets:
+  - id: news_golden
+    file: datasets/news.jsonl
+
+heuristics:
+  - type: json_schema
+    schema_file: schemas/summary.json
+  - type: length
+    max: 600
+    unit: chars
+  - type: not_contains
+    value: "As an AI"
+
+judges:
+  - id: helpfulness_v3
+    type: mock_pointwise   # offline judge with a fixed score for reproducibility
+    score: 4.5
+    threshold: 4.0
+
+gates:
+  - name: pr_gate
+    blocking: true
+    rules:
+      - { metric: pass_rate,                op: ">=", value: 0.95 }
+      - { metric: helpfulness_v3.mean,      op: ">=", value: 4.0  }
+      - { metric: cost_usd,                 op: "<=", value: 2.00 }
+
+cache:
+  dir: .evalguard/cache
+  enabled: true
+
+concurrency: 4

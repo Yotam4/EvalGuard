@@ -1,0 +1,43 @@
+version: 1
+project: my-project
+template: text_gen
+
+providers:
+  - id: mock:default
+    config: { mode: json_summary }
+  # Real providers — uncomment and configure as needed:
+  # - id: openai:gpt-4o-mini
+  # - id: ollama:llama3.2:3b
+  #   config: { base_url: http://localhost:11434 }
+  # - id: openai:llama3.2:3b
+  #   config: { base_url: http://localhost:11434/v1 }
+
+prompts:
+  - id: default
+    file: prompts/main.md
+
+datasets:
+  - id: golden
+    file: datasets/golden.jsonl
+
+heuristics:
+  - type: length
+    max: 1000
+  - type: not_contains
+    value: "As an AI"
+
+judges:
+  - id: quality
+    type: mock_pointwise
+    score: 4.5
+    threshold: 4.0
+
+gates:
+  - name: pr_gate
+    blocking: true
+    rules:
+      - { metric: pass_rate,        op: ">=", value: 0.90 }
+      - { metric: quality.mean,     op: ">=", value: 4.0  }
+
+cache: { dir: .evalguard/cache, enabled: true }
+concurrency: 4

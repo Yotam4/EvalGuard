@@ -1,0 +1,2 @@
+{"id": "ex1", "input": "What's the capital of France?", "expected": "Paris", "tags": ["normal"]}
+{"id": "ex2", "input": "Write a haiku about evals.", "expected": null, "tags": ["normal"]}
