@@ -22,6 +22,7 @@ from typing import Any
 
 from evalguard_cli.console import console
 from evalguard_cli.local.cache import ContentCache
+from evalguard_cli.local.gate import LAYER_INDEX
 from evalguard_cli.local.sqlite_store import SqliteStore
 from evalguard_cli.local.yaml_loader import LoadedConfig
 from evalguard_evaluators import EvalContext, ProviderResult, Score
@@ -60,6 +61,21 @@ async def execute(
     heuristic_evaluators = _build_evaluators(cfg.raw.get("heuristics", []), default_kind="heuristic")
     metric_evaluators = _build_evaluators(cfg.raw.get("metrics", []), default_kind="metric")
     judge_evaluators = _build_evaluators(cfg.raw.get("judges", []), default_kind="judge")
+
+    # Group evaluators by their .layer attribute so we can run them in
+    # pyramid order (1 → 5) and short-circuit on a per-row basis.
+    evaluators_by_layer: dict[int, list[Any]] = {}
+    for ev in heuristic_evaluators + metric_evaluators + judge_evaluators:
+        evaluators_by_layer.setdefault(int(ev.layer), []).append(ev)
+    layer_order = sorted(evaluators_by_layer)
+
+    run_mode = cfg.raw.get("run_mode", "short_circuit_blocking_only")
+    layer_gates = cfg.raw.get("layers") or {}
+    blocking_layer_idxs: set[int] = {
+        LAYER_INDEX[name]
+        for name, gate in layer_gates.items()
+        if gate.get("severity", "block") == "block" and name in LAYER_INDEX
+    }
 
     if not cfg.dataset_rows:
         raise ValueError("at least one dataset is required")
@@ -134,10 +150,16 @@ async def execute(
             )
 
             scores: list[Score] = []
-            for ev in heuristic_evaluators + metric_evaluators:
-                scores.extend(await ev.evaluate(ctx))
-            for ev in judge_evaluators:
-                scores.extend(await ev.evaluate(ctx))
+            short_circuited_at: int | None = None
+            for layer in layer_order:
+                layer_scores: list[Score] = []
+                for ev in evaluators_by_layer[layer]:
+                    layer_scores.extend(await ev.evaluate(ctx))
+                scores.extend(layer_scores)
+                layer_failed = any(not s.passed for s in layer_scores)
+                if layer_failed and _should_short_circuit(run_mode, layer, blocking_layer_idxs):
+                    short_circuited_at = layer
+                    break
 
             row_passed = all(s.passed for s in scores) if scores else True
             store.insert_row(
@@ -150,7 +172,12 @@ async def execute(
             store.insert_scores(run_id, row_id, [_score_to_dict(s) for s in scores])
             if not quiet:
                 marker = "[green]✓[/green]" if row_passed else "[red]✗[/red]"
-                console.print(f"  {marker} {row_id}  ({len(scores)} scores)")
+                tail = ""
+                if short_circuited_at is not None:
+                    skipped = [str(l) for l in layer_order if l > short_circuited_at]
+                    if skipped:
+                        tail = f"  [dim](short-circuit at L{short_circuited_at}; skipped L{','.join(skipped)})[/dim]"
+                console.print(f"  {marker} {row_id}  ({len(scores)} scores){tail}")
             if fail_fast and not row_passed:
                 aborted.set()
             return pr.cost_usd, row_passed, True
@@ -190,6 +217,21 @@ async def execute(
         row_count=len(rows), row_pass_count=pass_count, row_fail_count=fail_count,
         cost_usd=cost_total, row_status=row_status,
     )
+
+
+def _should_short_circuit(run_mode: str, layer: int, blocking_layer_idxs: set[int]) -> bool:
+    """Decide whether a failure at ``layer`` should skip later layers.
+
+    - ``always``: never short-circuit — every layer always runs.
+    - ``short_circuit``: any layer's failure skips later layers.
+    - ``short_circuit_blocking_only``: skip later layers only when the
+      failed layer carries a block-severity gate (default).
+    """
+    if run_mode == "always":
+        return False
+    if run_mode == "short_circuit":
+        return True
+    return layer in blocking_layer_idxs
 
 
 def _build_evaluators(specs: list[dict[str, Any]], default_kind: str) -> list[Any]:

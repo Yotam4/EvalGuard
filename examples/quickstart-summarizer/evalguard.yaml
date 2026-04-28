@@ -32,13 +32,27 @@ judges:
     score: 4.5
     threshold: 4.0
 
-gates:
-  - name: pr_gate
-    blocking: true
-    rules:
-      - { metric: pass_rate,                op: ">=", value: 0.95 }
-      - { metric: helpfulness_v3.mean,      op: ">=", value: 4.0  }
-      - { metric: cost_usd,                 op: "<=", value: 2.00 }
+# Layer-interaction policy. With ``short_circuit_blocking_only`` (the
+# default), a row that fails a block-severity gate at an earlier layer
+# skips the expensive judge calls for later layers — saving real $ in CI.
+run_mode: short_circuit_blocking_only
+
+# Per-layer gates. Each pyramid step has its own controllable gate
+# with severity ``block`` | ``warn`` | ``log``.
+layers:
+  heuristics:                       # Layer 1 — structural correctness
+    severity: block
+    aggregation: pass_rate
+    threshold: { min: 1.0 }         # zero tolerance for format errors
+
+  judge_offline:                    # Layer 3 — quality rubric on golden set
+    severity: block
+    aggregation: pass_rate_by_tag
+    threshold:
+      min: 0.90
+      per_tag_overrides:
+        normal: 0.95
+        edge:   0.80                # adversarial cases get more slack
 
 cache:
   dir: .evalguard/cache

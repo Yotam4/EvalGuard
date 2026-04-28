@@ -32,12 +32,18 @@ judges:
     score: 4.5
     threshold: 4.0
 
-gates:
-  - name: pr_gate
-    blocking: true
-    rules:
-      - { metric: pass_rate,        op: ">=", value: 0.90 }
-      - { metric: quality.mean,     op: ">=", value: 4.0  }
+run_mode: short_circuit_blocking_only
+
+layers:
+  heuristics:
+    severity: block
+    aggregation: pass_rate
+    threshold: { min: 1.0 }
+
+  judge_offline:
+    severity: block
+    aggregation: pass_rate
+    threshold: { min: 0.90 }
 
 cache: { dir: .evalguard/cache, enabled: true }
 concurrency: 4

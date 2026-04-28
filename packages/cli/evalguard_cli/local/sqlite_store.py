@@ -70,6 +70,8 @@ CREATE TABLE IF NOT EXISTS gate_results (
   gate_name     TEXT NOT NULL,
   blocking      INTEGER NOT NULL,
   passed        INTEGER NOT NULL,
+  severity      TEXT,
+  layer         INTEGER,
   details_json  TEXT
 );
 
@@ -88,12 +90,14 @@ CREATE INDEX IF NOT EXISTS idx_assets_run ON assets(run_id);
 # Idempotent migrations for existing local.db files. Each entry is
 # (table, column, ddl-fragment); attempted in order, ignoring duplicates.
 _MIGRATIONS: list[tuple[str, str, str]] = [
-    ("runs",     "row_status",     "TEXT"),
-    ("runs",     "gate_status",    "TEXT"),
-    ("runs",     "row_pass_count", "INTEGER DEFAULT 0"),
-    ("runs",     "row_fail_count", "INTEGER DEFAULT 0"),
-    ("runs",     "assets_json",    "TEXT"),
-    ("run_rows", "tags_json",      "TEXT"),
+    ("runs",         "row_status",     "TEXT"),
+    ("runs",         "gate_status",    "TEXT"),
+    ("runs",         "row_pass_count", "INTEGER DEFAULT 0"),
+    ("runs",         "row_fail_count", "INTEGER DEFAULT 0"),
+    ("runs",         "assets_json",    "TEXT"),
+    ("run_rows",     "tags_json",      "TEXT"),
+    ("gate_results", "severity",       "TEXT"),
+    ("gate_results", "layer",          "INTEGER"),
 ]
 
 
@@ -227,10 +231,16 @@ class SqliteStore:
     def save_gate_results(self, run_id: str, results: list[Any]) -> None:
         with self._conn() as c:
             c.executemany(
-                """INSERT INTO gate_results(run_id,gate_name,blocking,passed,details_json)
-                   VALUES (?,?,?,?,?)""",
+                """INSERT INTO gate_results(
+                       run_id,gate_name,blocking,passed,severity,layer,details_json)
+                   VALUES (?,?,?,?,?,?,?)""",
                 [
-                    (run_id, g.name, int(g.blocking), int(g.passed), json.dumps(g.details))
+                    (
+                        run_id, g.name, int(g.blocking), int(g.passed),
+                        getattr(g, "severity", "block"),
+                        getattr(g, "layer", None),
+                        json.dumps(g.details),
+                    )
                     for g in results
                 ],
             )
@@ -296,20 +306,27 @@ class SqliteStore:
                 (run_id,),
             ):
                 layer = int(r["layer"])
-                # row-level pass: rows where every score at this layer passed
-                row_pass = c.execute(
+                # rows that ran this layer (denominator) and rows where every
+                # score at this layer passed (numerator). Short-circuited
+                # rows simply don't appear in either set.
+                rows_in_layer = int(c.execute(
+                    "SELECT COUNT(DISTINCT row_id) AS n FROM scores WHERE run_id=? AND layer=?",
+                    (run_id, layer),
+                ).fetchone()["n"] or 0)
+                row_pass = int(c.execute(
                     """SELECT COUNT(DISTINCT row_id) AS n_pass FROM scores
                        WHERE run_id=? AND layer=?
                        AND row_id NOT IN (
                          SELECT row_id FROM scores WHERE run_id=? AND layer=? AND passed=0
                        )""",
                     (run_id, layer, run_id, layer),
-                ).fetchone()["n_pass"]
+                ).fetchone()["n_pass"] or 0)
                 evaluators = sorted(e for e, l in evaluator_layer.items() if l == layer)
                 by_layer[layer] = {
                     "mean": float(r["mean"] or 0.0),
                     "pass_rate": float(r["pass_rate"] or 0.0),
-                    "row_pass_rate": float(row_pass / n_rows) if n_rows else 0.0,
+                    "row_pass_rate": (row_pass / rows_in_layer) if rows_in_layer else 0.0,
+                    "rows_evaluated": rows_in_layer,
                     "n": int(r["n"]),
                     "evaluators": evaluators,
                 }
@@ -368,7 +385,8 @@ class SqliteStore:
     def get_gate_results(self, run_id: str) -> list[dict[str, Any]]:
         with self._conn() as c:
             rows = c.execute(
-                "SELECT gate_name, blocking, passed, details_json FROM gate_results WHERE run_id=?",
+                """SELECT gate_name, blocking, passed, severity, layer, details_json
+                   FROM gate_results WHERE run_id=?""",
                 (run_id,),
             ).fetchall()
         return [
@@ -376,6 +394,8 @@ class SqliteStore:
                 "gate_name": r["gate_name"],
                 "blocking": bool(r["blocking"]),
                 "passed": bool(r["passed"]),
+                "severity": r["severity"] or ("block" if r["blocking"] else "warn"),
+                "layer": r["layer"],
                 "details": json.loads(r["details_json"] or "[]"),
             }
             for r in rows

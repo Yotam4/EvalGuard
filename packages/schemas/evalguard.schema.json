@@ -92,6 +92,7 @@
     },
     "gates": {
       "type": "array",
+      "description": "Legacy global gates. Per-layer gates under top-level 'layers' supersede this; both shapes are accepted simultaneously.",
       "items": {
         "type": "object",
         "required": ["name", "rules"],
@@ -99,32 +100,85 @@
         "properties": {
           "name": { "type": "string" },
           "blocking": { "type": "boolean", "default": true },
+          "severity": { "type": "string", "enum": ["block", "warn", "log"] },
           "rules": {
             "type": "array",
             "minItems": 1,
-            "items": {
-              "type": "object",
-              "required": ["metric", "op", "value"],
-              "additionalProperties": false,
-              "properties": {
-                "metric": { "type": "string" },
-                "op": { "type": "string", "enum": [">=", "<=", ">", "<", "==", "!="] },
-                "value": { "type": "number" }
-              }
-            }
+            "items": { "$ref": "#/$defs/rule" }
           }
         }
+      }
+    },
+    "run_mode": {
+      "type": "string",
+      "enum": ["always", "short_circuit", "short_circuit_blocking_only"],
+      "default": "short_circuit_blocking_only",
+      "description": "Layer-interaction policy. 'always' runs every layer; 'short_circuit' aborts on any layer fail; 'short_circuit_blocking_only' (default) skips later layers only when an upstream block-severity gate fails."
+    },
+    "layers": {
+      "type": "object",
+      "description": "Per-layer gates. Keys are stable layer names: heuristics, metrics, judge_offline, judge_online, human.",
+      "additionalProperties": false,
+      "properties": {
+        "heuristics":     { "$ref": "#/$defs/layerGate" },
+        "metrics":        { "$ref": "#/$defs/layerGate" },
+        "judge_offline":  { "$ref": "#/$defs/layerGate" },
+        "judge_online":   { "$ref": "#/$defs/layerGate" },
+        "human":          { "$ref": "#/$defs/layerGate" }
       }
     },
     "cache": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "dir": { "type": "string", "default": ".evalguard/cache" },
+        "dir":     { "type": "string", "default": ".evalguard/cache" },
         "enabled": { "type": "boolean", "default": true }
       }
     },
     "concurrency": { "type": "integer", "minimum": 1, "default": 8 },
     "cost_cap_usd": { "type": "number", "minimum": 0 }
+  },
+  "$defs": {
+    "rule": {
+      "type": "object",
+      "required": ["metric", "op", "value"],
+      "additionalProperties": false,
+      "properties": {
+        "metric": { "type": "string" },
+        "op":     { "type": "string", "enum": [">=", "<=", ">", "<", "==", "!="] },
+        "value":  { "type": "number" }
+      }
+    },
+    "layerGate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["severity"],
+      "properties": {
+        "severity":   { "type": "string", "enum": ["block", "warn", "log"] },
+        "aggregation": {
+          "type": "string",
+          "enum": ["pass_rate", "row_pass_rate", "mean", "p50", "p95", "count_failures", "pass_rate_by_tag"],
+          "default": "pass_rate"
+        },
+        "evaluator":  {
+          "type": "string",
+          "description": "Optional: scope this gate to a single evaluator id rather than the layer roll-up."
+        },
+        "threshold": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type":              { "type": "string", "enum": ["absolute"], "default": "absolute" },
+            "min":               { "type": "number" },
+            "max":               { "type": "number" },
+            "per_tag_overrides": { "type": "object", "additionalProperties": { "type": "number" } }
+          }
+        },
+        "rules": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/rule" }
+        }
+      }
+    }
   }
 }

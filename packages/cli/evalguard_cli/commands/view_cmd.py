@@ -44,7 +44,14 @@ def view(
         if gate_results:
             console.print()
             console.print(format_gate_report([
-                GateResult(g["gate_name"], g["blocking"], g["passed"], g["details"])
+                GateResult(
+                    name=g["gate_name"],
+                    blocking=g["blocking"],
+                    passed=g["passed"],
+                    details=g["details"],
+                    severity=g.get("severity") or ("block" if g["blocking"] else "warn"),
+                    layer=g.get("layer"),
+                )
                 for g in gate_results
             ]))
         return

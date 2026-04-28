@@ -45,15 +45,16 @@ def run(
     metrics = store.compute_metrics(run_record.run_id)
     render_run_table(run_record, metrics, console=console)
 
-    gates = cfg.raw.get("gates") or []
-    gate_results = evaluate_gates(gates, metrics)
+    legacy_gates = cfg.raw.get("gates") or []
+    layer_gates = cfg.raw.get("layers") or {}
+    gate_results = evaluate_gates(legacy_gates, metrics, layers=layer_gates)
     store.save_gate_results(run_record.run_id, gate_results)
     if gate_results:
         console.print()
         console.print(format_gate_report(gate_results))
 
-    blocking_failed = any(g.passed is False and g.blocking for g in gate_results)
-    warned = any(g.passed is False and not g.blocking for g in gate_results)
+    blocking_failed = any(g.passed is False and g.severity == "block" for g in gate_results)
+    warned = any(g.passed is False and g.severity == "warn" for g in gate_results)
     gate_status = "failed" if blocking_failed else ("warned" if warned else ("passed" if gate_results else "none"))
 
     if run_record.row_status == "cost_capped":
