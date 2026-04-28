@@ -6,15 +6,13 @@ import asyncio
 from pathlib import Path
 
 import typer
-from rich.console import Console
 
+from evalguard_cli.console import console
 from evalguard_cli.local.gate import evaluate_gates, format_gate_report
 from evalguard_cli.local.local_executor import execute
 from evalguard_cli.local.report import render_run_table
 from evalguard_cli.local.sqlite_store import SqliteStore
 from evalguard_cli.local.yaml_loader import load_config
-
-console = Console()
 
 EXIT_PASS = 0
 EXIT_GATE_FAIL = 2
@@ -30,7 +28,7 @@ def run(
     """Run the eval pipeline against the local executor."""
     try:
         cfg = load_config(config)
-    except Exception as e:  # noqa: BLE001 - surface user-facing errors clearly
+    except Exception as e:  # noqa: BLE001 - user-facing surface
         console.print(f"[red]config error:[/red] {e}")
         raise typer.Exit(EXIT_INFRA_ERROR) from e
 
@@ -50,8 +48,36 @@ def run(
     gates = cfg.raw.get("gates") or []
     gate_results = evaluate_gates(gates, metrics)
     store.save_gate_results(run_record.run_id, gate_results)
-    console.print()
-    console.print(format_gate_report(gate_results))
+    if gate_results:
+        console.print()
+        console.print(format_gate_report(gate_results))
 
     blocking_failed = any(g.passed is False and g.blocking for g in gate_results)
+    warned = any(g.passed is False and not g.blocking for g in gate_results)
+    gate_status = "failed" if blocking_failed else ("warned" if warned else ("passed" if gate_results else "none"))
+
+    if run_record.row_status == "cost_capped":
+        overall = "cost_capped"
+    elif run_record.row_status == "failed":
+        overall = "row_failed"
+    elif blocking_failed:
+        overall = "gate_failed"
+    elif warned:
+        overall = "warned"
+    else:
+        overall = "passed"
+    store.finalize_run(run_record.run_id, status=overall, gate_status=gate_status)
+
+    console.print(f"\n[bold]overall:[/bold] {_pretty(overall)}")
     raise typer.Exit(EXIT_GATE_FAIL if blocking_failed else EXIT_PASS)
+
+
+def _pretty(status: str) -> str:
+    color = {
+        "passed":     "green",
+        "warned":     "yellow",
+        "row_failed": "red",
+        "gate_failed":"red",
+        "cost_capped":"yellow",
+    }.get(status, "white")
+    return f"[{color}]{status}[/{color}]"

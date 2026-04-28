@@ -1,4 +1,10 @@
-"""SQLite store mirroring the server's run/score schema (minus tenancy)."""
+"""SQLite store mirroring the server's run/score schema (minus tenancy).
+
+Status semantics:
+    runs.row_status   "passed" | "failed" | "error" | "cost_capped" — set by the executor.
+    runs.gate_status  "passed" | "failed" | "warned" | "none" — set by the gate evaluator.
+    runs.status       overall outcome computed at ``finalize_run`` time.
+"""
 
 from __future__ import annotations
 
@@ -12,14 +18,19 @@ from typing import Any, Iterator
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
-  run_id        TEXT PRIMARY KEY,
-  project       TEXT NOT NULL,
-  config_hash   TEXT NOT NULL,
-  status        TEXT NOT NULL,
-  started_at    TEXT NOT NULL,
-  finished_at   TEXT,
-  cost_usd      REAL DEFAULT 0,
-  row_count     INTEGER DEFAULT 0
+  run_id          TEXT PRIMARY KEY,
+  project         TEXT NOT NULL,
+  config_hash     TEXT NOT NULL,
+  status          TEXT,
+  row_status      TEXT,
+  gate_status     TEXT,
+  started_at      TEXT NOT NULL,
+  finished_at     TEXT,
+  cost_usd        REAL DEFAULT 0,
+  row_count       INTEGER DEFAULT 0,
+  row_pass_count  INTEGER DEFAULT 0,
+  row_fail_count  INTEGER DEFAULT 0,
+  assets_json     TEXT
 );
 
 CREATE TABLE IF NOT EXISTS run_rows (
@@ -33,7 +44,8 @@ CREATE TABLE IF NOT EXISTS run_rows (
   model           TEXT,
   cost_usd        REAL DEFAULT 0,
   latency_ms      INTEGER DEFAULT 0,
-  cache_hit       INTEGER DEFAULT 0
+  cache_hit       INTEGER DEFAULT 0,
+  tags_json       TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_run_rows_run ON run_rows(run_id);
 
@@ -50,6 +62,7 @@ CREATE TABLE IF NOT EXISTS scores (
 );
 CREATE INDEX IF NOT EXISTS idx_scores_run ON scores(run_id);
 CREATE INDEX IF NOT EXISTS idx_scores_eval ON scores(run_id, evaluator_id);
+CREATE INDEX IF NOT EXISTS idx_scores_layer ON scores(run_id, layer);
 
 CREATE TABLE IF NOT EXISTS gate_results (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -59,7 +72,29 @@ CREATE TABLE IF NOT EXISTS gate_results (
   passed        INTEGER NOT NULL,
   details_json  TEXT
 );
+
+CREATE TABLE IF NOT EXISTS assets (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id        TEXT NOT NULL,
+  kind          TEXT NOT NULL,
+  asset_id      TEXT NOT NULL,
+  version_id    TEXT NOT NULL,
+  source        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_assets_run ON assets(run_id);
 """
+
+
+# Idempotent migrations for existing local.db files. Each entry is
+# (table, column, ddl-fragment); attempted in order, ignoring duplicates.
+_MIGRATIONS: list[tuple[str, str, str]] = [
+    ("runs",     "row_status",     "TEXT"),
+    ("runs",     "gate_status",    "TEXT"),
+    ("runs",     "row_pass_count", "INTEGER DEFAULT 0"),
+    ("runs",     "row_fail_count", "INTEGER DEFAULT 0"),
+    ("runs",     "assets_json",    "TEXT"),
+    ("run_rows", "tags_json",      "TEXT"),
+]
 
 
 class SqliteStore:
@@ -81,20 +116,55 @@ class SqliteStore:
     def init_schema(self) -> None:
         with self._conn() as c:
             c.executescript(_SCHEMA)
+            for table, col, ddl in _MIGRATIONS:
+                cols = {row["name"] for row in c.execute(f"PRAGMA table_info({table})")}
+                if col not in cols:
+                    c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
 
-    def start_run(self, run_id: str, project: str, config_hash: str) -> None:
+    # --- run lifecycle -----------------------------------------------------
+
+    def start_run(self, run_id: str, project: str, config_hash: str, assets: list[Any] | None = None) -> None:
+        assets_json = json.dumps([_asset_to_dict(a) for a in (assets or [])]) if assets else None
         with self._conn() as c:
             c.execute(
-                "INSERT INTO runs(run_id, project, config_hash, status, started_at) VALUES (?,?,?,?,?)",
-                (run_id, project, config_hash, "running", _now_iso()),
+                """INSERT INTO runs(run_id, project, config_hash, started_at, status, assets_json)
+                   VALUES (?,?,?,?,?,?)""",
+                (run_id, project, config_hash, _now_iso(), "running", assets_json),
             )
+            if assets:
+                c.executemany(
+                    "INSERT INTO assets(run_id,kind,asset_id,version_id,source) VALUES (?,?,?,?,?)",
+                    [(run_id, a.kind, a.asset_id, a.version_id, a.source) for a in assets],
+                )
 
-    def finish_run(self, run_id: str, *, status: str, cost_usd: float, row_count: int) -> None:
+    def record_row_results(
+        self,
+        run_id: str,
+        *,
+        row_status: str,
+        cost_usd: float,
+        row_count: int,
+        row_pass_count: int,
+        row_fail_count: int,
+    ) -> None:
+        """Called by the executor when row processing finishes."""
         with self._conn() as c:
             c.execute(
-                "UPDATE runs SET status=?, finished_at=?, cost_usd=?, row_count=? WHERE run_id=?",
-                (status, _now_iso(), cost_usd, row_count, run_id),
+                """UPDATE runs SET row_status=?, cost_usd=?, row_count=?,
+                                  row_pass_count=?, row_fail_count=?
+                   WHERE run_id=?""",
+                (row_status, cost_usd, row_count, row_pass_count, row_fail_count, run_id),
             )
+
+    def finalize_run(self, run_id: str, *, status: str, gate_status: str) -> None:
+        """Called by the CLI after gate evaluation; sets the final outcome."""
+        with self._conn() as c:
+            c.execute(
+                "UPDATE runs SET status=?, gate_status=?, finished_at=? WHERE run_id=?",
+                (status, gate_status, _now_iso(), run_id),
+            )
+
+    # --- per-row writers ---------------------------------------------------
 
     def insert_row(
         self,
@@ -109,13 +179,14 @@ class SqliteStore:
         cost_usd: float,
         latency_ms: int,
         cache_hit: bool,
+        tags: list[str] | None = None,
     ) -> None:
         with self._conn() as c:
             c.execute(
                 """INSERT INTO run_rows(
                        run_id,row_id,input_json,expected_json,output,provider,model,
-                       cost_usd,latency_ms,cache_hit)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                       cost_usd,latency_ms,cache_hit,tags_json)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     run_id,
                     row_id,
@@ -127,6 +198,7 @@ class SqliteStore:
                     cost_usd,
                     latency_ms,
                     int(cache_hit),
+                    json.dumps(tags or []),
                 ),
             )
 
@@ -163,42 +235,127 @@ class SqliteStore:
                 ],
             )
 
-    def compute_metrics(self, run_id: str) -> dict[str, float]:
-        """Build a flat metrics dict consumable by the gate evaluator."""
+    # --- metrics -----------------------------------------------------------
+
+    def compute_metrics(self, run_id: str) -> dict[str, Any]:
+        """Build a structured metrics dict consumable by gate rules.
+
+        Returns a flat surface (back-compat with global-gate rules) plus
+        ``by_evaluator`` and ``by_layer`` sub-dicts so per-layer gates can
+        target a layer or a specific evaluator family.
+        """
         with self._conn() as c:
             row_total = c.execute(
                 "SELECT COUNT(*) AS n, COALESCE(SUM(cost_usd),0) AS cost FROM run_rows WHERE run_id=?",
                 (run_id,),
             ).fetchone()
-            n_rows = row_total["n"] or 0
+            n_rows = int(row_total["n"] or 0)
             cost = float(row_total["cost"] or 0.0)
 
-            # pass_rate = fraction of rows where every score on that row passed
             pass_rate = 0.0
             if n_rows:
-                failed_rows = c.execute(
-                    """SELECT COUNT(DISTINCT row_id) AS f FROM scores
-                       WHERE run_id=? AND passed=0""",
-                    (run_id,),
-                ).fetchone()["f"] or 0
+                failed_rows = int(
+                    c.execute(
+                        "SELECT COUNT(DISTINCT row_id) AS f FROM scores WHERE run_id=? AND passed=0",
+                        (run_id,),
+                    ).fetchone()["f"] or 0
+                )
                 pass_rate = (n_rows - failed_rows) / n_rows
 
-            # per-evaluator means
-            evaluator_means: dict[str, float] = {}
+            by_evaluator: dict[str, dict[str, float]] = {}
+            evaluator_layer: dict[str, int] = {}
             for r in c.execute(
-                """SELECT evaluator_id, AVG(value) AS mean, AVG(passed) AS pass_rate
+                """SELECT evaluator_id, evaluator_kind, layer,
+                          AVG(value)  AS mean,
+                          AVG(passed) AS pass_rate,
+                          COUNT(*)    AS n,
+                          SUM(CASE WHEN passed=0 THEN 1 ELSE 0 END) AS fail_count
                    FROM scores WHERE run_id=? GROUP BY evaluator_id""",
                 (run_id,),
             ):
-                evaluator_means[f"{r['evaluator_id']}.mean"] = float(r["mean"] or 0.0)
-                evaluator_means[f"{r['evaluator_id']}.pass_rate"] = float(r["pass_rate"] or 0.0)
+                ev = r["evaluator_id"]
+                evaluator_layer[ev] = int(r["layer"])
+                by_evaluator[ev] = {
+                    "kind": r["evaluator_kind"],
+                    "layer": int(r["layer"]),
+                    "mean": float(r["mean"] or 0.0),
+                    "pass_rate": float(r["pass_rate"] or 0.0),
+                    "n": int(r["n"]),
+                    "fail_count": int(r["fail_count"] or 0),
+                }
 
-        return {
+            # Per-layer roll-up: pass_rate = fraction of rows where every
+            # evaluator at that layer passed.
+            by_layer: dict[int, dict[str, Any]] = {}
+            for r in c.execute(
+                """SELECT layer,
+                          AVG(value)  AS mean,
+                          AVG(passed) AS pass_rate,
+                          COUNT(*)    AS n
+                   FROM scores WHERE run_id=? GROUP BY layer""",
+                (run_id,),
+            ):
+                layer = int(r["layer"])
+                # row-level pass: rows where every score at this layer passed
+                row_pass = c.execute(
+                    """SELECT COUNT(DISTINCT row_id) AS n_pass FROM scores
+                       WHERE run_id=? AND layer=?
+                       AND row_id NOT IN (
+                         SELECT row_id FROM scores WHERE run_id=? AND layer=? AND passed=0
+                       )""",
+                    (run_id, layer, run_id, layer),
+                ).fetchone()["n_pass"]
+                evaluators = sorted(e for e, l in evaluator_layer.items() if l == layer)
+                by_layer[layer] = {
+                    "mean": float(r["mean"] or 0.0),
+                    "pass_rate": float(r["pass_rate"] or 0.0),
+                    "row_pass_rate": float(row_pass / n_rows) if n_rows else 0.0,
+                    "n": int(r["n"]),
+                    "evaluators": evaluators,
+                }
+
+            # pass_rate_by_tag — built by joining scores to run_rows.tags_json
+            by_tag: dict[str, dict[str, Any]] = {}
+            tagged_rows = c.execute(
+                "SELECT row_id, tags_json FROM run_rows WHERE run_id=?",
+                (run_id,),
+            ).fetchall()
+            row_tags = {r["row_id"]: json.loads(r["tags_json"] or "[]") for r in tagged_rows}
+            for row_id, tags in row_tags.items():
+                row_failed = bool(
+                    c.execute(
+                        "SELECT 1 FROM scores WHERE run_id=? AND row_id=? AND passed=0 LIMIT 1",
+                        (run_id, row_id),
+                    ).fetchone()
+                )
+                for tag in tags:
+                    bucket = by_tag.setdefault(tag, {"n": 0, "passed": 0})
+                    bucket["n"] += 1
+                    if not row_failed:
+                        bucket["passed"] += 1
+            for tag, agg in by_tag.items():
+                agg["pass_rate"] = (agg["passed"] / agg["n"]) if agg["n"] else 0.0
+
+        # Flat keys for back-compat with the global-gate rule shape
+        flat: dict[str, Any] = {
             "row_count": float(n_rows),
             "cost_usd": cost,
             "pass_rate": pass_rate,
-            **evaluator_means,
         }
+        for ev, agg in by_evaluator.items():
+            flat[f"{ev}.mean"] = agg["mean"]
+            flat[f"{ev}.pass_rate"] = agg["pass_rate"]
+        for layer, agg in by_layer.items():
+            flat[f"layer{layer}.pass_rate"] = agg["pass_rate"]
+            flat[f"layer{layer}.row_pass_rate"] = agg["row_pass_rate"]
+            flat[f"layer{layer}.mean"] = agg["mean"]
+
+        flat["by_evaluator"] = by_evaluator
+        flat["by_layer"] = by_layer
+        flat["by_tag"] = by_tag
+        return flat
+
+    # --- read helpers ------------------------------------------------------
 
     def list_runs(self, limit: int = 10) -> list[dict[str, Any]]:
         with self._conn() as c:
@@ -207,6 +364,26 @@ class SqliteStore:
                 (limit,),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def get_gate_results(self, run_id: str) -> list[dict[str, Any]]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT gate_name, blocking, passed, details_json FROM gate_results WHERE run_id=?",
+                (run_id,),
+            ).fetchall()
+        return [
+            {
+                "gate_name": r["gate_name"],
+                "blocking": bool(r["blocking"]),
+                "passed": bool(r["passed"]),
+                "details": json.loads(r["details_json"] or "[]"),
+            }
+            for r in rows
+        ]
+
+
+def _asset_to_dict(a: Any) -> dict[str, Any]:
+    return {"kind": a.kind, "asset_id": a.asset_id, "version_id": a.version_id, "source": a.source}
 
 
 def _now_iso() -> str:

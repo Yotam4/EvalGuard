@@ -5,12 +5,11 @@ from __future__ import annotations
 from pathlib import Path
 
 import typer
-from rich.console import Console
 from rich.table import Table
 
+from evalguard_cli.console import console
+from evalguard_cli.local.gate import GateResult, format_gate_report
 from evalguard_cli.local.sqlite_store import SqliteStore
-
-console = Console()
 
 
 def view(
@@ -31,9 +30,23 @@ def view(
     if last:
         last_run = runs[0]
         metrics = store.compute_metrics(last_run["run_id"])
-        console.print(f"[bold]Run {last_run['run_id']}[/bold]  status={last_run['status']}")
+        gate_results = store.get_gate_results(last_run["run_id"])
+        console.print(
+            f"[bold]Run {last_run['run_id']}[/bold]  "
+            f"status={_color_status(last_run.get('status'))}  "
+            f"row_status={last_run.get('row_status')}  "
+            f"gate_status={last_run.get('gate_status')}"
+        )
         for k, v in metrics.items():
+            if k in {"by_evaluator", "by_layer", "by_tag"}:
+                continue
             console.print(f"  {k}: {v}")
+        if gate_results:
+            console.print()
+            console.print(format_gate_report([
+                GateResult(g["gate_name"], g["blocking"], g["passed"], g["details"])
+                for g in gate_results
+            ]))
         return
 
     table = Table(title="EvalGuard runs")
@@ -43,12 +56,24 @@ def view(
     table.add_column("rows", justify="right")
     table.add_column("cost_usd", justify="right")
     for r in runs:
-        status_style = "green" if r["status"] == "passed" else ("red" if r["status"] == "failed" else "yellow")
         table.add_row(
             r["run_id"],
             r["started_at"],
-            f"[{status_style}]{r['status']}[/{status_style}]",
-            str(r["row_count"]),
-            f"${r['cost_usd']:.4f}",
+            _color_status(r.get("status")),
+            str(r.get("row_count") or 0),
+            f"${(r.get('cost_usd') or 0.0):.4f}",
         )
     console.print(table)
+
+
+def _color_status(status: str | None) -> str:
+    color = {
+        "passed":      "green",
+        "warned":      "yellow",
+        "row_failed":  "red",
+        "gate_failed": "red",
+        "cost_capped": "yellow",
+        None:          "dim",
+        "running":     "dim",
+    }.get(status, "white")
+    return f"[{color}]{status or '-'}[/{color}]"

@@ -33,11 +33,27 @@ class OpenAIProvider:
         self._api_key: str | None = None
         self._base_url: str | None = None
         self._default_params: dict[str, Any] = {}
+        self._client: Any = None  # AsyncOpenAI, lazy-init in _get_client()
 
     def configure(self, cfg: dict[str, Any]) -> None:
         self._api_key = cfg.get("api_key") or os.environ.get("OPENAI_API_KEY")
         self._base_url = cfg.get("base_url")
         self._default_params = {k: v for k, v in cfg.items() if k not in {"api_key", "base_url"}}
+        self._client = None  # invalidate on reconfigure
+
+    def _get_client(self) -> Any:
+        if self._client is not None:
+            return self._client
+        try:
+            from openai import AsyncOpenAI
+        except ImportError as e:
+            raise RuntimeError(
+                "openai SDK not installed. `pip install evalguard-evaluators[openai]`"
+            ) from e
+        if not self._api_key and not self._base_url:
+            raise RuntimeError("OPENAI_API_KEY not set and no api_key in provider config")
+        self._client = AsyncOpenAI(api_key=self._api_key or "local", base_url=self._base_url)
+        return self._client
 
     async def complete(
         self,
@@ -46,17 +62,7 @@ class OpenAIProvider:
         model: str,
         params: dict[str, Any] | None = None,
     ) -> ProviderResult:
-        try:
-            from openai import AsyncOpenAI
-        except ImportError as e:
-            raise RuntimeError(
-                "openai SDK not installed. `pip install evalguard-evaluators[openai]`"
-            ) from e
-        # Local OpenAI-compatible servers usually don't require auth; only
-        # demand a key when talking to api.openai.com directly.
-        if not self._api_key and not self._base_url:
-            raise RuntimeError("OPENAI_API_KEY not set and no api_key in provider config")
-        client = AsyncOpenAI(api_key=self._api_key or "local", base_url=self._base_url)
+        client = self._get_client()
         merged = {**self._default_params, **(params or {})}
         start = time.monotonic()
         resp = await client.chat.completions.create(

@@ -6,9 +6,8 @@ import shutil
 from pathlib import Path
 
 import typer
-from rich.console import Console
 
-console = Console()
+from evalguard_cli.console import console
 
 
 def init(

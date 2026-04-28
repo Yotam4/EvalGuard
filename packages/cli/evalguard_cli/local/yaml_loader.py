@@ -1,7 +1,14 @@
-"""Validate and load ``evalguard.yaml`` plus the assets it references."""
+"""Validate and load ``evalguard.yaml`` plus the assets it references.
+
+Each asset (prompt, dataset, judge, heuristic, schema, rubric) is given a
+``version_id = sha256(content)``. The top-level ``config_hash`` covers the
+canonical YAML; individual asset hashes flow into ``LoadedConfig.assets``
+so per-asset regression diffs are possible later.
+"""
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from dataclasses import dataclass, field
@@ -11,19 +18,30 @@ from typing import Any
 import jsonschema
 import yaml
 
+from evalguard_cli.local.resolver import Resolver
+
+
+@dataclass
+class AssetVersion:
+    kind: str          # "prompt" | "dataset" | "judge" | "heuristic" | "schema" | "rubric"
+    asset_id: str      # config-declared id (or synthesized for inline assets)
+    version_id: str    # sha256 of canonicalised content
+    source: str        # "file:relative/path" | "inline" | "ref:registry://..."
+
 
 @dataclass
 class LoadedConfig:
     """Resolved config — file paths replaced with content, hashes computed."""
 
     project: str
-    raw: dict[str, Any]
+    raw: dict[str, Any]                 # original parsed YAML (post-validation)
+    resolved: dict[str, Any]            # YAML with all file refs inlined
     config_path: Path
     base_dir: Path
     config_hash: str
-    prompts: dict[str, str] = field(default_factory=dict)            # id -> template body
+    prompts: dict[str, str] = field(default_factory=dict)
     dataset_rows: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
-    schemas: dict[str, dict[str, Any]] = field(default_factory=dict)
+    assets: list[AssetVersion] = field(default_factory=list)
 
 
 def load_config(path: Path) -> LoadedConfig:
@@ -39,45 +57,123 @@ def load_config(path: Path) -> LoadedConfig:
     jsonschema.validate(data, schema)
 
     base = path.parent
-    prompts = _load_prompts(data.get("prompts", []), base)
-    datasets = _load_datasets(data.get("datasets", []), base)
+    resolver = Resolver(base)
+    resolved = copy.deepcopy(data)
+    assets: list[AssetVersion] = []
 
-    config_hash = hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
+    prompts = _load_prompts(resolved.get("prompts", []), resolver, assets)
+    datasets = _load_datasets(resolved.get("datasets", []), resolver, base, assets)
+    _inline_evaluator_files(resolved.get("heuristics", []), resolver, base, assets, kind="heuristic")
+    _inline_evaluator_files(resolved.get("metrics", []), resolver, base, assets, kind="metric")
+    _inline_evaluator_files(resolved.get("judges", []), resolver, base, assets, kind="judge")
+
+    config_hash = _sha256_canonical(resolved)
     return LoadedConfig(
-        project=data["project"],
-        raw=data,
+        project=resolved["project"],
+        raw=resolved,
+        resolved=resolved,
         config_path=path,
         base_dir=base,
         config_hash=config_hash,
         prompts=prompts,
         dataset_rows=datasets,
+        assets=assets,
     )
 
 
-def _load_prompts(specs: list[dict[str, Any]], base: Path) -> dict[str, str]:
+def _load_prompts(specs: list[dict[str, Any]], resolver: Resolver, assets: list[AssetVersion]) -> dict[str, str]:
     out: dict[str, str] = {}
-    for s in specs:
-        if "template" in s:
-            out[s["id"]] = s["template"]
-        else:
-            out[s["id"]] = (base / s["file"]).read_text()
+    for spec in specs:
+        body = resolver.resolve_text({k: spec[k] for k in spec if k in {"file", "content", "ref", "template"}}
+                                     if "template" not in spec
+                                     else {"content": spec["template"]})
+        version_id = _sha256_text(body)
+        out[spec["id"]] = body
+        source = _source_label(spec)
+        assets.append(AssetVersion("prompt", spec["id"], version_id, source))
+        spec["template"] = body          # inline so the rest of the system never re-reads
+        spec["version_id"] = version_id
+        spec.pop("file", None)
     return out
 
 
-def _load_datasets(specs: list[dict[str, Any]], base: Path) -> dict[str, list[dict[str, Any]]]:
+def _load_datasets(
+    specs: list[dict[str, Any]], resolver: Resolver, base: Path, assets: list[AssetVersion]
+) -> dict[str, list[dict[str, Any]]]:
     out: dict[str, list[dict[str, Any]]] = {}
-    for s in specs:
-        rows = []
-        with (base / s["file"]).open() as f:
-            for line in f:
-                line = line.strip()
-                if not line:
+    for spec in specs:
+        rel = spec["file"]
+        rows: list[dict[str, Any]] = []
+        path = (base / rel).resolve()
+        with path.open() as f:
+            for lineno, line in enumerate(f, start=1):
+                stripped = line.strip()
+                if not stripped:
                     continue
-                rows.append(json.loads(line))
-        if "limit" in s:
-            rows = rows[: int(s["limit"])]
-        out[s["id"]] = rows
+                try:
+                    rows.append(json.loads(stripped))
+                except json.JSONDecodeError as e:
+                    raise ValueError(f"{rel}:{lineno}: invalid JSON ({e.msg}) at col {e.colno}") from e
+        if "limit" in spec:
+            rows = rows[: int(spec["limit"])]
+        version_id = _sha256_canonical(rows)
+        out[spec["id"]] = rows
+        assets.append(AssetVersion("dataset", spec["id"], version_id, f"file:{rel}"))
+        spec["row_count"] = len(rows)
+        spec["version_id"] = version_id
     return out
+
+
+def _inline_evaluator_files(
+    specs: list[dict[str, Any]],
+    resolver: Resolver,
+    base: Path,
+    assets: list[AssetVersion],
+    *,
+    kind: str,
+) -> None:
+    """Replace ``schema_file`` / ``rubric_file`` with inline ``schema`` / ``rubric``.
+
+    Evaluators receive content directly and never touch the filesystem; this
+    is the seam that lets us swap to ``ref://`` refs without changing any
+    evaluator code.
+    """
+    for spec in specs:
+        ev_id = spec.get("id", spec.get("type", kind))
+        if "schema_file" in spec:
+            blob = resolver.resolve_text({"file": spec["schema_file"]})
+            schema_obj = json.loads(blob)
+            v = _sha256_canonical(schema_obj)
+            assets.append(AssetVersion("schema", ev_id, v, f"file:{spec['schema_file']}"))
+            spec["schema"] = schema_obj
+            spec["schema_version_id"] = v
+            spec.pop("schema_file")
+        if "rubric_file" in spec:
+            blob = resolver.resolve_text({"file": spec["rubric_file"]})
+            v = _sha256_text(blob)
+            assets.append(AssetVersion("rubric", ev_id, v, f"file:{spec['rubric_file']}"))
+            spec["rubric"] = blob
+            spec["rubric_version_id"] = v
+            spec.pop("rubric_file")
+        # Hash the final spec (post-inlining) so evaluator versions track config + assets.
+        spec["version_id"] = _sha256_canonical({k: v for k, v in spec.items() if k != "version_id"})
+        assets.append(AssetVersion(kind, ev_id, spec["version_id"], "inline"))
+
+
+def _source_label(spec: dict[str, Any]) -> str:
+    if "file" in spec:
+        return f"file:{spec['file']}"
+    if "ref" in spec:
+        return f"ref:{spec['ref']}"
+    return "inline"
+
+
+def _sha256_text(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def _sha256_canonical(value: Any) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
 
 def _schema_path() -> Path:

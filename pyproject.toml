@@ -10,3 +10,8 @@ members = ["packages/cli", "packages/evaluators"]
 [tool.uv.sources]
 evalguard = { workspace = true }
 evalguard-evaluators = { workspace = true }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+asyncio_mode = "strict"
