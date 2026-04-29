@@ -1,5 +1,13 @@
 """SQLite store mirroring the server's run/score schema (minus tenancy).
 
+Hierarchy (each level addressable on its own ID, mirrors the future API
+shape so the JSON contract stays stable from CLI to server to UI):
+
+    run
+     └─ trial          one (provider × prompt) execution
+         └─ run_row    one dataset row evaluated by that trial
+             └─ score  one evaluator output for that row
+
 Status semantics:
     runs.row_status   "passed" | "failed" | "error" | "cost_capped" — set by the executor.
     runs.gate_status  "passed" | "failed" | "warned" | "none" — set by the gate evaluator.
@@ -33,9 +41,30 @@ CREATE TABLE IF NOT EXISTS runs (
   assets_json     TEXT
 );
 
+CREATE TABLE IF NOT EXISTS trials (
+  trial_id          TEXT PRIMARY KEY,
+  run_id            TEXT NOT NULL REFERENCES runs(run_id),
+  provider_id       TEXT NOT NULL,
+  provider          TEXT NOT NULL,
+  model             TEXT NOT NULL,
+  prompt_id         TEXT,
+  prompt_version_id TEXT,
+  config_json       TEXT,
+  row_count         INTEGER DEFAULT 0,
+  row_pass_count    INTEGER DEFAULT 0,
+  row_fail_count    INTEGER DEFAULT 0,
+  cost_usd          REAL DEFAULT 0,
+  status            TEXT,
+  gate_status       TEXT,
+  started_at        TEXT NOT NULL,
+  finished_at       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_trials_run ON trials(run_id);
+
 CREATE TABLE IF NOT EXISTS run_rows (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id          TEXT NOT NULL REFERENCES runs(run_id),
+  trial_id        TEXT,
   row_id          TEXT NOT NULL,
   input_json      TEXT,
   expected_json   TEXT,
@@ -48,10 +77,12 @@ CREATE TABLE IF NOT EXISTS run_rows (
   tags_json       TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_run_rows_run ON run_rows(run_id);
+CREATE INDEX IF NOT EXISTS idx_run_rows_trial ON run_rows(trial_id);
 
 CREATE TABLE IF NOT EXISTS scores (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id          TEXT NOT NULL,
+  trial_id        TEXT,
   row_id          TEXT NOT NULL,
   evaluator_id    TEXT NOT NULL,
   evaluator_kind  TEXT NOT NULL,
@@ -61,12 +92,14 @@ CREATE TABLE IF NOT EXISTS scores (
   raw_json        TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_scores_run ON scores(run_id);
+CREATE INDEX IF NOT EXISTS idx_scores_trial ON scores(trial_id);
 CREATE INDEX IF NOT EXISTS idx_scores_eval ON scores(run_id, evaluator_id);
 CREATE INDEX IF NOT EXISTS idx_scores_layer ON scores(run_id, layer);
 
 CREATE TABLE IF NOT EXISTS gate_results (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id        TEXT NOT NULL,
+  trial_id      TEXT,
   gate_name     TEXT NOT NULL,
   blocking      INTEGER NOT NULL,
   passed        INTEGER NOT NULL,
@@ -74,6 +107,7 @@ CREATE TABLE IF NOT EXISTS gate_results (
   layer         INTEGER,
   details_json  TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_gate_trial ON gate_results(trial_id);
 
 CREATE TABLE IF NOT EXISTS assets (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -96,8 +130,11 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ("runs",         "row_fail_count", "INTEGER DEFAULT 0"),
     ("runs",         "assets_json",    "TEXT"),
     ("run_rows",     "tags_json",      "TEXT"),
+    ("run_rows",     "trial_id",       "TEXT"),
+    ("scores",       "trial_id",       "TEXT"),
     ("gate_results", "severity",       "TEXT"),
     ("gate_results", "layer",          "INTEGER"),
+    ("gate_results", "trial_id",       "TEXT"),
 ]
 
 
@@ -168,6 +205,89 @@ class SqliteStore:
                 (status, gate_status, _now_iso(), run_id),
             )
 
+    # --- trial lifecycle ---------------------------------------------------
+
+    def start_trial(
+        self,
+        trial_id: str,
+        run_id: str,
+        *,
+        provider_id: str,
+        provider: str,
+        model: str,
+        prompt_id: str | None,
+        prompt_version_id: str | None,
+        config: dict[str, Any] | None = None,
+    ) -> None:
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO trials(
+                       trial_id, run_id, provider_id, provider, model,
+                       prompt_id, prompt_version_id, config_json,
+                       started_at, status)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    trial_id, run_id, provider_id, provider, model,
+                    prompt_id, prompt_version_id,
+                    json.dumps(config or {}, default=str),
+                    _now_iso(),
+                    "running",
+                ),
+            )
+
+    def record_trial_results(
+        self,
+        trial_id: str,
+        *,
+        row_status: str,
+        cost_usd: float,
+        row_count: int,
+        row_pass_count: int,
+        row_fail_count: int,
+    ) -> None:
+        with self._conn() as c:
+            c.execute(
+                """UPDATE trials SET status=?, cost_usd=?, row_count=?,
+                                    row_pass_count=?, row_fail_count=?
+                   WHERE trial_id=?""",
+                (row_status, cost_usd, row_count, row_pass_count, row_fail_count, trial_id),
+            )
+
+    def finalize_trial(self, trial_id: str, *, status: str, gate_status: str) -> None:
+        with self._conn() as c:
+            c.execute(
+                "UPDATE trials SET status=?, gate_status=?, finished_at=? WHERE trial_id=?",
+                (status, gate_status, _now_iso(), trial_id),
+            )
+
+    def list_trials(self, run_id: str) -> list[dict[str, Any]]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM trials WHERE run_id=? ORDER BY started_at",
+                (run_id,),
+            ).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            out.append({
+                "trial_id":          r["trial_id"],
+                "run_id":            r["run_id"],
+                "provider_id":       r["provider_id"],
+                "provider":          r["provider"],
+                "model":             r["model"],
+                "prompt_id":         r["prompt_id"],
+                "prompt_version_id": r["prompt_version_id"],
+                "config":            json.loads(r["config_json"] or "{}"),
+                "row_count":         int(r["row_count"] or 0),
+                "row_pass_count":    int(r["row_pass_count"] or 0),
+                "row_fail_count":    int(r["row_fail_count"] or 0),
+                "cost_usd":          float(r["cost_usd"] or 0.0),
+                "status":            r["status"],
+                "gate_status":       r["gate_status"],
+                "started_at":        r["started_at"],
+                "finished_at":       r["finished_at"],
+            })
+        return out
+
     # --- per-row writers ---------------------------------------------------
 
     def insert_row(
@@ -175,6 +295,7 @@ class SqliteStore:
         run_id: str,
         row_id: str,
         *,
+        trial_id: str | None = None,
         input_json: Any,
         expected_json: Any,
         output: str,
@@ -188,11 +309,12 @@ class SqliteStore:
         with self._conn() as c:
             c.execute(
                 """INSERT INTO run_rows(
-                       run_id,row_id,input_json,expected_json,output,provider,model,
+                       run_id,trial_id,row_id,input_json,expected_json,output,provider,model,
                        cost_usd,latency_ms,cache_hit,tags_json)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     run_id,
+                    trial_id,
                     row_id,
                     json.dumps(input_json, default=str),
                     json.dumps(expected_json, default=str),
@@ -206,16 +328,25 @@ class SqliteStore:
                 ),
             )
 
-    def insert_scores(self, run_id: str, row_id: str, scores: list[dict[str, Any]]) -> None:
+    def insert_scores(
+        self,
+        run_id: str,
+        row_id: str,
+        scores: list[dict[str, Any]],
+        *,
+        trial_id: str | None = None,
+    ) -> None:
         if not scores:
             return
         with self._conn() as c:
             c.executemany(
-                """INSERT INTO scores(run_id,row_id,evaluator_id,evaluator_kind,layer,value,passed,raw_json)
-                   VALUES (?,?,?,?,?,?,?,?)""",
+                """INSERT INTO scores(
+                       run_id,trial_id,row_id,evaluator_id,evaluator_kind,layer,value,passed,raw_json)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
                 [
                     (
                         run_id,
+                        trial_id,
                         row_id,
                         s["evaluator_id"],
                         s["evaluator_kind"],
@@ -228,15 +359,21 @@ class SqliteStore:
                 ],
             )
 
-    def save_gate_results(self, run_id: str, results: list[Any]) -> None:
+    def save_gate_results(
+        self,
+        run_id: str,
+        results: list[Any],
+        *,
+        trial_id: str | None = None,
+    ) -> None:
         with self._conn() as c:
             c.executemany(
                 """INSERT INTO gate_results(
-                       run_id,gate_name,blocking,passed,severity,layer,details_json)
-                   VALUES (?,?,?,?,?,?,?)""",
+                       run_id,trial_id,gate_name,blocking,passed,severity,layer,details_json)
+                   VALUES (?,?,?,?,?,?,?,?)""",
                 [
                     (
-                        run_id, g.name, int(g.blocking), int(g.passed),
+                        run_id, trial_id, g.name, int(g.blocking), int(g.passed),
                         getattr(g, "severity", "block"),
                         getattr(g, "layer", None),
                         json.dumps(g.details),
@@ -247,17 +384,22 @@ class SqliteStore:
 
     # --- metrics -----------------------------------------------------------
 
-    def compute_metrics(self, run_id: str) -> dict[str, Any]:
+    def compute_metrics(self, run_id: str, *, trial_id: str | None = None) -> dict[str, Any]:
         """Build a structured metrics dict consumable by gate rules.
 
+        With ``trial_id``, scope the metrics to a single trial. Without
+        it, aggregate across every trial in the run.
+
         Returns a flat surface (back-compat with global-gate rules) plus
-        ``by_evaluator`` and ``by_layer`` sub-dicts so per-layer gates can
-        target a layer or a specific evaluator family.
+        ``by_evaluator`` and ``by_layer`` sub-dicts so per-layer gates
+        can target a layer or a specific evaluator family.
         """
+        scope_clause, scope_args = _scope_clause(trial_id)
         with self._conn() as c:
             row_total = c.execute(
-                "SELECT COUNT(*) AS n, COALESCE(SUM(cost_usd),0) AS cost FROM run_rows WHERE run_id=?",
-                (run_id,),
+                f"SELECT COUNT(*) AS n, COALESCE(SUM(cost_usd),0) AS cost "
+                f"FROM run_rows WHERE run_id=? {scope_clause}",
+                (run_id, *scope_args),
             ).fetchone()
             n_rows = int(row_total["n"] or 0)
             cost = float(row_total["cost"] or 0.0)
@@ -266,8 +408,9 @@ class SqliteStore:
             if n_rows:
                 failed_rows = int(
                     c.execute(
-                        "SELECT COUNT(DISTINCT row_id) AS f FROM scores WHERE run_id=? AND passed=0",
-                        (run_id,),
+                        f"SELECT COUNT(DISTINCT row_id) AS f FROM scores "
+                        f"WHERE run_id=? {scope_clause} AND passed=0",
+                        (run_id, *scope_args),
                     ).fetchone()["f"] or 0
                 )
                 pass_rate = (n_rows - failed_rows) / n_rows
@@ -275,13 +418,13 @@ class SqliteStore:
             by_evaluator: dict[str, dict[str, float]] = {}
             evaluator_layer: dict[str, int] = {}
             for r in c.execute(
-                """SELECT evaluator_id, evaluator_kind, layer,
+                f"""SELECT evaluator_id, evaluator_kind, layer,
                           AVG(value)  AS mean,
                           AVG(passed) AS pass_rate,
                           COUNT(*)    AS n,
                           SUM(CASE WHEN passed=0 THEN 1 ELSE 0 END) AS fail_count
-                   FROM scores WHERE run_id=? GROUP BY evaluator_id""",
-                (run_id,),
+                   FROM scores WHERE run_id=? {scope_clause} GROUP BY evaluator_id""",
+                (run_id, *scope_args),
             ):
                 ev = r["evaluator_id"]
                 evaluator_layer[ev] = int(r["layer"])
@@ -294,32 +437,29 @@ class SqliteStore:
                     "fail_count": int(r["fail_count"] or 0),
                 }
 
-            # Per-layer roll-up: pass_rate = fraction of rows where every
-            # evaluator at that layer passed.
             by_layer: dict[int, dict[str, Any]] = {}
             for r in c.execute(
-                """SELECT layer,
+                f"""SELECT layer,
                           AVG(value)  AS mean,
                           AVG(passed) AS pass_rate,
                           COUNT(*)    AS n
-                   FROM scores WHERE run_id=? GROUP BY layer""",
-                (run_id,),
+                   FROM scores WHERE run_id=? {scope_clause} GROUP BY layer""",
+                (run_id, *scope_args),
             ):
                 layer = int(r["layer"])
-                # rows that ran this layer (denominator) and rows where every
-                # score at this layer passed (numerator). Short-circuited
-                # rows simply don't appear in either set.
                 rows_in_layer = int(c.execute(
-                    "SELECT COUNT(DISTINCT row_id) AS n FROM scores WHERE run_id=? AND layer=?",
-                    (run_id, layer),
+                    f"SELECT COUNT(DISTINCT row_id) AS n FROM scores "
+                    f"WHERE run_id=? {scope_clause} AND layer=?",
+                    (run_id, *scope_args, layer),
                 ).fetchone()["n"] or 0)
                 row_pass = int(c.execute(
-                    """SELECT COUNT(DISTINCT row_id) AS n_pass FROM scores
-                       WHERE run_id=? AND layer=?
+                    f"""SELECT COUNT(DISTINCT row_id) AS n_pass FROM scores
+                       WHERE run_id=? {scope_clause} AND layer=?
                        AND row_id NOT IN (
-                         SELECT row_id FROM scores WHERE run_id=? AND layer=? AND passed=0
+                         SELECT row_id FROM scores
+                         WHERE run_id=? {scope_clause} AND layer=? AND passed=0
                        )""",
-                    (run_id, layer, run_id, layer),
+                    (run_id, *scope_args, layer, run_id, *scope_args, layer),
                 ).fetchone()["n_pass"] or 0)
                 evaluators = sorted(e for e, l in evaluator_layer.items() if l == layer)
                 by_layer[layer] = {
@@ -331,21 +471,32 @@ class SqliteStore:
                     "evaluators": evaluators,
                 }
 
-            # pass_rate_by_tag — built by joining scores to run_rows.tags_json
+            # pass_rate_by_tag
             by_tag: dict[str, dict[str, Any]] = {}
             tagged_rows = c.execute(
-                "SELECT row_id, tags_json FROM run_rows WHERE run_id=?",
-                (run_id,),
+                f"SELECT row_id, tags_json FROM run_rows WHERE run_id=? {scope_clause}",
+                (run_id, *scope_args),
             ).fetchall()
-            row_tags = {r["row_id"]: json.loads(r["tags_json"] or "[]") for r in tagged_rows}
-            for row_id, tags in row_tags.items():
+            seen_pairs: set[tuple[str, str]] = set()
+            for r in tagged_rows:
+                row_id = r["row_id"]
+                tags = json.loads(r["tags_json"] or "[]")
                 row_failed = bool(
                     c.execute(
-                        "SELECT 1 FROM scores WHERE run_id=? AND row_id=? AND passed=0 LIMIT 1",
-                        (run_id, row_id),
+                        f"SELECT 1 FROM scores WHERE run_id=? {scope_clause} "
+                        f"AND row_id=? AND passed=0 LIMIT 1",
+                        (run_id, *scope_args, row_id),
                     ).fetchone()
                 )
                 for tag in tags:
+                    # When aggregating across trials, a single dataset row
+                    # appears once per trial; dedupe by (row_id, tag) so the
+                    # tag denominator stays equal to the dataset row count.
+                    if trial_id is None:
+                        key = (row_id, tag)
+                        if key in seen_pairs:
+                            continue
+                        seen_pairs.add(key)
                     bucket = by_tag.setdefault(tag, {"n": 0, "passed": 0})
                     bucket["n"] += 1
                     if not row_failed:
@@ -382,25 +533,35 @@ class SqliteStore:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def list_rows(self, run_id: str) -> list[dict[str, Any]]:
+    def list_rows(self, run_id: str, *, trial_id: str | None = None) -> list[dict[str, Any]]:
         """One entry per row, with aggregated pass/fail across scores."""
+        scope = "AND r.trial_id=?" if trial_id else ""
+        scope_score = "AND s.trial_id=?" if trial_id else ""
+        # Argument order matches placeholder order in the SQL below:
+        # scope_score → r.run_id → scope.
+        if trial_id:
+            args: tuple[Any, ...] = (trial_id, run_id, trial_id)
+        else:
+            args = (run_id,)
         with self._conn() as c:
             rows = c.execute(
-                """SELECT r.row_id, r.provider, r.model, r.cost_usd, r.latency_ms,
-                          r.cache_hit, r.tags_json,
+                f"""SELECT r.row_id, r.trial_id, r.provider, r.model, r.cost_usd,
+                          r.latency_ms, r.cache_hit, r.tags_json,
                           COUNT(s.id) AS n_scores,
                           SUM(CASE WHEN s.passed=0 THEN 1 ELSE 0 END) AS n_failed
                    FROM run_rows r LEFT JOIN scores s
                      ON s.run_id = r.run_id AND s.row_id = r.row_id
-                   WHERE r.run_id = ?
-                   GROUP BY r.row_id
+                        {scope_score}
+                   WHERE r.run_id = ? {scope}
+                   GROUP BY r.id
                    ORDER BY r.id""",
-                (run_id,),
+                args,
             ).fetchall()
         out: list[dict[str, Any]] = []
         for r in rows:
             out.append({
                 "row_id":    r["row_id"],
+                "trial_id":  r["trial_id"],
                 "provider":  r["provider"],
                 "model":     r["model"],
                 "cost_usd":  float(r["cost_usd"] or 0.0),
@@ -412,21 +573,28 @@ class SqliteStore:
             })
         return out
 
-    def get_row(self, run_id: str, row_id: str) -> dict[str, Any] | None:
+    def get_row(
+        self, run_id: str, row_id: str, *, trial_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        row_scope = "AND trial_id=?" if trial_id else ""
+        score_scope = "AND trial_id=?" if trial_id else ""
+        args: tuple[Any, ...] = (trial_id,) if trial_id else ()
         with self._conn() as c:
             r = c.execute(
-                "SELECT * FROM run_rows WHERE run_id=? AND row_id=?",
-                (run_id, row_id),
+                f"SELECT * FROM run_rows WHERE run_id=? AND row_id=? {row_scope} LIMIT 1",
+                (run_id, row_id, *args),
             ).fetchone()
             if not r:
                 return None
             scores = c.execute(
-                """SELECT evaluator_id, evaluator_kind, layer, value, passed, raw_json
-                   FROM scores WHERE run_id=? AND row_id=? ORDER BY layer, evaluator_id""",
-                (run_id, row_id),
+                f"""SELECT evaluator_id, evaluator_kind, layer, value, passed, raw_json
+                    FROM scores WHERE run_id=? AND row_id=? {score_scope}
+                    ORDER BY layer, evaluator_id""",
+                (run_id, row_id, *args),
             ).fetchall()
         return {
             "row_id":     r["row_id"],
+            "trial_id":   r["trial_id"],
             "input":      json.loads(r["input_json"] or "null"),
             "expected":   json.loads(r["expected_json"] or "null"),
             "output":     r["output"],
@@ -449,24 +617,92 @@ class SqliteStore:
             ],
         }
 
-    def get_gate_results(self, run_id: str) -> list[dict[str, Any]]:
+    def get_gate_results(
+        self, run_id: str, *, trial_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        scope = " AND trial_id=?" if trial_id else " AND trial_id IS NULL"
+        args: tuple[Any, ...] = (trial_id,) if trial_id else ()
         with self._conn() as c:
             rows = c.execute(
-                """SELECT gate_name, blocking, passed, severity, layer, details_json
-                   FROM gate_results WHERE run_id=?""",
-                (run_id,),
+                f"""SELECT gate_name, blocking, passed, severity, layer, details_json, trial_id
+                    FROM gate_results WHERE run_id=? {scope}""",
+                (run_id, *args),
             ).fetchall()
         return [
             {
                 "gate_name": r["gate_name"],
-                "blocking": bool(r["blocking"]),
-                "passed": bool(r["passed"]),
-                "severity": r["severity"] or ("block" if r["blocking"] else "warn"),
-                "layer": r["layer"],
-                "details": json.loads(r["details_json"] or "[]"),
+                "trial_id":  r["trial_id"],
+                "blocking":  bool(r["blocking"]),
+                "passed":    bool(r["passed"]),
+                "severity":  r["severity"] or ("block" if r["blocking"] else "warn"),
+                "layer":     r["layer"],
+                "details":   json.loads(r["details_json"] or "[]"),
             }
             for r in rows
         ]
+
+    def compute_comparison(self, run_id: str) -> dict[str, Any]:
+        """Cross-trial winner table for the most engineering-relevant scalars.
+
+        Emits ``best_by`` keyed by metric name; each value records which
+        trial wins (and the runner-up for context). 'Best' means *higher*
+        for quality-style metrics and *lower* for ``cost_usd`` / ``latency``.
+        """
+        trials = self.list_trials(run_id)
+        if len(trials) < 2:
+            return {"best_by": {}, "trials": [t["trial_id"] for t in trials]}
+
+        per_trial = {t["trial_id"]: self.compute_metrics(run_id, trial_id=t["trial_id"]) for t in trials}
+
+        # Pick a small set of scalars worth comparing. Anything with
+        # ``cost`` or ``latency`` in the name is lower-better.
+        candidate_keys: set[str] = set()
+        for m in per_trial.values():
+            for k, v in m.items():
+                if isinstance(v, (int, float)) and k not in {"row_count"}:
+                    candidate_keys.add(k)
+        # cost shows up at the trial level, not in metrics — surface explicitly.
+        candidate_keys.update({"cost_usd", "row_pass_count"})
+
+        best_by: dict[str, dict[str, Any]] = {}
+        for key in sorted(candidate_keys):
+            lower_better = any(s in key for s in ("cost", "latency"))
+            scored: list[tuple[str, float]] = []
+            for t in trials:
+                m = per_trial[t["trial_id"]]
+                if key in m and isinstance(m[key], (int, float)):
+                    val = float(m[key])
+                elif key == "cost_usd":
+                    val = float(t["cost_usd"])
+                elif key == "row_pass_count":
+                    val = float(t["row_pass_count"])
+                else:
+                    continue
+                scored.append((t["trial_id"], val))
+            if len(scored) < 2:
+                continue
+            scored.sort(key=lambda x: x[1], reverse=not lower_better)
+            winner_id, winner_val = scored[0]
+            runner_id, runner_val = scored[1]
+            winner = next(t for t in trials if t["trial_id"] == winner_id)
+            runner = next(t for t in trials if t["trial_id"] == runner_id)
+            best_by[key] = {
+                "winner": {
+                    "trial_id":    winner_id,
+                    "provider_id": winner["provider_id"],
+                    "value":       winner_val,
+                },
+                "runner_up": {
+                    "trial_id":    runner_id,
+                    "provider_id": runner["provider_id"],
+                    "value":       runner_val,
+                },
+                "lower_better": lower_better,
+            }
+        return {
+            "best_by": best_by,
+            "trials":  [t["trial_id"] for t in trials],
+        }
 
 
 def _asset_to_dict(a: Any) -> dict[str, Any]:
@@ -475,3 +711,10 @@ def _asset_to_dict(a: Any) -> dict[str, Any]:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _scope_clause(trial_id: str | None) -> tuple[str, tuple[Any, ...]]:
+    """Optional ``AND trial_id=?`` predicate (or empty when aggregating)."""
+    if trial_id is None:
+        return "", ()
+    return "AND trial_id=?", (trial_id,)

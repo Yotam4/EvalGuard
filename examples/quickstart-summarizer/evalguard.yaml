@@ -9,9 +9,17 @@ template: text_gen
 # ``response_format`` are all here. ``${ENV}`` substitution lets you keep
 # secrets out of the repo; ``${VAR:-default}`` provides a fallback.
 providers:
-  - id: mock:fake-summary           # offline default — works without an API key
+  # Multi-provider matrix: each entry creates an independent ``trial`` so
+  # you can compare model-effectiveness side by side. Run with
+  # ``gate_strategy: all`` (every model must pass) or ``any`` (best of N).
+  - id: mock:fake-summary-strong    # default offline pair — no API key needed
     config:
       mode: json_summary
+      score_hint: 4.7
+  - id: mock:fake-summary-weak
+    config:
+      mode: json_summary
+      score_hint: 3.8
 
   # Real providers (uncomment to use):
   # - id: openai:gpt-4o-mini
@@ -20,7 +28,7 @@ providers:
   #     temperature: 0.2
   #     max_tokens: 256
   #     response_format: { type: json_object }
-  # - id: openai:llama3.2:3b        # any OpenAI-compatible local server (Ollama, vLLM)
+  # - id: openai:llama3.2:3b        # any OpenAI-compatible local server
   #   config:
   #     base_url: ${OLLAMA_BASE_URL:-http://localhost:11434/v1}
   #     temperature: 0.0
@@ -88,6 +96,9 @@ layers:
       per_tag_overrides:
         normal: 0.95
         edge:   0.80                # adversarial cases get more slack
+
+# ── Cross-trial verdict ─────────────────────────────────────────────────────
+gate_strategy: all                  # `all` = every model must pass; `any` = best-of-N
 
 # ── Cost controls ────────────────────────────────────────────────────────────
 cost_cap_usd: 2.00

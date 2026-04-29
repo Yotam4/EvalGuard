@@ -1,0 +1,158 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://evalguard.dev/schemas/evalguard.run.schema.json",
+  "title": "EvalGuard run output",
+  "description": "Stable JSON contract describing one ``evalguard run``. Consumed by the CLI (`view --json`), the GitHub Action PR-comment generator, the API server's run endpoint, and any downstream UI/webhook. Breaking changes bump ``schema_version``.",
+  "type": "object",
+  "required": ["schema_version", "run_id", "project", "trials"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+    "run_id":         { "type": "string", "pattern": "^run_[a-z0-9]{8,}$" },
+    "project":        { "type": "string" },
+    "config_hash":    { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "status":         { "type": ["string", "null"], "enum": [null, "passed", "warned", "row_failed", "gate_failed", "cost_capped", "running", "error"] },
+    "row_status":     { "type": ["string", "null"] },
+    "gate_status":    { "type": ["string", "null"] },
+    "started_at":     { "type": ["string", "null"] },
+    "finished_at":    { "type": ["string", "null"] },
+    "row_count":      { "type": "integer", "minimum": 0 },
+    "row_pass_count": { "type": "integer", "minimum": 0 },
+    "row_fail_count": { "type": "integer", "minimum": 0 },
+    "cost_usd":       { "type": "number", "minimum": 0 },
+    "assets": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/asset" }
+    },
+    "trials": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/trial" }
+    },
+    "comparison": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "best_by": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/winner" }
+        },
+        "trials": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "aggregate": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "metrics": { "type": "object" },
+        "gates":   { "type": "array", "items": { "$ref": "#/$defs/gate" } }
+      }
+    }
+  },
+  "$defs": {
+    "asset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "asset_id", "version_id"],
+      "properties": {
+        "kind":       { "type": "string", "enum": ["prompt", "dataset", "schema", "rubric", "judge", "heuristic", "metric"] },
+        "asset_id":   { "type": "string" },
+        "version_id": { "type": "string" },
+        "source":     { "type": ["string", "null"] }
+      }
+    },
+    "trial": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["trial_id", "provider_id", "provider", "model"],
+      "properties": {
+        "trial_id":          { "type": "string", "pattern": "^trial_[a-z0-9]{8,}$" },
+        "provider_id":       { "type": "string" },
+        "provider":          { "type": "string" },
+        "model":             { "type": "string" },
+        "prompt_id":         { "type": ["string", "null"] },
+        "prompt_version_id": { "type": ["string", "null"] },
+        "config":            { "type": "object" },
+        "row_count":         { "type": "integer", "minimum": 0 },
+        "row_pass_count":    { "type": "integer", "minimum": 0 },
+        "row_fail_count":    { "type": "integer", "minimum": 0 },
+        "cost_usd":          { "type": "number", "minimum": 0 },
+        "status":            { "type": ["string", "null"] },
+        "gate_status":       { "type": ["string", "null"] },
+        "started_at":        { "type": ["string", "null"] },
+        "finished_at":       { "type": ["string", "null"] },
+        "metrics":           { "type": "object" },
+        "gates":             { "type": "array", "items": { "$ref": "#/$defs/gate" } },
+        "rows":              { "type": "array", "items": { "$ref": "#/$defs/row" } }
+      }
+    },
+    "row": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["row_id", "passed"],
+      "properties": {
+        "row_id":     { "type": "string" },
+        "passed":     { "type": "boolean" },
+        "n_scores":   { "type": "integer", "minimum": 0 },
+        "provider":   { "type": ["string", "null"] },
+        "model":      { "type": ["string", "null"] },
+        "cost_usd":   { "type": "number", "minimum": 0 },
+        "latency_ms": { "type": "integer", "minimum": 0 },
+        "cache_hit":  { "type": "boolean" },
+        "tags":       { "type": "array", "items": { "type": "string" } },
+        "input":      {},
+        "expected":   {},
+        "output":     { "type": ["string", "null"] },
+        "scores":     { "type": "array", "items": { "$ref": "#/$defs/score" } }
+      }
+    },
+    "score": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["evaluator_id", "evaluator_kind", "layer", "value", "passed"],
+      "properties": {
+        "evaluator_id":   { "type": "string" },
+        "evaluator_kind": { "type": "string" },
+        "layer":          { "type": "integer", "minimum": 1, "maximum": 5 },
+        "value":          { "type": "number" },
+        "passed":         { "type": "boolean" },
+        "raw":            {}
+      }
+    },
+    "gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["gate_name", "severity", "passed"],
+      "properties": {
+        "gate_name": { "type": "string" },
+        "severity":  { "type": "string", "enum": ["block", "warn", "log"] },
+        "blocking":  { "type": "boolean" },
+        "passed":    { "type": "boolean" },
+        "layer":     { "type": ["integer", "null"], "minimum": 1, "maximum": 5 },
+        "details":   { "type": "array" }
+      }
+    },
+    "winner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["winner", "runner_up"],
+      "properties": {
+        "winner":      { "$ref": "#/$defs/winnerEntry" },
+        "runner_up":   { "$ref": "#/$defs/winnerEntry" },
+        "lower_better":{ "type": "boolean" }
+      }
+    },
+    "winnerEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["trial_id", "provider_id", "value"],
+      "properties": {
+        "trial_id":    { "type": "string" },
+        "provider_id": { "type": "string" },
+        "value":       { "type": "number" }
+      }
+    }
+  }
+}

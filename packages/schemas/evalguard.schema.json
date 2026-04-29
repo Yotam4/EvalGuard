@@ -136,7 +136,13 @@
       }
     },
     "concurrency": { "type": "integer", "minimum": 1, "default": 8 },
-    "cost_cap_usd": { "type": "number", "minimum": 0 }
+    "cost_cap_usd": { "type": "number", "minimum": 0 },
+    "gate_strategy": {
+      "type": "string",
+      "enum": ["all", "any"],
+      "default": "all",
+      "description": "How to combine per-trial gate verdicts. 'all' (default) requires every trial to pass all blocking gates; 'any' passes the run if at least one trial passes."
+    }
   },
   "$defs": {
     "rule": {

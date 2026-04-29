@@ -1,4 +1,15 @@
-"""``evalguard run`` — execute the eval defined by ``evalguard.yaml``."""
+"""``evalguard run`` — execute the eval defined by ``evalguard.yaml``.
+
+Multi-trial pipeline:
+
+1. ``execute()`` runs every (provider × prompt) trial; each writes its
+   own rows + scores keyed by ``trial_id``.
+2. For each trial, gates are evaluated against trial-scoped metrics and
+   recorded with ``trial_id`` set.
+3. The run-level verdict combines trial verdicts according to
+   ``gate_strategy`` (``all`` → every trial must pass any blocking
+   gate; ``any`` → at least one trial must pass).
+"""
 
 from __future__ import annotations
 
@@ -6,9 +17,10 @@ import asyncio
 from pathlib import Path
 
 import typer
+from rich.table import Table
 
 from evalguard_cli.console import console
-from evalguard_cli.local.gate import evaluate_gates, format_gate_report
+from evalguard_cli.local.gate import GateResult, evaluate_gates, format_gate_report
 from evalguard_cli.local.local_executor import execute
 from evalguard_cli.local.report import render_run_table
 from evalguard_cli.local.sqlite_store import SqliteStore
@@ -28,7 +40,7 @@ def run(
     """Run the eval pipeline against the local executor."""
     try:
         cfg = load_config(config)
-    except Exception as e:  # noqa: BLE001 - user-facing surface
+    except Exception as e:  # noqa: BLE001 — user-facing surface
         console.print(f"[red]config error:[/red] {e}")
         raise typer.Exit(EXIT_INFRA_ERROR) from e
 
@@ -42,35 +54,151 @@ def run(
         console.print(f"[red]run error:[/red] {e}")
         raise typer.Exit(EXIT_INFRA_ERROR) from e
 
-    metrics = store.compute_metrics(run_record.run_id)
-    render_run_table(run_record, metrics, console=console)
-
     legacy_gates = cfg.raw.get("gates") or []
     layer_gates = cfg.raw.get("layers") or {}
-    gate_results = evaluate_gates(legacy_gates, metrics, layers=layer_gates)
-    store.save_gate_results(run_record.run_id, gate_results)
-    if gate_results:
-        console.print()
-        console.print(format_gate_report(gate_results))
+    gate_strategy = cfg.raw.get("gate_strategy", "all")
 
-    blocking_failed = any(g.passed is False and g.severity == "block" for g in gate_results)
-    warned = any(g.passed is False and g.severity == "warn" for g in gate_results)
-    gate_status = "failed" if blocking_failed else ("warned" if warned else ("passed" if gate_results else "none"))
+    # Per-trial gate evaluation
+    trial_verdicts: list[dict] = []
+    for trial in run_record.trials:
+        trial_metrics = store.compute_metrics(run_record.run_id, trial_id=trial.trial_id)
+        trial_gates = evaluate_gates(legacy_gates, trial_metrics, layers=layer_gates)
+        store.save_gate_results(run_record.run_id, trial_gates, trial_id=trial.trial_id)
+
+        trial_blocking_failed = any(g.passed is False and g.severity == "block" for g in trial_gates)
+        trial_warned = any(g.passed is False and g.severity == "warn" for g in trial_gates)
+        gate_status = (
+            "failed" if trial_blocking_failed
+            else "warned" if trial_warned
+            else "passed" if trial_gates
+            else "none"
+        )
+        if trial.row_status == "cost_capped":
+            trial_overall = "cost_capped"
+        elif trial.row_status == "failed":
+            trial_overall = "row_failed"
+        elif trial_blocking_failed:
+            trial_overall = "gate_failed"
+        elif trial_warned:
+            trial_overall = "warned"
+        else:
+            trial_overall = "passed"
+        store.finalize_trial(trial.trial_id, status=trial_overall, gate_status=gate_status)
+        trial_verdicts.append({
+            "trial": trial,
+            "metrics": trial_metrics,
+            "gates": trial_gates,
+            "status": trial_overall,
+            "gate_status": gate_status,
+            "blocking_failed": trial_blocking_failed,
+            "warned": trial_warned,
+        })
+
+    # Run-level aggregate render
+    if len(run_record.trials) >= 2:
+        _render_trials_summary(run_record, trial_verdicts, store)
+    else:
+        # Single-trial fallback: behave like Phase 0.5 — one summary table + gates.
+        metrics = store.compute_metrics(run_record.run_id)
+        render_run_table(run_record, metrics, console=console)
+        if trial_verdicts:
+            console.print()
+            console.print(format_gate_report(trial_verdicts[0]["gates"]))
+
+    # gate_strategy decides the run-level blocking verdict.
+    if not trial_verdicts:
+        run_blocking_failed = False
+        run_warned = False
+    elif gate_strategy == "any":
+        # Pass if ANY trial passed without a blocking failure.
+        run_blocking_failed = all(v["blocking_failed"] for v in trial_verdicts)
+        run_warned = any(v["warned"] for v in trial_verdicts) and not run_blocking_failed
+    else:  # "all"
+        run_blocking_failed = any(v["blocking_failed"] for v in trial_verdicts)
+        run_warned = any(v["warned"] for v in trial_verdicts) and not run_blocking_failed
+
+    if run_blocking_failed:
+        gate_status_overall = "failed"
+    elif run_warned:
+        gate_status_overall = "warned"
+    elif trial_verdicts:
+        gate_status_overall = "passed"
+    else:
+        gate_status_overall = "none"
 
     if run_record.row_status == "cost_capped":
         overall = "cost_capped"
-    elif run_record.row_status == "failed":
+    elif run_record.row_status == "failed" and gate_strategy == "all":
         overall = "row_failed"
-    elif blocking_failed:
+    elif run_blocking_failed:
         overall = "gate_failed"
-    elif warned:
+    elif run_warned:
         overall = "warned"
     else:
         overall = "passed"
-    store.finalize_run(run_record.run_id, status=overall, gate_status=gate_status)
 
-    console.print(f"\n[bold]overall:[/bold] {_pretty(overall)}")
-    raise typer.Exit(EXIT_GATE_FAIL if blocking_failed else EXIT_PASS)
+    store.finalize_run(run_record.run_id, status=overall, gate_status=gate_status_overall)
+
+    console.print(
+        f"\n[bold]overall:[/bold] {_pretty(overall)}  "
+        f"[dim](strategy: {gate_strategy}, {len(run_record.trials)} trial(s))[/dim]"
+    )
+    raise typer.Exit(EXIT_GATE_FAIL if run_blocking_failed else EXIT_PASS)
+
+
+def _render_trials_summary(run_record, trial_verdicts: list[dict], store: SqliteStore) -> None:
+    table = Table(title=f"Trials — {run_record.run_id}")
+    table.add_column("trial",      style="cyan", no_wrap=True)
+    table.add_column("provider",   style="dim")
+    table.add_column("model",      no_wrap=True)
+    table.add_column("status",     justify="center")
+    table.add_column("rows",       justify="right")
+    table.add_column("cost",       justify="right")
+    table.add_column("gates",      justify="center")
+    for v in trial_verdicts:
+        t = v["trial"]
+        rows_label = f"{t.row_pass_count}/{t.row_count}"
+        gates_status = "[green]PASS[/green]" if v["gate_status"] == "passed" else (
+            "[yellow]warn[/yellow]" if v["gate_status"] == "warned"
+            else "[red]FAIL[/red]" if v["gate_status"] == "failed"
+            else "[dim]-[/dim]"
+        )
+        table.add_row(
+            t.trial_id, t.provider, t.model,
+            _pretty(v["status"]),
+            rows_label, f"${t.cost_usd:.4f}", gates_status,
+        )
+    console.print(table)
+
+    # Cross-trial winner table for the metrics that matter most
+    comparison = store.compute_comparison(run_record.run_id)
+    if comparison.get("best_by"):
+        cmp_table = Table(title="Best by metric", show_lines=False)
+        cmp_table.add_column("metric", style="cyan")
+        cmp_table.add_column("winner", style="green")
+        cmp_table.add_column("value", justify="right")
+        cmp_table.add_column("runner-up", style="dim")
+        cmp_table.add_column("Δ", justify="right")
+        # Curate which keys to surface — full dict goes in --json output.
+        priority = ["pass_rate", "cost_usd", "row_pass_count"]
+        priority += sorted(k for k in comparison["best_by"] if k.startswith("layer") and k.endswith(".mean"))
+        priority += sorted(k for k in comparison["best_by"]
+                           if k.endswith(".mean") and not k.startswith("layer") and k not in priority)
+        seen = set()
+        for key in priority:
+            if key not in comparison["best_by"] or key in seen:
+                continue
+            seen.add(key)
+            row = comparison["best_by"][key]
+            delta = row["winner"]["value"] - row["runner_up"]["value"]
+            cmp_table.add_row(
+                key,
+                row["winner"]["provider_id"],
+                f"{row['winner']['value']:.4f}",
+                row["runner_up"]["provider_id"],
+                f"{delta:+.4f}",
+            )
+        console.print(cmp_table)
 
 
 def _pretty(status: str) -> str:
