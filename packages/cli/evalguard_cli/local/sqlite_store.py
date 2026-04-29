@@ -382,6 +382,73 @@ class SqliteStore:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def list_rows(self, run_id: str) -> list[dict[str, Any]]:
+        """One entry per row, with aggregated pass/fail across scores."""
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT r.row_id, r.provider, r.model, r.cost_usd, r.latency_ms,
+                          r.cache_hit, r.tags_json,
+                          COUNT(s.id) AS n_scores,
+                          SUM(CASE WHEN s.passed=0 THEN 1 ELSE 0 END) AS n_failed
+                   FROM run_rows r LEFT JOIN scores s
+                     ON s.run_id = r.run_id AND s.row_id = r.row_id
+                   WHERE r.run_id = ?
+                   GROUP BY r.row_id
+                   ORDER BY r.id""",
+                (run_id,),
+            ).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            out.append({
+                "row_id":    r["row_id"],
+                "provider":  r["provider"],
+                "model":     r["model"],
+                "cost_usd":  float(r["cost_usd"] or 0.0),
+                "latency_ms": int(r["latency_ms"] or 0),
+                "cache_hit": bool(r["cache_hit"]),
+                "tags":      json.loads(r["tags_json"] or "[]"),
+                "n_scores":  int(r["n_scores"] or 0),
+                "passed":    int(r["n_failed"] or 0) == 0,
+            })
+        return out
+
+    def get_row(self, run_id: str, row_id: str) -> dict[str, Any] | None:
+        with self._conn() as c:
+            r = c.execute(
+                "SELECT * FROM run_rows WHERE run_id=? AND row_id=?",
+                (run_id, row_id),
+            ).fetchone()
+            if not r:
+                return None
+            scores = c.execute(
+                """SELECT evaluator_id, evaluator_kind, layer, value, passed, raw_json
+                   FROM scores WHERE run_id=? AND row_id=? ORDER BY layer, evaluator_id""",
+                (run_id, row_id),
+            ).fetchall()
+        return {
+            "row_id":     r["row_id"],
+            "input":      json.loads(r["input_json"] or "null"),
+            "expected":   json.loads(r["expected_json"] or "null"),
+            "output":     r["output"],
+            "provider":   r["provider"],
+            "model":      r["model"],
+            "cost_usd":   float(r["cost_usd"] or 0.0),
+            "latency_ms": int(r["latency_ms"] or 0),
+            "cache_hit":  bool(r["cache_hit"]),
+            "tags":       json.loads(r["tags_json"] or "[]"),
+            "scores": [
+                {
+                    "evaluator_id":   s["evaluator_id"],
+                    "evaluator_kind": s["evaluator_kind"],
+                    "layer":          int(s["layer"]),
+                    "value":          float(s["value"] or 0.0),
+                    "passed":         bool(s["passed"]),
+                    "raw":            json.loads(s["raw_json"] or "null"),
+                }
+                for s in scores
+            ],
+        }
+
     def get_gate_results(self, run_id: str) -> list[dict[str, Any]]:
         with self._conn() as c:
             rows = c.execute(

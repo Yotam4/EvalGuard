@@ -177,6 +177,19 @@
         "rules": {
           "type": "array",
           "items": { "$ref": "#/$defs/rule" }
+        },
+        "custom_check": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["module"],
+          "description": "Escape hatch: invoke a Python function as part of this gate. Function signature: (metrics: dict, config: dict) -> {'passed': bool, 'details': list}.",
+          "properties": {
+            "module": {
+              "type": "string",
+              "description": "Dotted path with optional ':' separator, e.g. 'my_pkg.gates:safety_check' or 'my_pkg.gates.safety_check'."
+            },
+            "config": { "type": "object" }
+          }
         }
       }
     }

@@ -2,15 +2,22 @@ version: 1
 project: my-project
 template: text_gen
 
+# ── Providers ────────────────────────────────────────────────────────────────
+# Every value under ``config`` is forwarded to the SDK call. ${ENV} works
+# anywhere in this file.
 providers:
   - id: mock:default
     config: { mode: json_summary }
-  # Real providers — uncomment and configure as needed:
+  # Real options:
   # - id: openai:gpt-4o-mini
-  # - id: ollama:llama3.2:3b
-  #   config: { base_url: http://localhost:11434 }
+  #   config:
+  #     api_key: ${OPENAI_API_KEY}
+  #     temperature: 0.2
+  #     max_tokens: 512
   # - id: openai:llama3.2:3b
-  #   config: { base_url: http://localhost:11434/v1 }
+  #   config:
+  #     base_url: ${OLLAMA_BASE_URL:-http://localhost:11434/v1}
+  #     temperature: 0.0
 
 prompts:
   - id: default
@@ -20,12 +27,14 @@ datasets:
   - id: golden
     file: datasets/golden.jsonl
 
+# ── Heuristics (Layer 1) ─────────────────────────────────────────────────────
 heuristics:
   - type: length
     max: 1000
   - type: not_contains
     value: "As an AI"
 
+# ── LLM judge (Layer 3) ─────────────────────────────────────────────────────
 judges:
   - id: quality
     type: mock_pointwise
@@ -34,6 +43,7 @@ judges:
 
 run_mode: short_circuit_blocking_only
 
+# ── Gates ────────────────────────────────────────────────────────────────────
 layers:
   heuristics:
     severity: block
@@ -45,5 +55,17 @@ layers:
     aggregation: pass_rate
     threshold: { min: 0.90 }
 
-cache: { dir: .evalguard/cache, enabled: true }
+  # Custom gate via Python (escape hatch). Module path can be ``pkg.mod:fn``
+  # or ``pkg.mod.fn``. The function receives (metrics, config) and returns
+  # ``{"passed": bool, "details": [{...}]}``.
+  #
+  # human:
+  #   severity: log
+  #   custom_check:
+  #     module: my_evals.gates:promote_disagreements
+  #     config: { destination: ./goldens/candidates.jsonl }
+
+cost_cap_usd: 5.00
 concurrency: 4
+
+cache: { dir: .evalguard/cache, enabled: true }

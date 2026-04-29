@@ -11,6 +11,8 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -52,6 +54,10 @@ def load_config(path: Path) -> LoadedConfig:
     data = yaml.safe_load(text)
     if not isinstance(data, dict):
         raise ValueError("evalguard.yaml must be a mapping at the top level")
+
+    # Substitute ${ENV_VAR} (and ${VAR:-default}) before schema validation so
+    # secrets, base URLs, model ids, anything can live in the environment.
+    data = _substitute_env(data)
 
     schema = json.loads(_schema_path().read_text())
     jsonschema.validate(data, schema)
@@ -183,3 +189,35 @@ def _schema_path() -> Path:
         if candidate.exists():
             return candidate
     raise FileNotFoundError("evalguard.schema.json not found")
+
+
+# ``${VAR}`` or ``${VAR:-default}`` — names match POSIX-style identifiers.
+_ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
+
+
+def _substitute_env(value: Any) -> Any:
+    """Recursively substitute ``${ENV}`` references in any string value.
+
+    Missing variables raise a clear error; ``${VAR:-default}`` provides a
+    fallback. ``$$`` is left alone so users can write literal ``$`` if
+    needed (rare).
+    """
+    if isinstance(value, str):
+        def _sub(m: "re.Match[str]") -> str:
+            name = m.group(1)
+            default = m.group(2)
+            v = os.environ.get(name)
+            if v is None:
+                if default is None:
+                    raise ValueError(
+                        f"environment variable ${{{name}}} is not set "
+                        "(use ${" + name + ":-default} to provide a fallback)"
+                    )
+                return default
+            return v
+        return _ENV_RE.sub(_sub, value)
+    if isinstance(value, dict):
+        return {k: _substitute_env(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_substitute_env(v) for v in value]
+    return value

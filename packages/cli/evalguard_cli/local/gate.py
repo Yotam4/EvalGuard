@@ -20,6 +20,7 @@ Severity → CLI behaviour:
 
 from __future__ import annotations
 
+import importlib
 import operator
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -167,6 +168,23 @@ def _evaluate_layers(layers: dict[str, dict[str, Any]], metrics: dict[str, Any])
                 })
                 passed = passed and ok
 
+        # 4) custom_check Python escape hatch
+        if (custom := gate.get("custom_check")):
+            try:
+                result = _invoke_custom_check(custom, metrics)
+            except Exception as e:  # noqa: BLE001
+                details.append({
+                    "metric": f"{layer_name}.custom_check",
+                    "op": "raise", "target": 0.0, "actual": float("nan"),
+                    "passed": False, "error": str(e),
+                })
+                passed = False
+            else:
+                passed = passed and bool(result.get("passed", True))
+                for d in result.get("details", []):
+                    d.setdefault("metric", f"{layer_name}.custom_check")
+                    details.append(d)
+
         results.append(GateResult(
             name=layer_name,
             blocking=(severity == "block"),
@@ -222,6 +240,30 @@ def _resolve_aggregation(
             layer_data.get("pass_rate", 0.0)
         ), label
     return None, label
+
+
+def _invoke_custom_check(spec: dict[str, Any], metrics: dict[str, Any]) -> dict[str, Any]:
+    """Resolve ``module: foo.bar:func`` (or ``foo.bar.func``) and invoke it.
+
+    The function is given the full metrics dict and the gate's ``config``.
+    It must return ``{"passed": bool, "details": [{...}]}``. Any raised
+    exception is caught by the caller and surfaced as a gate detail.
+    """
+    path = spec["module"]
+    if ":" in path:
+        mod_name, func_name = path.rsplit(":", 1)
+    else:
+        mod_name, func_name = path.rsplit(".", 1)
+    module = importlib.import_module(mod_name)
+    func = getattr(module, func_name, None)
+    if not callable(func):
+        raise AttributeError(f"{path} did not resolve to a callable")
+    out = func(metrics, dict(spec.get("config") or {}))
+    if not isinstance(out, dict) or "passed" not in out:
+        raise TypeError(
+            f"{path} must return a dict with at least a 'passed' key; got {type(out).__name__}"
+        )
+    return out
 
 
 def _apply_op(op: str, actual: float, target: float) -> bool:

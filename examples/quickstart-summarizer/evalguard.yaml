@@ -2,21 +2,47 @@ version: 1
 project: quickstart-summarizer
 template: text_gen
 
+# ── Providers ────────────────────────────────────────────────────────────────
+# Every provider is a control panel. Anything you put under ``config`` is
+# forwarded to the underlying SDK call (chat.completions.create for OpenAI),
+# so model knobs like ``temperature``, ``top_p``, ``max_tokens``,
+# ``response_format`` are all here. ``${ENV}`` substitution lets you keep
+# secrets out of the repo; ``${VAR:-default}`` provides a fallback.
 providers:
-  # Default: offline deterministic provider. Swap to `openai`, `ollama`,
-  # or any OpenAI-compatible local server by editing this block.
-  - id: mock:fake-summary
+  - id: mock:fake-summary           # offline default — works without an API key
     config:
       mode: json_summary
 
+  # Real providers (uncomment to use):
+  # - id: openai:gpt-4o-mini
+  #   config:
+  #     api_key: ${OPENAI_API_KEY}
+  #     temperature: 0.2
+  #     max_tokens: 256
+  #     response_format: { type: json_object }
+  # - id: openai:llama3.2:3b        # any OpenAI-compatible local server (Ollama, vLLM)
+  #   config:
+  #     base_url: ${OLLAMA_BASE_URL:-http://localhost:11434/v1}
+  #     temperature: 0.0
+
+# ── Prompts ──────────────────────────────────────────────────────────────────
+# Every prompt gets a content-hashed ``version_id`` automatically. Pin a
+# specific prompt version for reproducible runs, or update the file to
+# create a new version that the CI gate can compare against main.
 prompts:
   - id: summarize_v1
     file: prompts/summarize.md
 
+# ── Datasets (golden set) ───────────────────────────────────────────────────
+# JSONL with at minimum ``input``. Optional: ``id``, ``expected``,
+# ``tags`` (used by ``pass_rate_by_tag`` aggregations).
 datasets:
   - id: news_golden
     file: datasets/news.jsonl
 
+# ── Layer 1 — heuristics ─────────────────────────────────────────────────────
+# Cheap deterministic checks. Anything you can write in 10 lines of code:
+# format, length, banned phrases, JSON-schema, code-compiles, regex.
 heuristics:
   - type: json_schema
     schema_file: schemas/summary.json
@@ -26,26 +52,35 @@ heuristics:
   - type: not_contains
     value: "As an AI"
 
+# ── Layer 3 — offline LLM-as-judge ──────────────────────────────────────────
+# Each judge is its own configurable unit: which model judges, what rubric,
+# what threshold. Model and rubric are versioned the same way prompts are.
 judges:
   - id: helpfulness_v3
-    type: mock_pointwise   # offline judge with a fixed score for reproducibility
+    type: mock_pointwise            # swap to ``pointwise`` for a real LLM judge
     score: 4.5
     threshold: 4.0
+    # For real ``pointwise``:
+    # model: openai:gpt-4o
+    # rubric_file: rubrics/helpfulness.md
+    # params: { temperature: 0.0 }
 
-# Layer-interaction policy. With ``short_circuit_blocking_only`` (the
-# default), a row that fails a block-severity gate at an earlier layer
-# skips the expensive judge calls for later layers — saving real $ in CI.
+# ── Layer-interaction policy ─────────────────────────────────────────────────
+# always | short_circuit | short_circuit_blocking_only (default)
 run_mode: short_circuit_blocking_only
 
-# Per-layer gates. Each pyramid step has its own controllable gate
-# with severity ``block`` | ``warn`` | ``log``.
+# ── Gates ────────────────────────────────────────────────────────────────────
+# Each pyramid step is its own controllable gate. Severity dictates CI behavior:
+#   block — fails the build (exit 2)
+#   warn  — annotates the PR but exits 0
+#   log   — recorded only; never blocks
 layers:
-  heuristics:                       # Layer 1 — structural correctness
+  heuristics:                       # Layer 1
     severity: block
     aggregation: pass_rate
     threshold: { min: 1.0 }         # zero tolerance for format errors
 
-  judge_offline:                    # Layer 3 — quality rubric on golden set
+  judge_offline:                    # Layer 3
     severity: block
     aggregation: pass_rate_by_tag
     threshold:
@@ -54,8 +89,10 @@ layers:
         normal: 0.95
         edge:   0.80                # adversarial cases get more slack
 
+# ── Cost controls ────────────────────────────────────────────────────────────
+cost_cap_usd: 2.00
+concurrency: 4
+
 cache:
   dir: .evalguard/cache
   enabled: true
-
-concurrency: 4
