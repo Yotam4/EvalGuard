@@ -181,6 +181,19 @@ design doc and roadmap.
 | `evalguard audit verify <run_id>` | Walk the per-run hash chain (exit 2 on tamper) |
 | `evalguard audit export <run_id> -f jsonl\|prov-json\|otel-json` | Export for archival / OTel collector |
 
+### Event vocabulary (W3C PROV "Activity")
+
+| Kind | When |
+|---|---|
+| `run.started` | A new run begins |
+| `run.cost_capped` | `cost_cap_usd` was hit; subsequent rows abort pre-flight |
+| `run.finalized` | Final overall status is recorded |
+| `trial.started` / `trial.finalized` | Per (provider × prompt) trial |
+| `provider.called` | An LLM API call (the trial's main call **or** a judge's nested call — distinguishable via `payload.is_judge_call`) |
+| `evaluator.heuristic.invoked` / `metric.invoked` / `judge.invoked` | An evaluator scored a row |
+| `row.short_circuited` | A row failed an upstream block-severity layer; later layers were skipped |
+| `gate.evaluated` | A gate was applied to a trial's metrics |
+
 Exit codes: `0` pass · `2` blocking gate failed (or audit chain broken) · `1` infra/config error.
 
 ## Audit & governance

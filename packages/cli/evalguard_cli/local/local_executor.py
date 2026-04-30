@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from evalguard_cli.console import console
-from evalguard_cli.local.audit import AuditLog
+from evalguard_cli.local.audit import AuditHook, AuditLog
 from evalguard_cli.local.cache import ContentCache
 from evalguard_cli.local.gate import LAYER_INDEX
 from evalguard_cli.local.sqlite_store import SqliteStore
@@ -225,9 +225,28 @@ async def execute(
 
                 async with cost_lock:
                     total_cost += pr.cost_usd
+                    just_capped = (
+                        cost_cap is not None
+                        and total_cost >= cost_cap
+                        and not cost_capped.is_set()
+                    )
                     if cost_cap is not None and total_cost >= cost_cap:
                         aborted.set()
                         cost_capped.set()
+                if just_capped:
+                    audit.emit(
+                        "run.cost_capped",
+                        trial_id=trial_id, row_id=row_id,
+                        subject_id=cfg.project,
+                        payload={
+                            "cost_cap_usd":   cost_cap,
+                            "total_cost_usd": total_cost,
+                            "trial_id":       trial_id,
+                            "row_id":         row_id,
+                            "reason": "post-call cap reached; subsequent rows will abort pre-flight",
+                        },
+                        cost_usd=total_cost,
+                    )
 
                 audit.emit(
                     "provider.called",
@@ -259,8 +278,21 @@ async def execute(
                 for layer in layer_order:
                     layer_scores: list[Score] = []
                     for ev, ev_spec in evaluators_by_layer[layer]:
+                        # Pre-allocate the evaluator-event's span so the
+                        # evaluator can emit nested ``provider.called``
+                        # events (e.g. a judge's own LLM call) with the
+                        # right parent_span_id before this event itself
+                        # is emitted.
+                        ev_span_id = uuid.uuid4().hex[:16]
+                        ev._audit_hook = AuditHook(
+                            audit, ev_span_id,
+                            trial_id=trial_id, row_id=row_id,
+                        )
                         ev_t0 = time.monotonic()
-                        ev_scores = await ev.evaluate(ctx)
+                        try:
+                            ev_scores = await ev.evaluate(ctx)
+                        finally:
+                            ev._audit_hook = None
                         ev_dur = int((time.monotonic() - ev_t0) * 1000)
                         layer_scores.extend(ev_scores)
                         # Score.evaluator_id is the user-configured id (e.g.
@@ -280,6 +312,7 @@ async def execute(
                         audit.emit(
                             kind_event,
                             trial_id=trial_id, row_id=row_id,
+                            span_id=ev_span_id,
                             subject_kind=ev_kind,
                             subject_id=ev_id,
                             subject_version=ev_version,
@@ -315,6 +348,22 @@ async def execute(
                         run_mode, layer, blocking_layer_idxs
                     ):
                         short_circuited_at = layer
+                        skipped = [l for l in layer_order if l > layer]
+                        audit.emit(
+                            "row.short_circuited",
+                            trial_id=trial_id, row_id=row_id,
+                            subject_kind="row", subject_id=row_id,
+                            payload={
+                                "failed_at_layer": layer,
+                                "skipped_layers":  skipped,
+                                "run_mode":        run_mode,
+                                "reason": (
+                                    "blocking_severity_layer_failed"
+                                    if run_mode == "short_circuit_blocking_only"
+                                    else "any_layer_failed"
+                                ),
+                            },
+                        )
                         break
 
                 row_passed = all(s.passed for s in scores) if scores else True

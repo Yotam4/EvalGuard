@@ -40,8 +40,10 @@ from evalguard_cli.local.sqlite_store import SqliteStore
 EVENT_KINDS: dict[str, tuple[str, str | None]] = {
     "run.started":               ("Activity", "run"),
     "run.finalized":             ("Activity", "run"),
+    "run.cost_capped":           ("Activity", "run"),
     "trial.started":             ("Activity", "trial"),
     "trial.finalized":           ("Activity", "trial"),
+    "row.short_circuited":       ("Activity", "row"),
     "provider.called":           ("Activity", "provider"),
     "evaluator.heuristic.invoked": ("Activity", "heuristic"),
     "evaluator.metric.invoked":  ("Activity", "metric"),
@@ -140,8 +142,14 @@ class AuditLog:
         cost_usd: float | None = None,
         duration_ms: int | None = None,
         parent_span_id: str | None = None,
+        span_id: str | None = None,
     ) -> dict[str, Any]:
-        """Append one event. Returns the event dict (post-hash)."""
+        """Append one event. Returns the event dict (post-hash).
+
+        ``span_id`` may be pre-allocated by the caller so a sub-event
+        (e.g. a judge's nested provider call) can record this event's
+        span as its parent before this event is itself emitted.
+        """
         if kind not in EVENT_KINDS:
             raise ValueError(f"unknown event kind {kind!r}; add it to EVENT_KINDS")
 
@@ -155,7 +163,8 @@ class AuditLog:
 
         now_iso = _now_iso()
         event_id = _ulid()
-        span_id = uuid.uuid4().hex[:16]                  # 16 hex
+        if span_id is None:
+            span_id = uuid.uuid4().hex[:16]                  # 16 hex
         record: dict[str, Any] = {
             "event_id":        event_id,
             "kind":            kind,
@@ -199,6 +208,73 @@ class AuditLog:
                     "length":   len(_to_text(out[field])),
                 }
         return out
+
+
+# ---------------------------------------------------------------------------
+# Audit hook for nested events emitted by evaluators
+
+
+class AuditHook:
+    """Bound emitter handed to an evaluator before its invocation.
+
+    The executor pre-allocates the evaluator's span_id and constructs
+    an AuditHook bound to that span. The evaluator can then emit
+    nested events (e.g. a judge's own LLM call) with
+    ``parent_span_id`` already set correctly, without needing to know
+    the chain tip or actor identity.
+    """
+
+    def __init__(
+        self,
+        audit: "AuditLog",
+        parent_span_id: str,
+        *,
+        trial_id: str | None,
+        row_id: str | None,
+    ) -> None:
+        self._audit = audit
+        self._parent_span_id = parent_span_id
+        self._trial_id = trial_id
+        self._row_id = row_id
+
+    def emit_provider_call(
+        self,
+        *,
+        provider: str,
+        model: str,
+        prompt: str,
+        response: str,
+        model_params: dict[str, Any] | None = None,
+        tokens: dict[str, int] | None = None,
+        cost_usd: float = 0.0,
+        latency_ms: int = 0,
+        raw: dict[str, Any] | None = None,
+        is_judge_call: bool = False,
+        cache_hit: bool = False,
+    ) -> dict[str, Any]:
+        """Record one LLM API call as a child of the current evaluator span."""
+        return self._audit.emit(
+            "provider.called",
+            trial_id=self._trial_id,
+            row_id=self._row_id,
+            subject_id=f"{provider}:{model}",
+            inputs=prompt,
+            outputs=response,
+            payload={
+                "provider":        provider,
+                "model":           model,
+                "rendered_prompt": prompt,
+                "raw_response":    response,
+                "model_params":    model_params or {},
+                "tokens":          tokens,
+                "raw_provider":    raw or {},
+                "is_judge_call":   is_judge_call,
+                "cache_hit":       cache_hit,
+            },
+            cost_usd=cost_usd,
+            duration_ms=latency_ms,
+            parent_span_id=self._parent_span_id,
+        )
 
 
 # ---------------------------------------------------------------------------

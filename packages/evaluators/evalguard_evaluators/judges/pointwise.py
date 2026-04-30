@@ -1,20 +1,37 @@
 """Layer-3 LLM-as-judge: G-Eval-style pointwise rubric scoring.
 
 Two implementations:
-- ``PointwiseJudge`` calls a real provider (OpenAI by default).
+- ``PointwiseJudge`` calls a real provider (OpenAI by default). Its own
+  LLM call is recorded as a nested ``provider.called`` audit event when
+  the executor has set an ``_audit_hook`` on the instance.
 - ``MockPointwiseJudge`` returns a deterministic, configurable score so
   examples and tests can run offline. This is what the quickstart uses.
+
+Both judges share a base class that carries the optional audit hook so
+the executor can treat them uniformly.
 """
 
 from __future__ import annotations
 
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any
 
 from evalguard_evaluators.base import EvalContext, Score
 from evalguard_evaluators.registry import load_provider
+
+
+class _AuditableJudge:
+    """Mixin: judges expose ``_audit_hook`` for nested-event emission.
+
+    The executor sets this attribute before calling ``evaluate()`` and
+    the judge checks it. ``None`` (the default) means "no audit
+    context" — useful for unit tests and direct-call usage.
+    """
+
+    _audit_hook: Any = None
 
 _DEFAULT_TEMPLATE = """You are a strict evaluator.
 
@@ -42,7 +59,7 @@ def _render_input(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2)
 
 
-class PointwiseJudge:
+class PointwiseJudge(_AuditableJudge):
     kind = "judge"
     layer = 3
 
@@ -86,12 +103,36 @@ class PointwiseJudge:
             output=ctx.output,
             expected_block=expected_block,
         )
+
+        t0 = time.monotonic()
         result = await provider.complete(prompt, model=self._model)
+        latency_ms = int((time.monotonic() - t0) * 1000)
+
+        # Nested audit event for the judge's own LLM call. ``parent_span_id``
+        # is the evaluator-event's span (set up by the executor before this
+        # call), so a downstream UI can render the judge call as a child of
+        # the evaluator.judge.invoked event in the trace tree.
+        if self._audit_hook is not None:
+            tokens = _extract_tokens(result.raw)
+            self._audit_hook.emit_provider_call(
+                provider=self._provider_name,
+                model=self._model,
+                prompt=prompt,
+                response=result.output,
+                model_params=self._provider_cfg,
+                tokens=tokens,
+                cost_usd=result.cost_usd,
+                latency_ms=latency_ms,
+                raw=result.raw,
+                is_judge_call=True,
+            )
+
         score, reason = _parse_score_json(result.output)
         passed = score >= self._threshold
         raw = {
             "judge_model": f"{self._provider_name}:{self._model}",
             "judge_cost_usd": result.cost_usd,
+            "judge_latency_ms": latency_ms,
             "score": score,
             "reason": reason,
             "raw": result.raw,
@@ -99,7 +140,7 @@ class PointwiseJudge:
         return [Score(self.id, self.kind, self.layer, float(score), passed, raw)]
 
 
-class MockPointwiseJudge:
+class MockPointwiseJudge(_AuditableJudge):
     """Deterministic offline judge for examples and tests."""
 
     kind = "judge"
@@ -135,6 +176,24 @@ class MockPointwiseJudge:
 
 
 _SCORE_RE = re.compile(r'"score"\s*:\s*([0-9]+(?:\.[0-9]+)?)')
+
+
+def _extract_tokens(raw: dict[str, Any] | None) -> dict[str, int] | None:
+    """Best-effort token extraction from common provider raw shapes.
+
+    Mirrors the helper in ``local_executor`` so judges produce the same
+    ``tokens`` field shape on their nested ``provider.called`` events.
+    """
+    if not raw:
+        return None
+    usage = raw.get("usage") if isinstance(raw, dict) else None
+    if not isinstance(usage, dict):
+        return None
+    return {
+        "prompt":     int(usage.get("prompt_tokens", 0) or 0),
+        "completion": int(usage.get("completion_tokens", 0) or 0),
+        "total":      int(usage.get("total_tokens", 0) or 0),
+    }
 
 
 def _parse_score_json(text: str) -> tuple[float, str]:

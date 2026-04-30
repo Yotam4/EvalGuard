@@ -3,10 +3,13 @@
 Useful for examples, CI, and tests where calling a real LLM is undesirable.
 Behaviour is configurable via the ``mode`` field:
 
-- ``echo``     return the input verbatim
-- ``expected`` return the row's ``expected`` field (set on the call)
+- ``echo``         return the input verbatim
+- ``expected``     return the row's ``expected`` field (set on the call)
 - ``json_summary`` return ``{"summary": "...", "topic": "..."}`` shaped to
   match the quickstart example schema
+- ``judge_score``  return ``{"score": <score>, "reason": "..."}`` parseable
+  by ``PointwiseJudge``; the score is configurable via the ``score``
+  config key (default 4.5).
 """
 
 from __future__ import annotations
@@ -24,10 +27,14 @@ class MockProvider:
     def __init__(self) -> None:
         self._mode: str = "json_summary"
         self._latency_ms: int = 5
+        self._score: float = 4.5
+        self._cost_per_call: float = 0.0
 
     def configure(self, cfg: dict[str, Any]) -> None:
         self._mode = cfg.get("mode", "json_summary")
         self._latency_ms = int(cfg.get("latency_ms", 5))
+        self._score = float(cfg.get("score", 4.5))
+        self._cost_per_call = float(cfg.get("cost_per_call", 0.0))
 
     async def complete(
         self,
@@ -41,14 +48,21 @@ class MockProvider:
             output = prompt
         elif self._mode == "json_summary":
             output = self._fake_summary(prompt)
+        elif self._mode == "judge_score":
+            output = json.dumps({"score": self._score, "reason": "mock judge response"})
         else:
             output = prompt[:200]
         elapsed = max(int((time.monotonic() - start) * 1000), self._latency_ms)
         return ProviderResult(
             output=output,
-            cost_usd=0.0,
+            cost_usd=self._cost_per_call,
             latency_ms=elapsed,
-            raw={"provider": "mock", "mode": self._mode, "model": model},
+            raw={
+                "provider": "mock", "mode": self._mode, "model": model,
+                "usage": {"prompt_tokens": len(prompt) // 4,
+                          "completion_tokens": len(output) // 4,
+                          "total_tokens": (len(prompt) + len(output)) // 4},
+            },
         )
 
     @staticmethod
