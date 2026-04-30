@@ -187,9 +187,24 @@ Exit codes: `0` pass · `2` blocking gate failed (or audit chain broken) · `1` 
 
 Every state change emits a typed, hash-chained event so corporate
 deployments can answer *who did what, when, against which version,
-with what inputs and outputs.* For an LLM-as-judge call that means
-the model id, model params, rendered prompt, raw response, parsed
-score, tokens, latency, and cost — captured automatically.
+with what inputs and outputs.* Every event also captures the **full
+criteria the user set** — not just the resolved verdict — so an
+auditor can answer:
+
+- For an **LLM judge**: which model judged this row, what temperature /
+  top_p / max_tokens, what threshold was the pass/fail criteria, which
+  rubric (content-hashed `rubric_version_id`), what score did it parse,
+  and what raw response did the model return.
+- For a **gate**: what severity, what aggregation, what threshold,
+  per-tag overrides, evaluator scope, custom Python check (if any).
+- For a **heuristic / metric**: the full evaluator spec — e.g.
+  `length: {max: 600, unit: chars}`, `not_contains: {value: "As an AI"}`.
+
+API keys, tokens, passwords and similar secrets are stripped from
+every event payload **before** the hash is computed (key match is
+case-insensitive: `api_key`, `Authorization`, `bearer_token`, …),
+so the chain still verifies and a leaked YAML config doesn't leak
+into the audit log.
 
 Vocabulary maps to W3C PROV (Activity / Entity / Agent). Field
 naming is OpenTelemetry-GenAI compatible so the same data ports

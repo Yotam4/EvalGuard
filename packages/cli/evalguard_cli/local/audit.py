@@ -61,6 +61,41 @@ _PRIVACY_SENSITIVE_FIELDS: tuple[str, ...] = (
     "rubric",
 )
 
+# Keys whose values are *always* stripped from every event payload before
+# storage — even when ``redact_payload`` is False. The threat is API keys
+# leaking from provider configs into the audit log: a YAML containing
+# ``api_key: ${OPENAI_API_KEY}`` would otherwise materialize the resolved
+# secret into events. Match is case-insensitive on the key name.
+_ALWAYS_REDACTED_KEYS: frozenset[str] = frozenset(map(str.lower, [
+    "api_key", "apikey", "api-key",
+    "token", "auth_token", "access_token", "refresh_token", "bearer_token",
+    "password", "passwd", "pwd",
+    "secret", "client_secret",
+    "authorization",
+    "openai_api_key", "anthropic_api_key", "ollama_api_key",
+]))
+
+
+def redact_secrets(value: Any) -> Any:
+    """Recursively replace known-sensitive values with ``"***"``.
+
+    Walks dicts and lists; leaves scalars intact. The match is on key
+    name (case-insensitive) — values are not inspected, so a secret
+    stored under an unexpected key name will still leak. Treat this as
+    defense-in-depth, not a substitute for keeping secrets in env vars.
+    """
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            if isinstance(k, str) and k.lower() in _ALWAYS_REDACTED_KEYS and v is not None:
+                out[k] = "***"
+            else:
+                out[k] = redact_secrets(v)
+        return out
+    if isinstance(value, list):
+        return [redact_secrets(v) for v in value]
+    return value
+
 
 # ---------------------------------------------------------------------------
 # Emitter
@@ -113,7 +148,10 @@ class AuditLog:
         if subject_kind is None:
             subject_kind = EVENT_KINDS[kind][1]
 
-        sanitized_payload = self._sanitize(dict(payload or {}))
+        # Strip API keys / tokens / passwords from payload + actor_meta
+        # *before* hashing, so the chain commits to the redacted form.
+        actor_meta = redact_secrets(self.actor.actor_meta)
+        sanitized_payload = self._sanitize(redact_secrets(dict(payload or {})))
 
         now_iso = _now_iso()
         event_id = _ulid()
@@ -126,7 +164,7 @@ class AuditLog:
             "row_id":          row_id,
             "actor_id":        self.actor.actor_id,
             "actor_type":      self.actor.actor_type,
-            "actor_meta":      self.actor.actor_meta,
+            "actor_meta":      actor_meta,
             "subject_kind":    subject_kind,
             "subject_id":      subject_id,
             "subject_version": subject_version,

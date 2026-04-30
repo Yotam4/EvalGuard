@@ -59,6 +59,14 @@ def run(
     gate_strategy = cfg.raw.get("gate_strategy", "all")
     audit = run_record.audit
 
+    # Map gate.name → resolved spec so each gate.evaluated event records
+    # the full pass/fail criteria the user set for this run (severity,
+    # aggregation, threshold, per_tag_overrides, evaluator scope,
+    # custom_check), not just the resolved verdict.
+    gate_specs: dict[str, dict] = {**(layer_gates or {})}
+    for legacy in legacy_gates:
+        gate_specs[legacy["name"]] = legacy
+
     # Per-trial gate evaluation
     trial_verdicts: list[dict] = []
     for trial in run_record.trials:
@@ -66,9 +74,13 @@ def run(
         trial_gates = evaluate_gates(legacy_gates, trial_metrics, layers=layer_gates)
         store.save_gate_results(run_record.run_id, trial_gates, trial_id=trial.trial_id)
 
-        # Audit: one event per gate evaluated, with the rule details and verdict.
+        # Audit: one event per gate evaluated. ``spec`` records the
+        # criteria the user set; ``details`` records what each rule
+        # actually evaluated to. Both shapes are needed for forensics —
+        # "what did the gate require" vs "what did it observe".
         if audit is not None:
             for g in trial_gates:
+                spec = gate_specs.get(g.name) or {}
                 audit.emit(
                     "gate.evaluated",
                     trial_id=trial.trial_id,
@@ -76,12 +88,20 @@ def run(
                     inputs=g.details,
                     outputs={"passed": g.passed, "severity": g.severity},
                     payload={
+                        # What the gate said happened
                         "gate_name": g.name,
                         "severity":  g.severity,
                         "blocking":  g.blocking,
                         "passed":    g.passed,
                         "layer":     g.layer,
                         "details":   g.details,
+                        # What the gate was configured to require
+                        "spec":             spec,
+                        "aggregation":      spec.get("aggregation"),
+                        "threshold":        spec.get("threshold"),
+                        "evaluator_scope":  spec.get("evaluator"),
+                        "custom_check":     spec.get("custom_check"),
+                        "rules":            spec.get("rules"),
                     },
                 )
 

@@ -112,14 +112,16 @@ async def execute(
 
     prompt_id, prompt_template, prompt_version_id = _resolve_prompt(cfg)
 
-    # Evaluator instances are shared across trials. They are
-    # configured-once and stateless across rows.
+    # Evaluator instances + their resolved specs are paired so every
+    # invocation event can carry the full evaluator config (model,
+    # threshold, rubric_version_id, etc.) — not just the resolved
+    # scores. Specs are post-${ENV} and post-resource-inlining.
     heuristic_evaluators = _build_evaluators(cfg.raw.get("heuristics", []), default_kind="heuristic")
     metric_evaluators = _build_evaluators(cfg.raw.get("metrics", []), default_kind="metric")
     judge_evaluators = _build_evaluators(cfg.raw.get("judges", []), default_kind="judge")
-    evaluators_by_layer: dict[int, list[Any]] = {}
-    for ev in heuristic_evaluators + metric_evaluators + judge_evaluators:
-        evaluators_by_layer.setdefault(int(ev.layer), []).append(ev)
+    evaluators_by_layer: dict[int, list[tuple[Any, dict[str, Any]]]] = {}
+    for ev, spec in heuristic_evaluators + metric_evaluators + judge_evaluators:
+        evaluators_by_layer.setdefault(int(ev.layer), []).append((ev, spec))
     layer_order = sorted(evaluators_by_layer)
 
     run_mode = cfg.raw.get("run_mode", "short_circuit_blocking_only")
@@ -256,20 +258,20 @@ async def execute(
                 short_circuited_at: int | None = None
                 for layer in layer_order:
                     layer_scores: list[Score] = []
-                    for ev in evaluators_by_layer[layer]:
+                    for ev, ev_spec in evaluators_by_layer[layer]:
                         ev_t0 = time.monotonic()
                         ev_scores = await ev.evaluate(ctx)
                         ev_dur = int((time.monotonic() - ev_t0) * 1000)
                         layer_scores.extend(ev_scores)
                         # Score.evaluator_id is the user-configured id (e.g.
-                        # "helpfulness_v3"); fall back to the class name only
-                        # when the evaluator emitted no scores.
+                        # "helpfulness_v3"); fall back to the spec id when the
+                        # evaluator emitted no scores.
                         first = ev_scores[0] if ev_scores else None
                         ev_kind = (first.evaluator_kind if first
-                                    else getattr(ev, "kind", "heuristic"))
+                                    else ev_spec.get("kind", "heuristic"))
                         ev_id = (first.evaluator_id if first
-                                  else type(ev).__name__)
-                        ev_version = getattr(ev, "version_id", None)
+                                  else ev_spec.get("id", ev_spec.get("type", type(ev).__name__)))
+                        ev_version = ev_spec.get("version_id")
                         kind_event = f"evaluator.{ev_kind}.invoked"
                         if kind_event not in {"evaluator.heuristic.invoked",
                                                "evaluator.metric.invoked",
@@ -284,16 +286,26 @@ async def execute(
                             inputs=pr.output,
                             outputs=[s.value for s in ev_scores],
                             payload={
+                                # What ran
                                 "evaluator_id":   ev_id,
                                 "evaluator_kind": ev_kind,
+                                "evaluator_type": ev_spec.get("type"),
                                 "layer":          layer,
+                                # Configuration as set by the user — captures
+                                # the full pass/fail criteria for this run:
+                                # threshold, model, model_params, rubric, etc.
+                                "spec":               ev_spec,
+                                "threshold":          ev_spec.get("threshold"),
+                                "model":              ev_spec.get("model"),
+                                "model_params":       ev_spec.get("params"),
+                                "rubric_version_id":  ev_spec.get("rubric_version_id"),
+                                "schema_version_id":  ev_spec.get("schema_version_id"),
+                                # What it produced
                                 "scores": [
                                     {"value": s.value, "passed": s.passed,
                                      "raw": s.raw}
                                     for s in ev_scores
                                 ],
-                                "model": getattr(ev, "model", None),
-                                "model_params": getattr(ev, "params", None),
                             },
                             duration_ms=ev_dur,
                         )
@@ -468,8 +480,18 @@ def _should_short_circuit(run_mode: str, layer: int, blocking_layer_idxs: set[in
     return layer in blocking_layer_idxs
 
 
-def _build_evaluators(specs: list[dict[str, Any]], default_kind: str) -> list[Any]:
-    out = []
+def _build_evaluators(
+    specs: list[dict[str, Any]], default_kind: str,
+) -> list[tuple[Any, dict[str, Any]]]:
+    """Return (instance, resolved_spec) pairs.
+
+    The returned spec is the one the audit log will record on every
+    invocation; it includes ``version_id`` (content hash of the asset)
+    and any inlined assets like ``schema`` / ``rubric`` resolved by the
+    YAML loader, but excludes the synthesized ``id`` fallback so the
+    audit reflects what the user actually configured.
+    """
+    out: list[tuple[Any, dict[str, Any]]] = []
     for spec in specs:
         type_name = spec["type"]
         ep_name = f"{default_kind}.{type_name}"
@@ -477,7 +499,11 @@ def _build_evaluators(specs: list[dict[str, Any]], default_kind: str) -> list[An
                if k not in {"type", "version_id", "schema_version_id", "rubric_version_id"}}
         if "id" not in cfg:
             cfg["id"] = type_name
-        out.append(load_evaluator(ep_name, cfg))
+        instance = load_evaluator(ep_name, cfg)
+        # Carry the resolved-but-unhashed spec for audit. We add ``kind``
+        # so the caller can look it up without an isinstance check.
+        spec_for_audit = {**spec, "kind": default_kind}
+        out.append((instance, spec_for_audit))
     return out
 
 

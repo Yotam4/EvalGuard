@@ -227,3 +227,160 @@ def test_serialized_run_omits_events_by_default(tmp_path):
     store.finalize_run(record.run_id, status="passed", gate_status="none")
     payload = run_to_dict(store, record.run_id)
     assert "audit" not in payload
+
+
+# ---------------------------------------------------------------------------
+# criteria capture — every gate / evaluator records the user-set criteria
+
+
+def test_judge_event_records_full_spec_and_threshold(tmp_path):
+    """For an LLM judge, the audit event must record the model, params,
+    threshold, and content-hashed version_id — i.e. the pass/fail
+    criteria the user set for this run."""
+    store, record = _run(tmp_path)
+    [judge_event] = store.list_events(record.run_id, kind="evaluator.judge.invoked", limit=1)
+    p = judge_event["payload"]
+
+    assert p["evaluator_id"] == "q"
+    assert p["evaluator_kind"] == "judge"
+    assert p["evaluator_type"] == "mock_pointwise"
+    assert p["threshold"] == 4.0
+    # Full configured spec is on the event.
+    assert "spec" in p
+    assert p["spec"]["id"] == "q"
+    assert p["spec"]["score"] == 4.5
+    assert p["spec"]["threshold"] == 4.0
+    # Content-hashed version_id present on both spec and event subject_version.
+    assert p["spec"]["version_id"]
+    assert judge_event["subject_version"] == p["spec"]["version_id"]
+
+
+def test_gate_event_records_full_criteria(tmp_path):
+    """gate.evaluated events must record severity / aggregation /
+    threshold so an auditor can see exactly what the gate required,
+    not just whether it passed."""
+    cfg = load_config(_project(tmp_path))
+    # Override layers to use a richer threshold + tags so the test
+    # covers per_tag_overrides too.
+    cfg.raw["layers"] = {
+        "judge_offline": {
+            "severity": "block",
+            "aggregation": "pass_rate_by_tag",
+            "threshold": {
+                "min": 0.9,
+                "per_tag_overrides": {"normal": 0.95, "edge": 0.8},
+            },
+        },
+    }
+    store = SqliteStore(tmp_path / "rich.db")
+    store.init_schema()
+    record = asyncio.run(execute(cfg, store=store, quiet=True))
+    # Now run the gate eval the way run_cmd does.
+    from evalguard_cli.local.gate import evaluate_gates
+    metrics = store.compute_metrics(record.run_id, trial_id=record.trials[0].trial_id)
+    gates = evaluate_gates(None, metrics, layers=cfg.raw["layers"])
+    store.save_gate_results(record.run_id, gates, trial_id=record.trials[0].trial_id)
+    record.audit.emit(
+        "gate.evaluated",
+        trial_id=record.trials[0].trial_id,
+        subject_id=gates[0].name,
+        payload={
+            "gate_name":   gates[0].name,
+            "severity":    gates[0].severity,
+            "passed":      gates[0].passed,
+            "spec":        cfg.raw["layers"]["judge_offline"],
+            "aggregation": cfg.raw["layers"]["judge_offline"]["aggregation"],
+            "threshold":   cfg.raw["layers"]["judge_offline"]["threshold"],
+        },
+    )
+
+    [gate_event] = store.list_events(record.run_id, kind="gate.evaluated", limit=1)
+    p = gate_event["payload"]
+    assert p["aggregation"] == "pass_rate_by_tag"
+    assert p["threshold"]["min"] == 0.9
+    assert p["threshold"]["per_tag_overrides"] == {"normal": 0.95, "edge": 0.8}
+    assert p["spec"]["severity"] == "block"
+
+
+def test_heuristic_event_records_evaluator_spec(tmp_path):
+    """Heuristic config (e.g. ``length: {max: 600}``) must be on the
+    invocation event — not just the resolved score."""
+    (tmp_path / "datasets").mkdir(parents=True)
+    (tmp_path / "datasets" / "g.jsonl").write_text(
+        '{"id":"r1","input":"hi"}\n'
+    )
+    cfg_path = tmp_path / "evalguard.yaml"
+    cfg_path.write_text(
+        "version: 1\nproject: t\n"
+        "providers: [{ id: 'mock:m', config: { mode: echo } }]\n"
+        "datasets: [{ id: g, file: datasets/g.jsonl }]\n"
+        "heuristics:\n"
+        "  - { type: length, max: 50, unit: chars }\n"
+        "  - { type: not_contains, value: 'As an AI' }\n"
+    )
+    cfg = load_config(cfg_path)
+    store = SqliteStore(tmp_path / "local.db")
+    store.init_schema()
+    record = asyncio.run(execute(cfg, store=store, quiet=True))
+
+    h_events = store.list_events(record.run_id, kind="evaluator.heuristic.invoked")
+    by_type = {e["payload"]["evaluator_type"]: e["payload"] for e in h_events}
+    assert by_type["length"]["spec"]["max"] == 50
+    assert by_type["length"]["spec"]["unit"] == "chars"
+    assert by_type["not_contains"]["spec"]["value"] == "As an AI"
+
+
+# ---------------------------------------------------------------------------
+# secret redaction — API keys must never end up in audit payloads
+
+
+def test_api_key_in_provider_config_is_redacted(tmp_path, monkeypatch):
+    """If the user puts ``api_key: sk-...`` in their YAML config, the
+    secret must not materialize in any audit event."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-LIVE-must-not-leak")
+    (tmp_path / "datasets").mkdir(parents=True)
+    (tmp_path / "datasets" / "g.jsonl").write_text(
+        '{"id":"r1","input":"hi"}\n'
+    )
+    cfg_path = tmp_path / "evalguard.yaml"
+    cfg_path.write_text(
+        "version: 1\nproject: t\n"
+        "providers:\n"
+        "  - id: 'mock:m'\n"
+        "    config:\n"
+        "      api_key: '${OPENAI_API_KEY}'\n"
+        "      mode: echo\n"
+        "datasets: [{ id: g, file: datasets/g.jsonl }]\n"
+    )
+    cfg = load_config(cfg_path)
+    store = SqliteStore(tmp_path / "local.db")
+    store.init_schema()
+    record = asyncio.run(execute(cfg, store=store, quiet=True))
+
+    # Walk every event and confirm the live key never appears anywhere.
+    raw = sqlite3.connect(tmp_path / "local.db")
+    rows = raw.execute("SELECT actor_meta_json, payload_json FROM events").fetchall()
+    raw.close()
+    for actor_meta, payload in rows:
+        assert "sk-LIVE-must-not-leak" not in (actor_meta or "")
+        assert "sk-LIVE-must-not-leak" not in (payload or "")
+    # And the redaction sentinel is present in the trial.started payload
+    # which carries provider_config.
+    [trial_started] = store.list_events(record.run_id, kind="trial.started", limit=1)
+    assert trial_started["payload"]["provider_config"]["api_key"] == "***"
+
+
+def test_redactor_handles_nested_secrets():
+    from evalguard_cli.local.audit import redact_secrets
+    out = redact_secrets({
+        "api_key": "secret",
+        "model_params": {"temperature": 0, "auth_token": "T"},
+        "list_field": [{"password": "p", "ok": "v"}],
+        "case_check": {"API-KEY": "secret"},
+    })
+    assert out["api_key"] == "***"
+    assert out["model_params"]["temperature"] == 0
+    assert out["model_params"]["auth_token"] == "***"
+    assert out["list_field"][0]["password"] == "***"
+    assert out["list_field"][0]["ok"] == "v"
+    assert out["case_check"]["API-KEY"] == "***"
