@@ -142,6 +142,18 @@
       "enum": ["all", "any"],
       "default": "all",
       "description": "How to combine per-trial gate verdicts. 'all' (default) requires every trial to pass all blocking gates; 'any' passes the run if at least one trial passes."
+    },
+    "audit": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Per-run audit / governance controls. Events are always recorded; this block configures retention and privacy.",
+      "properties": {
+        "redact_payload": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true, strip rendered prompts / raw responses / judge reasons from event payloads but keep their content hashes so the chain still verifies."
+        }
+      }
     }
   },
   "$defs": {

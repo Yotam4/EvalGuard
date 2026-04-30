@@ -57,6 +57,7 @@ def run(
     legacy_gates = cfg.raw.get("gates") or []
     layer_gates = cfg.raw.get("layers") or {}
     gate_strategy = cfg.raw.get("gate_strategy", "all")
+    audit = run_record.audit
 
     # Per-trial gate evaluation
     trial_verdicts: list[dict] = []
@@ -64,6 +65,25 @@ def run(
         trial_metrics = store.compute_metrics(run_record.run_id, trial_id=trial.trial_id)
         trial_gates = evaluate_gates(legacy_gates, trial_metrics, layers=layer_gates)
         store.save_gate_results(run_record.run_id, trial_gates, trial_id=trial.trial_id)
+
+        # Audit: one event per gate evaluated, with the rule details and verdict.
+        if audit is not None:
+            for g in trial_gates:
+                audit.emit(
+                    "gate.evaluated",
+                    trial_id=trial.trial_id,
+                    subject_id=g.name,
+                    inputs=g.details,
+                    outputs={"passed": g.passed, "severity": g.severity},
+                    payload={
+                        "gate_name": g.name,
+                        "severity":  g.severity,
+                        "blocking":  g.blocking,
+                        "passed":    g.passed,
+                        "layer":     g.layer,
+                        "details":   g.details,
+                    },
+                )
 
         trial_blocking_failed = any(g.passed is False and g.severity == "block" for g in trial_gates)
         trial_warned = any(g.passed is False and g.severity == "warn" for g in trial_gates)
@@ -138,6 +158,24 @@ def run(
         overall = "passed"
 
     store.finalize_run(run_record.run_id, status=overall, gate_status=gate_status_overall)
+
+    if audit is not None:
+        audit.emit(
+            "run.finalized",
+            subject_id=run_record.project,
+            payload={
+                "status":         overall,
+                "gate_status":    gate_status_overall,
+                "row_status":     run_record.row_status,
+                "row_count":      run_record.row_count,
+                "row_pass_count": run_record.row_pass_count,
+                "row_fail_count": run_record.row_fail_count,
+                "cost_usd":       run_record.cost_usd,
+                "trial_count":    len(run_record.trials),
+                "gate_strategy":  gate_strategy,
+            },
+            cost_usd=run_record.cost_usd,
+        )
 
     console.print(
         f"\n[bold]overall:[/bold] {_pretty(overall)}  "

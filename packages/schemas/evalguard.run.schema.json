@@ -49,6 +49,20 @@
         "metrics": { "type": "object" },
         "gates":   { "type": "array", "items": { "$ref": "#/$defs/gate" } }
       }
+    },
+    "audit": {
+      "type": "object",
+      "description": "Append-only audit timeline. Present only when ``--events`` is requested.",
+      "additionalProperties": false,
+      "properties": {
+        "actor_id":    { "type": ["string", "null"] },
+        "actor_type":  { "type": ["string", "null"], "enum": [null, "cli", "ci", "api_key", "system"] },
+        "actor_meta":  { "type": "object" },
+        "trace_id":    { "type": ["string", "null"] },
+        "event_count": { "type": "integer", "minimum": 0 },
+        "chain_tip":   { "type": ["string", "null"] },
+        "events":      { "type": "array", "items": { "$ref": "#/$defs/event" } }
+      }
     }
   },
   "$defs": {
@@ -152,6 +166,37 @@
         "trial_id":    { "type": "string" },
         "provider_id": { "type": "string" },
         "value":       { "type": "number" }
+      }
+    },
+    "event": {
+      "type": "object",
+      "description": "One audit/provenance event. Hash-chained per run_id.",
+      "additionalProperties": true,
+      "required": ["event_id", "kind", "run_id", "actor_id", "actor_type", "started_at", "event_hash"],
+      "properties": {
+        "event_id":        { "type": "string" },
+        "kind":            { "type": "string" },
+        "run_id":          { "type": "string" },
+        "trial_id":        { "type": ["string", "null"] },
+        "row_id":          { "type": ["string", "null"] },
+        "actor_id":        { "type": "string" },
+        "actor_type":      { "type": "string", "enum": ["cli", "ci", "api_key", "system"] },
+        "actor_meta":      { "type": "object" },
+        "subject_kind":    { "type": ["string", "null"] },
+        "subject_id":      { "type": ["string", "null"] },
+        "subject_version": { "type": ["string", "null"] },
+        "inputs_hash":     { "type": ["string", "null"] },
+        "outputs_hash":    { "type": ["string", "null"] },
+        "payload":         { "type": "object" },
+        "cost_usd":        { "type": ["number", "null"] },
+        "started_at":      { "type": "string" },
+        "finished_at":     { "type": ["string", "null"] },
+        "duration_ms":     { "type": ["integer", "null"] },
+        "trace_id":        { "type": ["string", "null"] },
+        "span_id":         { "type": ["string", "null"] },
+        "parent_span_id":  { "type": ["string", "null"] },
+        "prev_event_hash": { "type": ["string", "null"] },
+        "event_hash":      { "type": "string" }
       }
     }
   }

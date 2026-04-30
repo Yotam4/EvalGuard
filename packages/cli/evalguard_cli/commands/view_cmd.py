@@ -33,6 +33,7 @@ def view(
     last: bool = typer.Option(False, "--last", help="Use the most recent run regardless of run_id"),
     as_json: bool = typer.Option(False, "--json", help="Emit the stable JSON contract to stdout"),
     include_scores: bool = typer.Option(False, "--scores", help="Include full per-row scores in --json"),
+    include_events: bool = typer.Option(False, "--events", help="Include the full audit timeline in --json"),
     db_path: Path = typer.Option(Path(".evalguard/local.db"), "--db", help="SQLite path"),
     limit: int = typer.Option(10, "--limit", "-n", help="When listing, how many runs to show"),
 ) -> None:
@@ -64,7 +65,11 @@ def view(
         if full is None:
             console.print("[red]--json requires a run_id (or pass --last)[/red]")
             raise typer.Exit(1)
-        print(run_to_json(store, full["run_id"], include_scores=include_scores))
+        print(run_to_json(
+            store, full["run_id"],
+            include_scores=include_scores,
+            include_events=include_events,
+        ))
         return
 
     if (row is not None or trial is not None) and full is None:

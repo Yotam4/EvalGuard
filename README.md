@@ -38,7 +38,12 @@ golden set, your own rubric, your own thresholds.
 4. **Everything is versioned.** Prompts, datasets, schemas, rubrics,
    judges, heuristics each get a content-hashed `version_id` so a CI
    gate can compare apples to apples across PRs.
-5. **Local-first, server-optional.** The CLI runs entirely on your
+5. **Every action is audited.** Each run emits an append-only,
+   hash-chained event log: who triggered it, which model judged what,
+   what score it returned, which gate passed or failed. Tamper
+   detection is one CLI call (`evalguard audit verify`); export is
+   `jsonl`, W3C `prov-json`, or OpenTelemetry-flavoured `otel-json`.
+6. **Local-first, server-optional.** The CLI runs entirely on your
    laptop with SQLite. The same config will run on a shared server
    later for org-wide visibility.
 
@@ -169,9 +174,55 @@ design doc and roadmap.
 | `evalguard run [-c evalguard.yaml]` | Run pipeline; exit 0/2 by gate severity |
 | `evalguard view` | List recent runs |
 | `evalguard view <run_id>` | Rows table + per-layer rollup + gates |
-| `evalguard view <run_id> --row R [--layer N]` | Drill into one row |
+| `evalguard view <run_id> --trial T` | Per-trial drill-down |
+| `evalguard view <run_id> --row R [--layer N]` | Per-row drill-down |
+| `evalguard view <run_id> --json [--scores] [--events]` | Stable JSON contract |
+| `evalguard audit show <run_id> [--kind K]` | Render the audit timeline |
+| `evalguard audit verify <run_id>` | Walk the per-run hash chain (exit 2 on tamper) |
+| `evalguard audit export <run_id> -f jsonl\|prov-json\|otel-json` | Export for archival / OTel collector |
 
-Exit codes: `0` pass · `2` blocking gate failed · `1` infra/config error.
+Exit codes: `0` pass · `2` blocking gate failed (or audit chain broken) · `1` infra/config error.
+
+## Audit & governance
+
+Every state change emits a typed, hash-chained event so corporate
+deployments can answer *who did what, when, against which version,
+with what inputs and outputs.* For an LLM-as-judge call that means
+the model id, model params, rendered prompt, raw response, parsed
+score, tokens, latency, and cost — captured automatically.
+
+Vocabulary maps to W3C PROV (Activity / Entity / Agent). Field
+naming is OpenTelemetry-GenAI compatible so the same data ports
+cleanly to OTLP later. Hash chain is per-`run_id` (single-writer
+hash chain — sufficient for self-host; Sigstore-Rekor / Merkle
+upgrade lives on the enterprise tier).
+
+Privacy: `audit.redact_payload: true` strips rendered prompts,
+raw responses, and judge reasons from the payload but **keeps their
+content hashes** so the chain still verifies after erasure — the
+pattern Sentry / Langfuse use to reconcile append-only logs with
+GDPR right-to-erasure.
+
+```yaml
+audit:
+  redact_payload: false     # set true to comply with PII / PHI policies
+```
+
+```text
+$ evalguard audit show run_abc --kind evaluator.judge.invoked
+Audit timeline · run_abc (10 events)
+┏━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━┳━━━━━━━━━━┳━━━━━┳━━━━━┳━━━━━━┳━━━━━━┓
+┃ at           ┃ kind                    ┃ s… ┃ trial    ┃ row ┃ d_ms┃ cost ┃ hash ┃
+┡──────────────╇─────────────────────────╇────╇──────────╇─────╇─────╇──────╇──────┩
+│ 12:00:00.583 │ evaluator.judge.invoked │ q  │ trial_a… │ n1  │  17 │      │ fdd5… │
+│ ...                                                                              │
+actor: ci:gh:acme/widgets#run/12345  (ci)
+
+$ evalguard audit verify run_abc
+✓ chain intact · 60 events · run run_abc
+
+$ evalguard audit export run_abc -f otel-json | otel-collector ingest
+```
 
 ## Repo layout
 

@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from evalguard_cli.console import console
+from evalguard_cli.local.audit import AuditLog
 from evalguard_cli.local.cache import ContentCache
 from evalguard_cli.local.gate import LAYER_INDEX
 from evalguard_cli.local.sqlite_store import SqliteStore
@@ -63,6 +64,7 @@ class RunRecord:
     cost_usd: float
     row_status: str               # aggregate across trials
     trials: list[TrialRecord] = field(default_factory=list)
+    audit: "AuditLog | None" = None
 
 
 async def execute(
@@ -75,10 +77,29 @@ async def execute(
     run_id = f"run_{uuid.uuid4().hex[:16]}"
     project = cfg.project
     store.start_run(run_id, project, cfg.config_hash, assets=cfg.assets)
+
+    audit_cfg = cfg.raw.get("audit") or {}
+    audit = AuditLog(
+        store, run_id,
+        redact_payload=bool(audit_cfg.get("redact_payload", False)),
+    )
+    audit.emit(
+        "run.started",
+        subject_id=project,
+        subject_version=cfg.config_hash,
+        payload={
+            "project":     project,
+            "config_hash": cfg.config_hash,
+            "asset_count": len(cfg.assets),
+            "providers":   [p["id"] for p in cfg.raw.get("providers", [])],
+            "run_mode":    cfg.raw.get("run_mode", "short_circuit_blocking_only"),
+        },
+    )
+
     if not quiet:
         console.print(
             f"[bold]Run[/bold] {run_id}  project={project}  "
-            f"config={cfg.config_hash[:12]}…"
+            f"config={cfg.config_hash[:12]}…  actor={audit.actor.actor_id}"
         )
 
     cache_dir = Path(cfg.raw.get("cache", {}).get("dir", ".evalguard/cache"))
@@ -141,6 +162,18 @@ async def execute(
             prompt_id=prompt_id, prompt_version_id=prompt_version_id,
             config=provider_cfg,
         )
+        audit.emit(
+            "trial.started",
+            trial_id=trial_id,
+            subject_id=provider_id,
+            payload={
+                "provider":          provider_name,
+                "model":             model,
+                "provider_config":   provider_cfg,
+                "prompt_id":         prompt_id,
+                "prompt_version_id": prompt_version_id,
+            },
+        )
         if not quiet:
             console.print(f"\n[bold cyan]▶ trial[/bold cyan] {trial_id} · {provider_id}")
 
@@ -194,6 +227,26 @@ async def execute(
                         aborted.set()
                         cost_capped.set()
 
+                audit.emit(
+                    "provider.called",
+                    trial_id=trial_id, row_id=row_id,
+                    subject_id=provider_id,
+                    inputs=prompt,
+                    outputs=pr.output,
+                    payload={
+                        "provider":         provider_name,
+                        "model":            model,
+                        "model_params":     provider_cfg,
+                        "rendered_prompt":  prompt,
+                        "raw_response":     pr.output,
+                        "raw_provider":     pr.raw,
+                        "cache_hit":        cache_hit,
+                        "tokens":           _extract_tokens(pr.raw),
+                    },
+                    cost_usd=pr.cost_usd,
+                    duration_ms=pr.latency_ms,
+                )
+
                 ctx = EvalContext(
                     row_id=row_id, input=input_value, expected=expected,
                     output=pr.output, provider=provider_name, model=model,
@@ -204,7 +257,46 @@ async def execute(
                 for layer in layer_order:
                     layer_scores: list[Score] = []
                     for ev in evaluators_by_layer[layer]:
-                        layer_scores.extend(await ev.evaluate(ctx))
+                        ev_t0 = time.monotonic()
+                        ev_scores = await ev.evaluate(ctx)
+                        ev_dur = int((time.monotonic() - ev_t0) * 1000)
+                        layer_scores.extend(ev_scores)
+                        # Score.evaluator_id is the user-configured id (e.g.
+                        # "helpfulness_v3"); fall back to the class name only
+                        # when the evaluator emitted no scores.
+                        first = ev_scores[0] if ev_scores else None
+                        ev_kind = (first.evaluator_kind if first
+                                    else getattr(ev, "kind", "heuristic"))
+                        ev_id = (first.evaluator_id if first
+                                  else type(ev).__name__)
+                        ev_version = getattr(ev, "version_id", None)
+                        kind_event = f"evaluator.{ev_kind}.invoked"
+                        if kind_event not in {"evaluator.heuristic.invoked",
+                                               "evaluator.metric.invoked",
+                                               "evaluator.judge.invoked"}:
+                            kind_event = "evaluator.heuristic.invoked"
+                        audit.emit(
+                            kind_event,
+                            trial_id=trial_id, row_id=row_id,
+                            subject_kind=ev_kind,
+                            subject_id=ev_id,
+                            subject_version=ev_version,
+                            inputs=pr.output,
+                            outputs=[s.value for s in ev_scores],
+                            payload={
+                                "evaluator_id":   ev_id,
+                                "evaluator_kind": ev_kind,
+                                "layer":          layer,
+                                "scores": [
+                                    {"value": s.value, "passed": s.passed,
+                                     "raw": s.raw}
+                                    for s in ev_scores
+                                ],
+                                "model": getattr(ev, "model", None),
+                                "model_params": getattr(ev, "params", None),
+                            },
+                            duration_ms=ev_dur,
+                        )
                     scores.extend(layer_scores)
                     layer_failed = any(not s.passed for s in layer_scores)
                     if layer_failed and _should_short_circuit(
@@ -258,6 +350,19 @@ async def execute(
             row_count=len(rows),
             row_pass_count=trial_pass,
             row_fail_count=trial_fail,
+        )
+        audit.emit(
+            "trial.finalized",
+            trial_id=trial_id,
+            subject_id=provider_id,
+            payload={
+                "row_count":      len(rows),
+                "row_pass_count": trial_pass,
+                "row_fail_count": trial_fail,
+                "row_status":     trial_status,
+                "cost_usd":       trial_cost,
+            },
+            cost_usd=trial_cost,
         )
 
         trials.append(TrialRecord(
@@ -315,8 +420,22 @@ async def execute(
         run_id=run_id, project=project, config_hash=cfg.config_hash,
         row_count=total_rows, row_pass_count=total_pass, row_fail_count=total_fail,
         cost_usd=total_cost, row_status=row_status,
-        trials=trials,
+        trials=trials, audit=audit,
     )
+
+
+def _extract_tokens(raw: dict[str, Any] | None) -> dict[str, int] | None:
+    """Best-effort token extraction from common provider raw shapes."""
+    if not raw:
+        return None
+    usage = raw.get("usage") if isinstance(raw, dict) else None
+    if not isinstance(usage, dict):
+        return None
+    return {
+        "prompt":     int(usage.get("prompt_tokens", 0) or 0),
+        "completion": int(usage.get("completion_tokens", 0) or 0),
+        "total":      int(usage.get("total_tokens", 0) or 0),
+    }
 
 
 # ---------------------------------------------------------------------------

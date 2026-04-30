@@ -118,6 +118,39 @@ CREATE TABLE IF NOT EXISTS assets (
   source        TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_assets_run ON assets(run_id);
+
+-- Append-only audit / provenance log. Source of truth for "who/what/when/why";
+-- the runs/trials/scores/gate_results tables above are queryable views built
+-- by the executor as it emits events. ``prev_event_hash`` chains events per
+-- ``run_id`` partition (single-writer hash chain — sufficient for self-host).
+CREATE TABLE IF NOT EXISTS events (
+  event_id        TEXT PRIMARY KEY,        -- ULID, sortable
+  kind            TEXT NOT NULL,           -- 'run.started', 'evaluator.judge.invoked', ...
+  run_id          TEXT NOT NULL,
+  trial_id        TEXT,
+  row_id          TEXT,
+  actor_id        TEXT NOT NULL,
+  actor_type      TEXT NOT NULL,           -- cli | ci | api_key | system
+  actor_meta_json TEXT,
+  subject_kind    TEXT,
+  subject_id      TEXT,
+  subject_version TEXT,                    -- content-hashed asset version_id
+  inputs_hash     TEXT,                    -- sha256 of canonical inputs
+  outputs_hash    TEXT,                    -- sha256 of canonical outputs
+  payload_json    TEXT,
+  cost_usd        REAL,
+  started_at      TEXT NOT NULL,
+  finished_at     TEXT,
+  duration_ms     INTEGER,
+  trace_id        TEXT,                    -- per-run W3C trace id
+  span_id         TEXT,
+  parent_span_id  TEXT,
+  prev_event_hash TEXT,
+  event_hash      TEXT NOT NULL UNIQUE
+);
+CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_events_trial ON events(trial_id);
+CREATE INDEX IF NOT EXISTS idx_events_kind ON events(run_id, kind);
 """
 
 
@@ -525,6 +558,74 @@ class SqliteStore:
 
     # --- read helpers ------------------------------------------------------
 
+    # --- audit events ------------------------------------------------------
+
+    def insert_event(self, event: dict[str, Any]) -> None:
+        """Append one fully-formed event row. ``event_hash`` must be set."""
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO events(
+                       event_id, kind, run_id, trial_id, row_id,
+                       actor_id, actor_type, actor_meta_json,
+                       subject_kind, subject_id, subject_version,
+                       inputs_hash, outputs_hash, payload_json,
+                       cost_usd, started_at, finished_at, duration_ms,
+                       trace_id, span_id, parent_span_id,
+                       prev_event_hash, event_hash)
+                   VALUES (?,?,?,?,?, ?,?,?, ?,?,?, ?,?,?, ?,?,?,?, ?,?,?, ?,?)""",
+                (
+                    event["event_id"], event["kind"], event["run_id"],
+                    event.get("trial_id"), event.get("row_id"),
+                    event["actor_id"], event["actor_type"],
+                    json.dumps(event.get("actor_meta") or {}, default=str),
+                    event.get("subject_kind"), event.get("subject_id"),
+                    event.get("subject_version"),
+                    event.get("inputs_hash"), event.get("outputs_hash"),
+                    json.dumps(event.get("payload") or {}, default=str),
+                    event.get("cost_usd"),
+                    event["started_at"], event.get("finished_at"),
+                    event.get("duration_ms"),
+                    event.get("trace_id"), event.get("span_id"),
+                    event.get("parent_span_id"),
+                    event.get("prev_event_hash"), event["event_hash"],
+                ),
+            )
+
+    def last_event_hash(self, run_id: str) -> str | None:
+        """Most recent ``event_hash`` for the run (the chain tip)."""
+        with self._conn() as c:
+            r = c.execute(
+                "SELECT event_hash FROM events WHERE run_id=? ORDER BY started_at DESC, event_id DESC LIMIT 1",
+                (run_id,),
+            ).fetchone()
+        return r["event_hash"] if r else None
+
+    def list_events(
+        self,
+        run_id: str,
+        *,
+        kind: str | None = None,
+        trial_id: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = ["run_id=?"]
+        args: list[Any] = [run_id]
+        if kind is not None:
+            clauses.append("kind=?")
+            args.append(kind)
+        if trial_id is not None:
+            clauses.append("trial_id=?")
+            args.append(trial_id)
+        sql = (
+            "SELECT * FROM events WHERE " + " AND ".join(clauses)
+            + " ORDER BY started_at, event_id"
+        )
+        if limit is not None:
+            sql += f" LIMIT {int(limit)}"
+        with self._conn() as c:
+            rows = c.execute(sql, args).fetchall()
+        return [_event_row_to_dict(r) for r in rows]
+
     def list_runs(self, limit: int = 10) -> list[dict[str, Any]]:
         with self._conn() as c:
             rows = c.execute(
@@ -703,6 +804,40 @@ class SqliteStore:
             "best_by": best_by,
             "trials":  [t["trial_id"] for t in trials],
         }
+
+
+def _event_row_to_dict(r: Any) -> dict[str, Any]:
+    """Lossless round-trip: a NULL column comes back as ``None``, never 0/0.0.
+
+    The hash chain depends on this — ``_hash_event`` will recompute over
+    the read-back dict, and any normalization (e.g. ``None`` → ``0.0``)
+    silently invalidates every event past it.
+    """
+    return {
+        "event_id":        r["event_id"],
+        "kind":            r["kind"],
+        "run_id":          r["run_id"],
+        "trial_id":        r["trial_id"],
+        "row_id":          r["row_id"],
+        "actor_id":        r["actor_id"],
+        "actor_type":      r["actor_type"],
+        "actor_meta":      json.loads(r["actor_meta_json"]) if r["actor_meta_json"] else {},
+        "subject_kind":    r["subject_kind"],
+        "subject_id":      r["subject_id"],
+        "subject_version": r["subject_version"],
+        "inputs_hash":     r["inputs_hash"],
+        "outputs_hash":    r["outputs_hash"],
+        "payload":         json.loads(r["payload_json"]) if r["payload_json"] else {},
+        "cost_usd":        float(r["cost_usd"]) if r["cost_usd"] is not None else None,
+        "started_at":      r["started_at"],
+        "finished_at":     r["finished_at"],
+        "duration_ms":     int(r["duration_ms"]) if r["duration_ms"] is not None else None,
+        "trace_id":        r["trace_id"],
+        "span_id":         r["span_id"],
+        "parent_span_id":  r["parent_span_id"],
+        "prev_event_hash": r["prev_event_hash"],
+        "event_hash":      r["event_hash"],
+    }
 
 
 def _asset_to_dict(a: Any) -> dict[str, Any]:

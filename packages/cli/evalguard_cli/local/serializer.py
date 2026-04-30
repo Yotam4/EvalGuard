@@ -28,12 +28,15 @@ def run_to_dict(
     *,
     include_rows: bool = True,
     include_scores: bool = False,
+    include_events: bool = False,
 ) -> dict[str, Any]:
     """Materialize a run as the canonical JSON-serializable dict.
 
     ``include_rows`` adds a ``rows`` array per trial (one entry per
     dataset row × trial). ``include_scores`` adds a ``scores`` array
     per row — heavy, opt-in for full drill-down exports.
+    ``include_events`` adds the full audit timeline as a top-level
+    ``events`` array — heavy, opt-in for archival exports.
     """
     runs = store.list_runs(limit=1000)
     run = next((r for r in runs if r["run_id"] == run_id), None)
@@ -75,7 +78,7 @@ def run_to_dict(
             trial_obj["rows"] = trial_rows
         trial_objs.append(trial_obj)
 
-    return {
+    payload = {
         "schema_version": SCHEMA_VERSION,
         "run_id":         run_id,
         "project":        run["project"],
@@ -97,6 +100,18 @@ def run_to_dict(
             "gates":   _normalize_gates(aggregate_gates),
         },
     }
+    if include_events:
+        events = store.list_events(run_id)
+        payload["audit"] = {
+            "actor_id":     events[0]["actor_id"]   if events else None,
+            "actor_type":   events[0]["actor_type"] if events else None,
+            "actor_meta":   events[0]["actor_meta"] if events else {},
+            "trace_id":     events[0]["trace_id"]   if events else None,
+            "event_count":  len(events),
+            "chain_tip":    events[-1]["event_hash"] if events else None,
+            "events":       events,
+        }
+    return payload
 
 
 def run_to_json(store: SqliteStore, run_id: str, **kwargs: Any) -> str:
