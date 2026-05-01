@@ -20,12 +20,12 @@ inside the hot path. The shape is documented in ``EVENT_KINDS``.
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import json
-import os
+import re
 import time
 import uuid
-from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any
 
@@ -65,33 +65,49 @@ _PRIVACY_SENSITIVE_FIELDS: tuple[str, ...] = (
     "rubric",
 )
 
-# Keys whose values are *always* stripped from every event payload before
-# storage — even when ``redact_payload`` is False. The threat is API keys
-# leaking from provider configs into the audit log: a YAML containing
-# ``api_key: ${OPENAI_API_KEY}`` would otherwise materialize the resolved
-# secret into events. Match is case-insensitive on the key name.
-_ALWAYS_REDACTED_KEYS: frozenset[str] = frozenset(map(str.lower, [
-    "api_key", "apikey", "api-key",
-    "token", "auth_token", "access_token", "refresh_token", "bearer_token",
-    "password", "passwd", "pwd",
-    "secret", "client_secret",
-    "authorization",
-    "openai_api_key", "anthropic_api_key", "ollama_api_key",
-]))
+# Keys whose values are *always* stripped from every event payload
+# before storage — even when ``redact_payload`` is False. The threat is
+# API keys leaking from provider configs into the audit log: a YAML
+# carrying ``api_key: ${OPENAI_API_KEY}`` would otherwise materialize
+# the resolved secret into events.
+#
+# A substring/regex match generalizes over vendor-specific names so we
+# don't have to maintain a list as new providers are added. Examples
+# that match: ``api_key``, ``apikey``, ``API-KEY``, ``OPENAI_API_KEY``,
+# ``MISTRAL_API_KEY``, ``GOOGLE_TOKEN``, ``my_password``, ``Authorization``,
+# ``client_secret``, ``bearer_token``.
+_SECRET_KEY_RE = re.compile(
+    # Standalone forms (case-insensitive whole-string match).
+    r"^(api[_-]?key|password|passwd|pwd|secret|authorization|credential|token)$"
+    r"|"
+    # Any key whose tail is a secret-shaped suffix. Note ``token`` only
+    # matches when *qualified* (``auth_token``, ``access_token``, …) so
+    # ``tokens`` (LLM usage stats) is NOT redacted.
+    r"(api[_-]?key|password|passwd|pwd|secret|authorization|credential|client[_-]?secret|"
+    r"refresh[_-]?token|access[_-]?token|bearer[_-]?token|auth[_-]?token|"
+    r"id[_-]?token|csrf[_-]?token)$",
+    re.IGNORECASE,
+)
+
+
+def _is_secret_key(name: Any) -> bool:
+    if not isinstance(name, str):
+        return False
+    return bool(_SECRET_KEY_RE.search(name))
 
 
 def redact_secrets(value: Any) -> Any:
     """Recursively replace known-sensitive values with ``"***"``.
 
     Walks dicts and lists; leaves scalars intact. The match is on key
-    name (case-insensitive) — values are not inspected, so a secret
-    stored under an unexpected key name will still leak. Treat this as
-    defense-in-depth, not a substitute for keeping secrets in env vars.
+    name only — values aren't inspected, so a secret stored under an
+    unexpected key name still leaks. Treat as defense-in-depth, not a
+    substitute for keeping secrets in env vars.
     """
     if isinstance(value, dict):
-        out = {}
+        out: dict[Any, Any] = {}
         for k, v in value.items():
-            if isinstance(k, str) and k.lower() in _ALWAYS_REDACTED_KEYS and v is not None:
+            if _is_secret_key(k) and v is not None:
                 out[k] = "***"
             else:
                 out[k] = redact_secrets(v)
@@ -119,10 +135,11 @@ class AuditLog:
         *,
         actor: Actor | None = None,
         redact_payload: bool = False,
+        project_dir: "Any" = None,
     ) -> None:
         self.store = store
         self.run_id = run_id
-        self.actor = actor or resolve_actor()
+        self.actor = actor or resolve_actor(project_dir)
         self.redact_payload = redact_payload
         self.trace_id = uuid.uuid4().hex                 # 32 hex
         self._tip: str | None = store.last_event_hash(run_id)
@@ -277,6 +294,34 @@ class AuditHook:
             duration_ms=latency_ms,
             parent_span_id=self._parent_span_id,
         )
+
+
+# ---------------------------------------------------------------------------
+# Task-local audit hook (avoids races on shared evaluator instances)
+
+
+# When the executor invokes an evaluator under ``asyncio.gather`` with
+# concurrency > 1, every coroutine shares the *same* evaluator instance.
+# Storing the hook on ``ev._audit_hook`` would let one task's hook leak
+# into another task's emit_provider_call. ``ContextVar`` is task-local in
+# asyncio, so each ``process_row`` coroutine gets its own view.
+_audit_hook_var: contextvars.ContextVar["AuditHook | None"] = contextvars.ContextVar(
+    "evalguard_audit_hook", default=None,
+)
+
+
+def current_audit_hook() -> "AuditHook | None":
+    """Return the audit hook bound to the running evaluator, if any."""
+    return _audit_hook_var.get()
+
+
+def set_audit_hook(hook: "AuditHook | None") -> "contextvars.Token[AuditHook | None]":
+    """Bind an audit hook to the current task; returns a reset token."""
+    return _audit_hook_var.set(hook)
+
+
+def reset_audit_hook(token: "contextvars.Token[AuditHook | None]") -> None:
+    _audit_hook_var.reset(token)
 
 
 # ---------------------------------------------------------------------------

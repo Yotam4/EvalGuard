@@ -8,10 +8,9 @@ import pathlib
 import sqlite3
 
 import jsonschema
-import pytest
 
-from evalguard_cli.local.actor import Actor, resolve_actor
-from evalguard_cli.local.audit import AuditLog, verify_chain
+from evalguard_cli.local.actor import resolve_actor
+from evalguard_cli.local.audit import verify_chain
 from evalguard_cli.local.local_executor import execute
 from evalguard_cli.local.serializer import run_to_dict
 from evalguard_cli.local.sqlite_store import SqliteStore

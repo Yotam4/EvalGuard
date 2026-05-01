@@ -7,7 +7,6 @@ import json
 import pathlib
 
 import jsonschema
-import pytest
 
 from evalguard_cli.local.local_executor import execute
 from evalguard_cli.local.serializer import run_to_dict
@@ -153,7 +152,6 @@ def test_get_row_with_trial_id_filters_scores(tmp_path: pathlib.Path) -> None:
 def test_gate_strategy_any_passes_when_one_trial_passes() -> None:
     """Run-level pass should be granted under ``gate_strategy: any``."""
     # Simulate trial verdicts (hand-build to avoid wiring the run loop).
-    from evalguard_cli.local.gate import GateResult
     trial_verdicts = [
         {"trial": None, "metrics": {}, "gates": [], "status": "gate_failed",
          "gate_status": "failed", "blocking_failed": True, "warned": False},

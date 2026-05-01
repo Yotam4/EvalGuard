@@ -5,8 +5,6 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-import pytest
-
 from evalguard_cli.local.gate import LAYER_INDEX, evaluate_gates
 from evalguard_cli.local.local_executor import execute
 from evalguard_cli.local.sqlite_store import SqliteStore

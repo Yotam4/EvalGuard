@@ -277,14 +277,9 @@ def test_asset_resolved_emitted_per_loaded_asset(tmp_path: Path):
         assert len(ev["subject_version"]) == 64
         assert ev["payload"]["version_id"] == ev["subject_version"]
         assert ev["payload"]["source"]
-    # The number of asset.resolved events == len(cfg.assets).
-    assets_total = sum(
-        1 for r in sqlite3.connect(tmp_path / "local.db").execute(
-            "SELECT COUNT(*) AS n FROM assets WHERE run_id=?",
-            (record.run_id,),
-        ).fetchone()
-    )
-    assert len(asset_events) >= 3   # at least prompt + dataset + judge
+    # At least: one prompt + one dataset + one judge → 3 events.
+    # Heuristics / metrics are absent in this minimal config.
+    assert len(asset_events) >= 3
 
 
 # ---------------------------------------------------------------------------
@@ -422,3 +417,72 @@ def test_every_emitted_kind_is_registered(tmp_path: Path):
     raw.close()
     unknown = distinct_kinds - set(EVENT_KINDS)
     assert not unknown, f"unknown kinds emitted: {unknown}"
+
+
+# ---------------------------------------------------------------------------
+# 8. event.kind in run.schema.json must mirror EVENT_KINDS (drift canary)
+
+
+def test_run_schema_event_kind_matches_event_kinds():
+    """The run-output JSON Schema's ``event.kind`` enum must exactly
+    match the ``EVENT_KINDS`` registry. Drift means a consumer
+    (UI / archive) silently accepts a kind the runtime never emits, or
+    rejects one it does."""
+    import json
+    schema_path = Path(__file__).resolve().parents[1] / "packages" / "schemas" / "evalguard.run.schema.json"
+    schema = json.loads(schema_path.read_text())
+    enum = set(schema["$defs"]["event"]["properties"]["kind"]["enum"])
+    assert enum == set(EVENT_KINDS), (
+        f"schema/code drift: schema enum {sorted(enum)} != "
+        f"EVENT_KINDS {sorted(EVENT_KINDS)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 9. Concurrent rows must not corrupt each other's audit hook
+
+
+def test_concurrent_rows_dont_share_audit_hook(tmp_path: Path):
+    """Regression: under ``concurrency > 1`` two coroutines used to set
+    ``ev._audit_hook`` on the *same* shared evaluator instance, leaking
+    one row's hook into another row's evaluate(). The fix moves the
+    hook to a ``contextvars.ContextVar`` (task-local). This test
+    exercises the failure path with a real ``PointwiseJudge`` calling
+    a mock provider — every nested provider.called event must point
+    back at the correct judge invocation event for its own row."""
+    _write_dataset(tmp_path, [
+        f'{{"id":"r{i}","input":"input number {i}","expected":"x"}}'
+        for i in range(8)
+    ])
+    rubric = tmp_path / "rubric.md"
+    rubric.write_text("Rate 1-5 for helpfulness.")
+    store, record = _run(tmp_path,
+        "version: 1\nproject: cov\n"
+        "providers:\n"
+        "  - { id: 'mock:main', config: { mode: echo, latency_ms: 0 } }\n"
+        "datasets: [{ id: g, file: datasets/g.jsonl }]\n"
+        "concurrency: 8\n"
+        "judges:\n"
+        "  - id: helpfulness_v3\n"
+        "    type: pointwise\n"
+        "    model: 'mock:judge-model'\n"
+        "    rubric_file: rubric.md\n"
+        "    threshold: 4.0\n"
+        "    provider_config: { mode: judge_score, score: 4.7, latency_ms: 0 }\n"
+    )
+    events = store.list_events(record.run_id)
+    judge_events = {e["span_id"]: e for e in events
+                    if e["kind"] == "evaluator.judge.invoked"}
+    judge_calls = [e for e in events
+                   if e["kind"] == "provider.called"
+                   and e.get("payload", {}).get("is_judge_call")]
+    # Every nested judge call's parent_span_id must resolve to one of
+    # the judge invocation events that ran in this run, AND the trial /
+    # row of that parent must match the call's own trial / row.
+    assert len(judge_calls) == 8
+    for call in judge_calls:
+        parent = judge_events.get(call["parent_span_id"])
+        assert parent is not None, "judge call points at unknown parent"
+        assert parent["row_id"]   == call["row_id"]
+        assert parent["trial_id"] == call["trial_id"]
+    assert verify_chain(store, record.run_id)["ok"]

@@ -24,14 +24,26 @@ from evalguard_evaluators.registry import load_provider
 
 
 class _AuditableJudge:
-    """Mixin: judges expose ``_audit_hook`` for nested-event emission.
+    """Mixin: judges look up an audit hook via a task-local lookup.
 
-    The executor sets this attribute before calling ``evaluate()`` and
-    the judge checks it. ``None`` (the default) means "no audit
-    context" — useful for unit tests and direct-call usage.
+    The executor stores the hook on a ``contextvars.ContextVar`` before
+    each call so concurrent rows running on the *same* judge instance
+    don't trample each other (instance-attribute storage was racy).
+
+    Plugins are insulated from the lookup mechanism — they can either
+    read ``self._audit_hook`` (which delegates to the lookup) or import
+    ``current_audit_hook`` directly.
     """
 
-    _audit_hook: Any = None
+    @property
+    def _audit_hook(self) -> Any:
+        # Imported lazily to avoid a hard dep from evaluators → cli;
+        # the cli package owns the lookup, evaluators just read it.
+        try:
+            from evalguard_cli.local.audit import current_audit_hook
+        except ImportError:
+            return None
+        return current_audit_hook()
 
 _DEFAULT_TEMPLATE = """You are a strict evaluator.
 

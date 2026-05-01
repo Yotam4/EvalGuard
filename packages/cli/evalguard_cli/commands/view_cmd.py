@@ -21,7 +21,7 @@ from rich.table import Table
 
 from evalguard_cli.console import console
 from evalguard_cli.local.gate import GateResult, format_gate_report
-from evalguard_cli.local.serializer import run_to_dict, run_to_json
+from evalguard_cli.local.serializer import run_to_json
 from evalguard_cli.local.sqlite_store import SqliteStore
 
 

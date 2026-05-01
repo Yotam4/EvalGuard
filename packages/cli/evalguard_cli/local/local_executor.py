@@ -29,7 +29,12 @@ from pathlib import Path
 from typing import Any
 
 from evalguard_cli.console import console
-from evalguard_cli.local.audit import AuditHook, AuditLog
+from evalguard_cli.local.audit import (
+    AuditHook,
+    AuditLog,
+    reset_audit_hook,
+    set_audit_hook,
+)
 from evalguard_cli.local.cache import ContentCache
 from evalguard_cli.local.gate import LAYER_INDEX
 from evalguard_cli.local.sqlite_store import SqliteStore
@@ -82,6 +87,7 @@ async def execute(
     audit = AuditLog(
         store, run_id,
         redact_payload=bool(audit_cfg.get("redact_payload", False)),
+        project_dir=cfg.base_dir,
     )
     audit.emit(
         "run.started",
@@ -304,16 +310,23 @@ async def execute(
                         # events (e.g. a judge's own LLM call) with the
                         # right parent_span_id before this event itself
                         # is emitted.
+                        #
+                        # The hook is stored task-local via a ContextVar
+                        # rather than on the evaluator instance, because
+                        # evaluator instances are shared across rows and
+                        # asyncio.gather would otherwise let one row's
+                        # hook leak into another row's evaluate() call.
                         ev_span_id = uuid.uuid4().hex[:16]
-                        ev._audit_hook = AuditHook(
+                        hook = AuditHook(
                             audit, ev_span_id,
                             trial_id=trial_id, row_id=row_id,
                         )
+                        token = set_audit_hook(hook)
                         ev_t0 = time.monotonic()
                         try:
                             ev_scores = await ev.evaluate(ctx)
                         finally:
-                            ev._audit_hook = None
+                            reset_audit_hook(token)
                         ev_dur = int((time.monotonic() - ev_t0) * 1000)
                         layer_scores.extend(ev_scores)
                         # Score.evaluator_id is the user-configured id (e.g.
@@ -329,7 +342,12 @@ async def execute(
                         if kind_event not in {"evaluator.heuristic.invoked",
                                                "evaluator.metric.invoked",
                                                "evaluator.judge.invoked"}:
-                            kind_event = "evaluator.heuristic.invoked"
+                            raise ValueError(
+                                f"unknown evaluator kind {ev_kind!r} for "
+                                f"{ev_id!r}; expected heuristic / metric / judge. "
+                                "Add the new kind to EVENT_KINDS and to "
+                                "evalguard.run.schema.json#/$defs/event.kind."
+                            )
                         audit.emit(
                             kind_event,
                             trial_id=trial_id, row_id=row_id,

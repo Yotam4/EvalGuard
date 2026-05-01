@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -49,4 +50,9 @@ class ContentCache:
             return
         p = self._path(key)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(value))
+        # Atomic write: never expose a partial file to a concurrent
+        # reader. The tmpfile carries os.getpid() so two writers racing
+        # on the same key don't clobber each other's tmp.
+        tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(value))
+        tmp.replace(p)

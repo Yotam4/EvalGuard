@@ -175,7 +175,24 @@
       "required": ["event_id", "kind", "run_id", "actor_id", "actor_type", "started_at", "event_hash"],
       "properties": {
         "event_id":        { "type": "string" },
-        "kind":            { "type": "string" },
+        "kind":            {
+          "type": "string",
+          "enum": [
+            "run.started",
+            "run.finalized",
+            "run.cost_capped",
+            "asset.resolved",
+            "trial.started",
+            "trial.finalized",
+            "row.short_circuited",
+            "provider.called",
+            "evaluator.heuristic.invoked",
+            "evaluator.metric.invoked",
+            "evaluator.judge.invoked",
+            "gate.evaluated",
+            "gate.custom_check.invoked"
+          ]
+        },
         "run_id":          { "type": "string" },
         "trial_id":        { "type": ["string", "null"] },
         "row_id":          { "type": ["string", "null"] },

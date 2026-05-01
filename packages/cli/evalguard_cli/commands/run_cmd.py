@@ -21,7 +21,7 @@ import typer
 from rich.table import Table
 
 from evalguard_cli.console import console
-from evalguard_cli.local.gate import GateResult, evaluate_gates, format_gate_report
+from evalguard_cli.local.gate import evaluate_gates, format_gate_report
 from evalguard_cli.local.local_executor import execute
 from evalguard_cli.local.report import render_run_table
 from evalguard_cli.local.sqlite_store import SqliteStore

@@ -592,10 +592,15 @@ class SqliteStore:
             )
 
     def last_event_hash(self, run_id: str) -> str | None:
-        """Most recent ``event_hash`` for the run (the chain tip)."""
+        """Most recent ``event_hash`` for the run (the chain tip).
+
+        Ordered by ``rowid`` (insert order) so two events emitted in
+        the same millisecond can't be reordered by ULID-tail randomness
+        — that would surface as a false ``verify_chain`` failure.
+        """
         with self._conn() as c:
             r = c.execute(
-                "SELECT event_hash FROM events WHERE run_id=? ORDER BY started_at DESC, event_id DESC LIMIT 1",
+                "SELECT event_hash FROM events WHERE run_id=? ORDER BY rowid DESC LIMIT 1",
                 (run_id,),
             ).fetchone()
         return r["event_hash"] if r else None
@@ -616,9 +621,12 @@ class SqliteStore:
         if trial_id is not None:
             clauses.append("trial_id=?")
             args.append(trial_id)
+        # ``ORDER BY rowid`` preserves insert order across ULID-tail
+        # collisions within the same millisecond. Required for chain
+        # verification — see ``last_event_hash`` for the rationale.
         sql = (
             "SELECT * FROM events WHERE " + " AND ".join(clauses)
-            + " ORDER BY started_at, event_id"
+            + " ORDER BY rowid"
         )
         if limit is not None:
             sql += f" LIMIT {int(limit)}"
