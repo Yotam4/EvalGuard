@@ -41,6 +41,7 @@ EVENT_KINDS: dict[str, tuple[str, str | None]] = {
     "run.started":               ("Activity", "run"),
     "run.finalized":             ("Activity", "run"),
     "run.cost_capped":           ("Activity", "run"),
+    "asset.resolved":            ("Entity",   "asset"),
     "trial.started":             ("Activity", "trial"),
     "trial.finalized":           ("Activity", "trial"),
     "row.short_circuited":       ("Activity", "row"),
@@ -49,6 +50,7 @@ EVENT_KINDS: dict[str, tuple[str, str | None]] = {
     "evaluator.metric.invoked":  ("Activity", "metric"),
     "evaluator.judge.invoked":   ("Activity", "judge"),
     "gate.evaluated":            ("Activity", "gate"),
+    "gate.custom_check.invoked": ("Activity", "custom_check"),
 }
 
 # Fields that contain raw user/model content. ``redact_payload`` strips

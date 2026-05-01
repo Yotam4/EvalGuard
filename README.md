@@ -186,6 +186,7 @@ design doc and roadmap.
 | Kind | When |
 |---|---|
 | `run.started` | A new run begins |
+| `asset.resolved` | A prompt / dataset / rubric / schema / judge / heuristic was loaded and content-hashed (one event per asset) |
 | `run.cost_capped` | `cost_cap_usd` was hit; subsequent rows abort pre-flight |
 | `run.finalized` | Final overall status is recorded |
 | `trial.started` / `trial.finalized` | Per (provider × prompt) trial |
@@ -193,6 +194,7 @@ design doc and roadmap.
 | `evaluator.heuristic.invoked` / `metric.invoked` / `judge.invoked` | An evaluator scored a row |
 | `row.short_circuited` | A row failed an upstream block-severity layer; later layers were skipped |
 | `gate.evaluated` | A gate was applied to a trial's metrics |
+| `gate.custom_check.invoked` | A gate's Python `custom_check` ran (records module path, config, duration, pass/fail, exception if any) |
 
 Exit codes: `0` pass · `2` blocking gate failed (or audit chain broken) · `1` infra/config error.
 

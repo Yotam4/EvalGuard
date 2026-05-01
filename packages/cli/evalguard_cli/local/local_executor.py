@@ -96,6 +96,27 @@ async def execute(
         },
     )
 
+    # Emit one ``asset.resolved`` event per asset so the provenance graph
+    # records exactly which prompt / dataset / rubric / schema / judge /
+    # heuristic version_id was used. ``cfg.assets`` is already content-
+    # hashed by the YAML loader; this just promotes that snapshot into
+    # the event stream so downstream consumers (PR comment, lineage UI,
+    # compliance archive) can follow asset → run → trial → score links.
+    for asset in cfg.assets:
+        audit.emit(
+            "asset.resolved",
+            subject_kind=asset.kind,
+            subject_id=asset.asset_id,
+            subject_version=asset.version_id,
+            outputs={"version_id": asset.version_id},
+            payload={
+                "kind":       asset.kind,
+                "asset_id":   asset.asset_id,
+                "version_id": asset.version_id,
+                "source":     asset.source,
+            },
+        )
+
     if not quiet:
         console.print(
             f"[bold]Run[/bold] {run_id}  project={project}  "

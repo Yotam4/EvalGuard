@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import importlib
 import operator
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -55,6 +56,10 @@ class GateResult:
     details: list[dict[str, Any]] = field(default_factory=list)
     severity: str = "block"
     layer: int | None = None
+    # Populated when the gate had a ``custom_check.module``. The
+    # executor surfaces this on a dedicated ``gate.custom_check.invoked``
+    # event so the python escape hatch is independently auditable.
+    custom_check_execution: dict[str, Any] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -169,10 +174,23 @@ def _evaluate_layers(layers: dict[str, dict[str, Any]], metrics: dict[str, Any])
                 passed = passed and ok
 
         # 4) custom_check Python escape hatch
+        custom_execution: dict[str, Any] | None = None
         if (custom := gate.get("custom_check")):
+            module_path = custom.get("module", "")
+            cfg = dict(custom.get("config") or {})
+            t0 = time.monotonic()
             try:
                 result = _invoke_custom_check(custom, metrics)
             except Exception as e:  # noqa: BLE001
+                duration_ms = int((time.monotonic() - t0) * 1000)
+                custom_execution = {
+                    "module":      module_path,
+                    "config":      cfg,
+                    "passed":      False,
+                    "details":     [],
+                    "error":       f"{type(e).__name__}: {e}",
+                    "duration_ms": duration_ms,
+                }
                 details.append({
                     "metric": f"{layer_name}.custom_check",
                     "op": "raise", "target": 0.0, "actual": float("nan"),
@@ -180,6 +198,15 @@ def _evaluate_layers(layers: dict[str, dict[str, Any]], metrics: dict[str, Any])
                 })
                 passed = False
             else:
+                duration_ms = int((time.monotonic() - t0) * 1000)
+                custom_execution = {
+                    "module":      module_path,
+                    "config":      cfg,
+                    "passed":      bool(result.get("passed", True)),
+                    "details":     list(result.get("details", [])),
+                    "error":       None,
+                    "duration_ms": duration_ms,
+                }
                 passed = passed and bool(result.get("passed", True))
                 for d in result.get("details", []):
                     d.setdefault("metric", f"{layer_name}.custom_check")
@@ -192,6 +219,7 @@ def _evaluate_layers(layers: dict[str, dict[str, Any]], metrics: dict[str, Any])
             passed=passed,
             details=details,
             layer=idx,
+            custom_check_execution=custom_execution,
         ))
 
     return results

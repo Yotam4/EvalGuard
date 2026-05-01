@@ -21,10 +21,14 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import hashlib
 import sqlite3
+import sys
+import textwrap
 from pathlib import Path
 
 from evalguard_cli.local.audit import EVENT_KINDS, verify_chain
+from evalguard_cli.local.gate import evaluate_gates
 from evalguard_cli.local.local_executor import execute
 from evalguard_cli.local.sqlite_store import SqliteStore
 from evalguard_cli.local.yaml_loader import load_config
@@ -245,7 +249,161 @@ def test_pointwise_judge_emits_nested_provider_call(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# 5. Every kind we emit is registered (canary so unknown kinds blow up early)
+# 5. Asset-resolution events — one per content-hashed asset
+
+
+def test_asset_resolved_emitted_per_loaded_asset(tmp_path: Path):
+    """Every asset on ``cfg.assets`` must show up as a discrete
+    ``asset.resolved`` event with its content-hashed version_id."""
+    _write_dataset(tmp_path, [
+        '{"id":"r1","input":"hi"}',
+    ])
+    (tmp_path / "prompts").mkdir(exist_ok=True)
+    (tmp_path / "prompts" / "p.md").write_text("Echo: {input}")
+    store, record = _run(tmp_path,
+        "version: 1\nproject: cov\n"
+        "providers: [{ id: 'mock:m', config: { mode: echo, latency_ms: 0 } }]\n"
+        "prompts: [{ id: p1, file: prompts/p.md }]\n"
+        "datasets: [{ id: g, file: datasets/g.jsonl }]\n"
+        "judges: [{ id: q, type: mock_pointwise }]\n"
+    )
+    asset_events = store.list_events(record.run_id, kind="asset.resolved")
+    # At minimum: one prompt, one dataset, one judge spec.
+    kinds_seen = {e["payload"]["kind"] for e in asset_events}
+    assert {"prompt", "dataset", "judge"} <= kinds_seen
+    # Each event carries a content-hashed version_id and a source label.
+    for ev in asset_events:
+        assert ev["subject_version"]
+        assert len(ev["subject_version"]) == 64
+        assert ev["payload"]["version_id"] == ev["subject_version"]
+        assert ev["payload"]["source"]
+    # The number of asset.resolved events == len(cfg.assets).
+    assets_total = sum(
+        1 for r in sqlite3.connect(tmp_path / "local.db").execute(
+            "SELECT COUNT(*) AS n FROM assets WHERE run_id=?",
+            (record.run_id,),
+        ).fetchone()
+    )
+    assert len(asset_events) >= 3   # at least prompt + dataset + judge
+
+
+# ---------------------------------------------------------------------------
+# 6. Custom-check escape hatch emits its own dedicated event
+
+
+def _install_module(source: str, tmp_path: Path) -> str:
+    name = "ev_" + hashlib.md5(textwrap.dedent(source).encode()).hexdigest()[:8]
+    (tmp_path / f"{name}.py").write_text(textwrap.dedent(source))
+    sys.path.insert(0, str(tmp_path))
+    return name
+
+
+def test_gate_custom_check_emits_dedicated_event(tmp_path: Path):
+    """When a gate runs a Python ``custom_check``, an additional
+    ``gate.custom_check.invoked`` event must record the module path,
+    config, duration, pass/fail, and any exception — independently
+    auditable, with ``parent_span_id`` linking to the gate event."""
+    mod = _install_module("""
+        def threshold(metrics, config):
+            min_n = float(config['min_rows'])
+            actual = float(metrics['row_count'])
+            return {'passed': actual >= min_n,
+                    'details': [{'metric': 'rows', 'op': '>=',
+                                 'target': min_n, 'actual': actual,
+                                 'passed': actual >= min_n}]}
+    """, tmp_path)
+
+    # Run a tiny pipeline so we have a real run_id + audit log.
+    _write_dataset(tmp_path, [
+        '{"id":"r1","input":"hi"}',
+        '{"id":"r2","input":"yo"}',
+    ])
+    cfg_path = tmp_path / "evalguard.yaml"
+    cfg_path.write_text(
+        "version: 1\nproject: cov\n"
+        "providers: [{ id: 'mock:m', config: { mode: echo, latency_ms: 0 } }]\n"
+        "datasets: [{ id: g, file: datasets/g.jsonl }]\n"
+    )
+    cfg = load_config(cfg_path)
+    store = SqliteStore(tmp_path / "local.db")
+    store.init_schema()
+    record = asyncio.run(execute(cfg, store=store, quiet=True))
+
+    # Drive a gate eval the way run_cmd does.
+    layers = {"heuristics": {
+        "severity": "block",
+        "custom_check": {
+            "module": f"{mod}:threshold",
+            "config": {"min_rows": 5},
+        },
+    }}
+    metrics = store.compute_metrics(record.run_id)
+    gates = evaluate_gates(None, metrics, layers=layers)
+    assert len(gates) == 1
+    g = gates[0]
+    assert not g.passed                                  # 2 < 5
+    assert g.custom_check_execution is not None
+    exec_meta = g.custom_check_execution
+    assert exec_meta["module"].endswith(":threshold")
+    assert exec_meta["config"] == {"min_rows": 5}
+    assert exec_meta["passed"] is False
+    assert exec_meta["error"] is None
+    assert exec_meta["duration_ms"] is not None and exec_meta["duration_ms"] >= 0
+
+    # Now have the audit log emit the dedicated event the way run_cmd does.
+    import uuid as _uuid
+    gate_span = _uuid.uuid4().hex[:16]
+    record.audit.emit(
+        "gate.evaluated",
+        span_id=gate_span,
+        subject_id=g.name,
+        payload={"gate_name": g.name, "passed": g.passed},
+    )
+    record.audit.emit(
+        "gate.custom_check.invoked",
+        parent_span_id=gate_span,
+        subject_id=exec_meta["module"],
+        payload=exec_meta,
+        duration_ms=exec_meta["duration_ms"],
+    )
+
+    [cc_event] = store.list_events(record.run_id, kind="gate.custom_check.invoked", limit=1)
+    assert cc_event["payload"]["module"].endswith(":threshold")
+    assert cc_event["payload"]["passed"] is False
+    assert cc_event["payload"]["error"] is None
+    # Parent links to the gate event.
+    [gate_event] = store.list_events(record.run_id, kind="gate.evaluated", limit=1)
+    assert cc_event["parent_span_id"] == gate_event["span_id"]
+    assert verify_chain(store, record.run_id)["ok"]
+
+
+def test_gate_custom_check_records_exceptions(tmp_path: Path):
+    """If the user's Python ``custom_check`` raises, the execution
+    metadata records ``error`` and the gate fails (verified via the
+    GateResult — execution metadata always carries the exception type
+    and message for forensics)."""
+    mod = _install_module("""
+        def boom(metrics, config):
+            raise ValueError("intentional unit-test failure")
+    """, tmp_path)
+    layers = {"human": {
+        "severity": "block",
+        "custom_check": {"module": f"{mod}:boom"},
+    }}
+    metrics = {"row_count": 1.0, "cost_usd": 0.0,
+               "by_evaluator": {}, "by_layer": {}, "by_tag": {}}
+    gates = evaluate_gates(None, metrics, layers=layers)
+    g = gates[0]
+    assert not g.passed
+    exec_meta = g.custom_check_execution
+    assert exec_meta is not None
+    assert "intentional" in exec_meta["error"]
+    assert "ValueError" in exec_meta["error"]
+    assert exec_meta["duration_ms"] is not None
+
+
+# ---------------------------------------------------------------------------
+# 7. Every kind we emit is registered (canary so unknown kinds blow up early)
 
 
 def test_every_emitted_kind_is_registered(tmp_path: Path):

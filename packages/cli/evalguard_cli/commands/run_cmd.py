@@ -14,6 +14,7 @@ Multi-trial pipeline:
 from __future__ import annotations
 
 import asyncio
+import uuid
 from pathlib import Path
 
 import typer
@@ -81,9 +82,14 @@ def run(
         if audit is not None:
             for g in trial_gates:
                 spec = gate_specs.get(g.name) or {}
+                # Pre-allocate the gate event's span so a dedicated
+                # ``gate.custom_check.invoked`` child event can record
+                # the parent_span_id when the gate ran a Python check.
+                gate_span_id = uuid.uuid4().hex[:16]
                 audit.emit(
                     "gate.evaluated",
                     trial_id=trial.trial_id,
+                    span_id=gate_span_id,
                     subject_id=g.name,
                     inputs=g.details,
                     outputs={"passed": g.passed, "severity": g.severity},
@@ -104,6 +110,21 @@ def run(
                         "rules":            spec.get("rules"),
                     },
                 )
+                # If the gate ran a custom Python check, record its
+                # execution as a separate child event. Module path,
+                # config, duration, pass/fail, and any exception live
+                # here so the escape hatch is independently auditable.
+                if g.custom_check_execution is not None:
+                    exec_meta = g.custom_check_execution
+                    audit.emit(
+                        "gate.custom_check.invoked",
+                        trial_id=trial.trial_id,
+                        parent_span_id=gate_span_id,
+                        subject_id=exec_meta["module"],
+                        outputs={"passed": exec_meta["passed"]},
+                        payload=exec_meta,
+                        duration_ms=exec_meta.get("duration_ms"),
+                    )
 
         trial_blocking_failed = any(g.passed is False and g.severity == "block" for g in trial_gates)
         trial_warned = any(g.passed is False and g.severity == "warn" for g in trial_gates)
