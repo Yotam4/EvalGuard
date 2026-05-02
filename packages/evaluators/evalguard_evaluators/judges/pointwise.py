@@ -81,6 +81,7 @@ class PointwiseJudge(_AuditableJudge):
         self._threshold: float = 4.0
         self._provider_name: str = "openai"
         self._provider_cfg: dict[str, Any] = {}
+        self._params: dict[str, Any] = {}
         self._model: str = "gpt-4o-mini"
         self._template: str = _DEFAULT_TEMPLATE
 
@@ -100,6 +101,7 @@ class PointwiseJudge(_AuditableJudge):
         else:
             self._provider_name, self._model = "openai", model_str
         self._provider_cfg = cfg.get("provider_config", {})
+        self._params = cfg.get("params", {})
         self._template = cfg.get("prompt_template", _DEFAULT_TEMPLATE)
 
     async def evaluate(self, ctx: EvalContext) -> list[Score]:
@@ -117,7 +119,7 @@ class PointwiseJudge(_AuditableJudge):
         )
 
         t0 = time.monotonic()
-        result = await provider.complete(prompt, model=self._model)
+        result = await provider.complete(prompt, model=self._model, params=self._params)
         latency_ms = int((time.monotonic() - t0) * 1000)
 
         # Nested audit event for the judge's own LLM call. ``parent_span_id``
@@ -131,7 +133,7 @@ class PointwiseJudge(_AuditableJudge):
                 model=self._model,
                 prompt=prompt,
                 response=result.output,
-                model_params=self._provider_cfg,
+                model_params=self._params,
                 tokens=tokens,
                 cost_usd=result.cost_usd,
                 latency_ms=latency_ms,

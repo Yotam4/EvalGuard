@@ -285,3 +285,9 @@ def test_diff_classifies_regress_vs_improve():
     assert by_metric["pass_rate"][4] == "regress"
     # cost_usd dropped (lower is better) → improve
     assert by_metric["cost_usd"][4] == "improve"
+
+
+def test_row_failed_status_returns_gate_failure_exit_code():
+    from evalguard_cli.commands.run_cmd import EXIT_GATE_FAIL, _exit_code_for
+
+    assert _exit_code_for(overall="row_failed", run_blocking_failed=False) == EXIT_GATE_FAIL

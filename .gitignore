@@ -12,6 +12,7 @@ build/
 .idea/
 .vscode/
 .pytest_cache/
+pytest-cache-files-*/
 .ruff_cache/
 .mypy_cache/
 uv.lock

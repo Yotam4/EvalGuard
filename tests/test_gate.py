@@ -49,3 +49,20 @@ def test_warn_gate_is_non_blocking() -> None:
     )
     assert result[0].blocking is False
     assert result[0].passed is False
+
+
+def test_unsupported_layer_aggregation_fails_closed() -> None:
+    result = evaluate_gates(
+        None,
+        metrics={"by_layer": {3: {"pass_rate": 1.0}}},
+        layers={
+            "judge_offline": {
+                "severity": "block",
+                "aggregation": "p95",
+                "threshold": {"max": 1000},
+            },
+        },
+    )
+    assert result[0].passed is False
+    assert result[0].details[0]["metric"] == "judge_offline.p95"
+    assert "unsupported" in result[0].details[0]["error"]

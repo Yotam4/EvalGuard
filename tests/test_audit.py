@@ -122,7 +122,9 @@ def test_chain_detects_payload_tampering(tmp_path):
     raw = sqlite3.connect(tmp_path / "local.db")
     raw.execute(
         "UPDATE events SET payload_json='{\"tampered\":true}' "
-        "WHERE kind='evaluator.judge.invoked' LIMIT 1"
+        "WHERE rowid = ("
+        "  SELECT rowid FROM events WHERE kind='evaluator.judge.invoked' LIMIT 1"
+        ")"
     )
     raw.commit()
     raw.close()
@@ -135,7 +137,11 @@ def test_chain_detects_event_deletion(tmp_path):
     """Deleting an event breaks ``prev_event_hash`` of the next one."""
     store, record = _run(tmp_path)
     raw = sqlite3.connect(tmp_path / "local.db")
-    raw.execute("DELETE FROM events WHERE kind='trial.started' LIMIT 1")
+    raw.execute(
+        "DELETE FROM events WHERE rowid = ("
+        "  SELECT rowid FROM events WHERE kind='trial.started' LIMIT 1"
+        ")"
+    )
     raw.commit()
     raw.close()
     result = verify_chain(store, record.run_id)

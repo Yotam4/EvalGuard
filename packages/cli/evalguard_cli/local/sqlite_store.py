@@ -441,8 +441,11 @@ class SqliteStore:
             if n_rows:
                 failed_rows = int(
                     c.execute(
-                        f"SELECT COUNT(DISTINCT row_id) AS f FROM scores "
-                        f"WHERE run_id=? {scope_clause} AND passed=0",
+                        f"""SELECT COUNT(*) AS f FROM (
+                              SELECT trial_id, row_id FROM scores
+                              WHERE run_id=? {scope_clause} AND passed=0
+                              GROUP BY trial_id, row_id
+                            )""",
                         (run_id, *scope_args),
                     ).fetchone()["f"] or 0
                 )
@@ -481,18 +484,22 @@ class SqliteStore:
             ):
                 layer = int(r["layer"])
                 rows_in_layer = int(c.execute(
-                    f"SELECT COUNT(DISTINCT row_id) AS n FROM scores "
-                    f"WHERE run_id=? {scope_clause} AND layer=?",
+                    f"""SELECT COUNT(*) AS n FROM (
+                          SELECT trial_id, row_id FROM scores
+                          WHERE run_id=? {scope_clause} AND layer=?
+                          GROUP BY trial_id, row_id
+                        )""",
                     (run_id, *scope_args, layer),
                 ).fetchone()["n"] or 0)
                 row_pass = int(c.execute(
-                    f"""SELECT COUNT(DISTINCT row_id) AS n_pass FROM scores
-                       WHERE run_id=? {scope_clause} AND layer=?
-                       AND row_id NOT IN (
-                         SELECT row_id FROM scores
-                         WHERE run_id=? {scope_clause} AND layer=? AND passed=0
-                       )""",
-                    (run_id, *scope_args, layer, run_id, *scope_args, layer),
+                    f"""SELECT COUNT(*) AS n_pass FROM (
+                          SELECT trial_id, row_id
+                          FROM scores
+                          WHERE run_id=? {scope_clause} AND layer=?
+                          GROUP BY trial_id, row_id
+                          HAVING SUM(CASE WHEN passed=0 THEN 1 ELSE 0 END) = 0
+                        )""",
+                    (run_id, *scope_args, layer),
                 ).fetchone()["n_pass"] or 0)
                 evaluators = sorted(e for e, l in evaluator_layer.items() if l == layer)
                 by_layer[layer] = {
@@ -507,29 +514,30 @@ class SqliteStore:
             # pass_rate_by_tag
             by_tag: dict[str, dict[str, Any]] = {}
             tagged_rows = c.execute(
-                f"SELECT row_id, tags_json FROM run_rows WHERE run_id=? {scope_clause}",
+                f"SELECT trial_id, row_id, tags_json FROM run_rows WHERE run_id=? {scope_clause}",
                 (run_id, *scope_args),
             ).fetchall()
-            seen_pairs: set[tuple[str, str]] = set()
             for r in tagged_rows:
                 row_id = r["row_id"]
+                row_trial_id = r["trial_id"]
                 tags = json.loads(r["tags_json"] or "[]")
-                row_failed = bool(
-                    c.execute(
-                        f"SELECT 1 FROM scores WHERE run_id=? {scope_clause} "
-                        f"AND row_id=? AND passed=0 LIMIT 1",
-                        (run_id, *scope_args, row_id),
-                    ).fetchone()
-                )
+                if trial_id is None:
+                    row_failed = bool(
+                        c.execute(
+                            "SELECT 1 FROM scores WHERE run_id=? AND trial_id=? "
+                            "AND row_id=? AND passed=0 LIMIT 1",
+                            (run_id, row_trial_id, row_id),
+                        ).fetchone()
+                    )
+                else:
+                    row_failed = bool(
+                        c.execute(
+                            f"SELECT 1 FROM scores WHERE run_id=? {scope_clause} "
+                            f"AND row_id=? AND passed=0 LIMIT 1",
+                            (run_id, *scope_args, row_id),
+                        ).fetchone()
+                    )
                 for tag in tags:
-                    # When aggregating across trials, a single dataset row
-                    # appears once per trial; dedupe by (row_id, tag) so the
-                    # tag denominator stays equal to the dataset row count.
-                    if trial_id is None:
-                        key = (row_id, tag)
-                        if key in seen_pairs:
-                            continue
-                        seen_pairs.add(key)
                     bucket = by_tag.setdefault(tag, {"n": 0, "passed": 0})
                     bucket["n"] += 1
                     if not row_failed:

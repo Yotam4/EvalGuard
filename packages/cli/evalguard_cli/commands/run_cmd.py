@@ -269,7 +269,7 @@ def run(
         f"\n[bold]overall:[/bold] {_pretty(overall)}  "
         f"[dim](strategy: {gate_strategy}, {len(run_record.trials)} trial(s))[/dim]"
     )
-    raise typer.Exit(EXIT_GATE_FAIL if run_blocking_failed else EXIT_PASS)
+    raise typer.Exit(_exit_code_for(overall=overall, run_blocking_failed=run_blocking_failed))
 
 
 def _render_trials_summary(run_record, trial_verdicts: list[dict], store: SqliteStore) -> None:
@@ -336,3 +336,15 @@ def _pretty(status: str) -> str:
         "cost_capped":"yellow",
     }.get(status, "white")
     return f"[{color}]{status}[/{color}]"
+
+
+def _exit_code_for(*, overall: str, run_blocking_failed: bool) -> int:
+    """Translate the final run verdict into the CLI process exit code.
+
+    Blocking gates still drive the canonical gate-fail path, and row-level
+    evaluator failures also fail closed so CI cannot pass a run whose own
+    summary says model outputs failed evaluation.
+    """
+    if run_blocking_failed or overall in {"row_failed", "gate_failed", "cost_capped"}:
+        return EXIT_GATE_FAIL
+    return EXIT_PASS

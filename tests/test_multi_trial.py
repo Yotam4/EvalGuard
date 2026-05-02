@@ -74,16 +74,34 @@ def test_per_trial_metrics_are_independent(tmp_path: pathlib.Path) -> None:
 
 
 def test_aggregate_metrics_dedupe_tags_across_trials(tmp_path: pathlib.Path) -> None:
-    """Aggregating across 2 trials shouldn't double-count tag denominators."""
+    """Aggregate metrics count row-evaluations, not unique dataset row ids."""
     cfg = load_config(_project(tmp_path, providers=["mock:m1", "mock:m2"]))
     store = SqliteStore(tmp_path / "local.db")
     store.init_schema()
     record = asyncio.run(execute(cfg, store=store, quiet=True))
 
     agg = store.compute_metrics(record.run_id)
-    # Dataset has 1 row per tag; aggregate denominator must stay 1, not 2.
+    # Dataset has 1 row per tag and 2 trials, so aggregate row-evaluation
+    # denominators must be 2. Dataset-level rollups should use separate
+    # metric names if/when they are needed.
     for tag in ("normal", "edge"):
-        assert agg["by_tag"][tag]["n"] == 1
+        assert agg["by_tag"][tag]["n"] == 2
+
+
+def test_aggregate_pass_rate_counts_duplicate_row_failures_per_trial(tmp_path: pathlib.Path) -> None:
+    cfg = load_config(_project(
+        tmp_path,
+        providers=["mock:m1", "mock:m2"],
+        judge_threshold=4.9,
+    ))
+    store = SqliteStore(tmp_path / "local.db")
+    store.init_schema()
+    record = asyncio.run(execute(cfg, store=store, quiet=True))
+
+    agg = store.compute_metrics(record.run_id)
+    assert record.row_count == 4
+    assert agg["pass_rate"] == 0.0
+    assert agg["by_layer"][3]["row_pass_rate"] == 0.0
 
 
 def test_comparison_picks_winner_lower_better_for_cost(tmp_path: pathlib.Path) -> None:

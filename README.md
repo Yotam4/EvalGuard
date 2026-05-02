@@ -183,19 +183,22 @@ See `packages/action/README.md` for the full input / output reference.
   severity / aggregation / threshold / `per_tag_overrides`, `run_mode`
   short-circuit, gate `custom_check` Python escape hatch, per-row
   drill-down view.
+- **Phase 1** — Docker-based GitHub Action in `packages/action/`,
+  sticky PR comments, relative thresholds, baseline save/load flow, and
+  action-shape tests.
 
 ## Coming next
 
 | Phase | Deliverable |
 |---|---|
-| 1 | `evalguard/action@v1` GitHub Action; sticky PR comments; `relative` & `statistical` thresholds; baseline registry |
+| 1.5 | Published `evalguard/action@v1`; statistical thresholds; baseline registry polish |
 | 2 | Optional FastAPI server (multi-project, RBAC, Next.js UI mirroring YAML control panels) |
 | 3 | OTLP / `gen_ai.*` ingest; online sampler; drift detection |
 | 4 | Argilla-style human review queue; κ tracking; promote-to-golden flow |
 | 5 | Enterprise tier (SSO / SCIM / audit / dedicated) under ELv2 in `apps/api/ee/` |
 
-See `/root/.claude/plans/immutable-launching-barto.md` for the full
-design doc and roadmap.
+The roadmap above summarizes the public milestones; implementation
+details live alongside the shipped packages and tests in this repo.
 
 ## CLI
 

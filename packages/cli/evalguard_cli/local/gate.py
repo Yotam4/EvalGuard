@@ -166,7 +166,14 @@ def _evaluate_layers(
                 agg, layer_name, idx, evaluator_id,
                 by_evaluator=by_evaluator, by_layer=by_layer, by_tag=by_tag,
             )
-            if actual is not None:
+            if actual is None and ("min" in threshold or "max" in threshold):
+                details.append({
+                    "metric": label, "op": "available", "target": 1.0,
+                    "actual": float("nan"), "passed": False,
+                    "error": f"unsupported or unavailable aggregation: {agg}",
+                })
+                passed = False
+            elif actual is not None:
                 if "min" in threshold:
                     ok = _apply_op(">=", actual, float(threshold["min"]))
                     details.append({

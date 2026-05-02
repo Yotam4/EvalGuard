@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 
 from evalguard_evaluators.base import EvalContext
+from evalguard_evaluators.base import ProviderResult
 from evalguard_evaluators.judges.pointwise import (
     MockPointwiseJudge,
+    PointwiseJudge,
     _parse_score_json,
 )
 
@@ -48,3 +50,41 @@ def test_mock_judge_per_row_overrides_drive_failures() -> None:
     ctx_bad = EvalContext(row_id="bad", input="", expected=None, output="", provider="m", model="m")
     assert asyncio.run(j.evaluate(ctx_good))[0].passed is True
     assert asyncio.run(j.evaluate(ctx_bad))[0].passed is False
+
+
+def test_pointwise_judge_forwards_model_params(monkeypatch) -> None:
+    captured = {}
+
+    class RecordingProvider:
+        def configure(self, cfg):
+            pass
+
+        async def complete(self, prompt, *, model, params=None):
+            captured["model"] = model
+            captured["params"] = params
+            return ProviderResult(
+                output='{"score": 5, "reason": "ok"}',
+                cost_usd=0.0,
+                latency_ms=0,
+                raw={},
+            )
+
+    monkeypatch.setattr(
+        "evalguard_evaluators.judges.pointwise.load_provider",
+        lambda name, cfg: RecordingProvider(),
+    )
+
+    j = PointwiseJudge()
+    j.configure({
+        "id": "q",
+        "rubric": "Rate quality.",
+        "model": "mock:judge",
+        "threshold": 4.0,
+        "params": {"temperature": 0, "max_tokens": 64},
+    })
+    ctx = EvalContext(row_id="r1", input="x", expected=None, output="y", provider="mock", model="m")
+    scores = asyncio.run(j.evaluate(ctx))
+
+    assert scores[0].passed is True
+    assert captured["model"] == "judge"
+    assert captured["params"] == {"temperature": 0, "max_tokens": 64}
