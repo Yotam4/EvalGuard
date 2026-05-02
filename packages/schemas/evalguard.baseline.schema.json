@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://evalguard.dev/schemas/evalguard.baseline.schema.json",
+  "title": "EvalGuard baseline file",
+  "description": "Snapshot of one run's metrics, used by relative-threshold gates and the GitHub Action's PR-comment renderer to compute Δ-vs-baseline.",
+  "type": "object",
+  "required": ["schema_version", "run_id", "config_hash", "saved_at", "metrics"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+    "run_id":         { "type": "string", "pattern": "^run_[a-z0-9]{8,}$" },
+    "config_hash":    { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "saved_at":       { "type": "string" },
+    "actor_meta":     { "type": "object" },
+    "metrics": {
+      "type": "object",
+      "description": "Mirrors the dict produced by SqliteStore.compute_metrics(): flat scalars plus by_evaluator / by_layer / by_tag sub-dicts."
+    }
+  }
+}

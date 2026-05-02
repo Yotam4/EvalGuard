@@ -21,6 +21,7 @@ import typer
 from rich.table import Table
 
 from evalguard_cli.console import console
+from evalguard_cli.local.baseline_io import load_baseline, save_baseline
 from evalguard_cli.local.gate import evaluate_gates, format_gate_report
 from evalguard_cli.local.local_executor import execute
 from evalguard_cli.local.report import render_run_table
@@ -37,6 +38,14 @@ def run(
     db_path: Path = typer.Option(Path(".evalguard/local.db"), "--db", help="SQLite path for run history"),
     fail_fast: bool = typer.Option(False, "--fail-fast", help="Abort on the first failing row"),
     quiet: bool = typer.Option(False, "--quiet", "-q", help="Suppress per-row output"),
+    baseline: Path | None = typer.Option(
+        None, "--baseline",
+        help="Baseline file (JSON) for relative-threshold gates and Δ-vs-baseline reporting.",
+    ),
+    save_baseline_to: Path | None = typer.Option(
+        None, "--save-baseline",
+        help="After the run, write a baseline file at this path. The Phase-1 GitHub Action calls this on main.",
+    ),
 ) -> None:
     """Run the eval pipeline against the local executor."""
     try:
@@ -60,6 +69,21 @@ def run(
     gate_strategy = cfg.raw.get("gate_strategy", "all")
     audit = run_record.audit
 
+    # Optionally load a prior-run baseline for relative-threshold gates.
+    baseline_metrics = None
+    if baseline is not None:
+        try:
+            baseline_record = load_baseline(baseline)
+            baseline_metrics = baseline_record.metrics
+            console.print(
+                f"[dim]baseline:[/dim] {baseline} · "
+                f"run={baseline_record.run_id} · "
+                f"saved={baseline_record.saved_at}"
+            )
+        except Exception as e:  # noqa: BLE001
+            console.print(f"[red]baseline load error:[/red] {e}")
+            raise typer.Exit(EXIT_INFRA_ERROR) from e
+
     # Map gate.name → resolved spec so each gate.evaluated event records
     # the full pass/fail criteria the user set for this run (severity,
     # aggregation, threshold, per_tag_overrides, evaluator scope,
@@ -72,7 +96,10 @@ def run(
     trial_verdicts: list[dict] = []
     for trial in run_record.trials:
         trial_metrics = store.compute_metrics(run_record.run_id, trial_id=trial.trial_id)
-        trial_gates = evaluate_gates(legacy_gates, trial_metrics, layers=layer_gates)
+        trial_gates = evaluate_gates(
+            legacy_gates, trial_metrics,
+            layers=layer_gates, baseline=baseline_metrics,
+        )
         store.save_gate_results(run_record.run_id, trial_gates, trial_id=trial.trial_id)
 
         # Audit: one event per gate evaluated. ``spec`` records the
@@ -199,6 +226,26 @@ def run(
         overall = "passed"
 
     store.finalize_run(run_record.run_id, status=overall, gate_status=gate_status_overall)
+
+    # Persist a baseline snapshot at the end of the run if requested. We
+    # save the run-level aggregate metrics (not per-trial) — the Phase-1
+    # Action calls this on ``main`` so PR runs can compare against it.
+    if save_baseline_to is not None:
+        agg_metrics = store.compute_metrics(run_record.run_id)
+        try:
+            saved = save_baseline(
+                run_id=run_record.run_id,
+                config_hash=run_record.config_hash,
+                metrics=agg_metrics,
+                actor_meta=audit.actor.actor_meta if audit is not None else {},
+                path=save_baseline_to,
+            )
+            console.print(
+                f"[dim]baseline saved:[/dim] {save_baseline_to} · "
+                f"run={saved.run_id}"
+            )
+        except Exception as e:  # noqa: BLE001
+            console.print(f"[yellow]baseline save warning:[/yellow] {e}")
 
     if audit is not None:
         audit.emit(

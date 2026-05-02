@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import typer
 
-from evalguard_cli.commands import audit_cmd, init_cmd, run_cmd, view_cmd
+from evalguard_cli.commands import (
+    audit_cmd, diff_cmd, init_cmd, run_cmd, validate_cmd, view_cmd,
+)
 
 app = typer.Typer(
     name="evalguard",
@@ -14,8 +16,10 @@ app = typer.Typer(
 )
 
 app.command("init")(init_cmd.init)
+app.command("validate")(validate_cmd.validate)
 app.command("run")(run_cmd.run)
 app.command("view")(view_cmd.view)
+app.command("diff")(diff_cmd.diff)
 app.add_typer(audit_cmd.audit_app, name="audit")
 
 

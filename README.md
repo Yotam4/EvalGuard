@@ -122,6 +122,19 @@ layers:                                # one configurable gate per pyramid step
         safety:      1.00              # zero tolerance on safety
         helpfulness: 0.85              # adversarial cases get more slack
 
+  # ── Δ-vs-baseline gates (used by the GitHub Action; opt-in) ─────────────
+  # When ``evalguard run --baseline path.json`` is invoked, ``relative``
+  # rules fire: actual − baseline-actual must clear ``min_delta_vs_baseline``
+  # (or stay under ``max_delta_vs_baseline`` for cost / latency).
+  # Without ``--baseline`` the same rules are no-ops, so PR runs and
+  # local runs both work with the same YAML.
+  judge_offline_relative:                # alias, layer reuse is fine
+    severity: warn
+    aggregation: pass_rate
+    threshold:
+      type: relative
+      min_delta_vs_baseline: -0.02       # fail if pass_rate dropped >2 pp
+
   human:                               # custom Python escape hatch
     severity: log
     custom_check:
@@ -171,7 +184,9 @@ design doc and roadmap.
 | Command | What it does |
 |---|---|
 | `evalguard init [-t text_gen\|rag\|text_to_sql]` | Scaffold a project |
-| `evalguard run [-c evalguard.yaml]` | Run pipeline; exit 0/2 by gate severity |
+| `evalguard validate [-c evalguard.yaml]` | Schema-validate + asset-resolve in <1s, no provider calls |
+| `evalguard run [-c evalguard.yaml] [--baseline f.json] [--save-baseline f.json]` | Run pipeline; exit 0/2 by gate severity |
+| `evalguard diff <run_a> <run_b>` | Side-by-side metric Δ between two local runs |
 | `evalguard view` | List recent runs |
 | `evalguard view <run_id>` | Rows table + per-layer rollup + gates |
 | `evalguard view <run_id> --trial T` | Per-trial drill-down |

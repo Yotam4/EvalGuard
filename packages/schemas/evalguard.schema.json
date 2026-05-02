@@ -186,9 +186,17 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "type":              { "type": "string", "enum": ["absolute"], "default": "absolute" },
+            "type":              { "type": "string", "enum": ["absolute", "relative"], "default": "absolute" },
             "min":               { "type": "number" },
             "max":               { "type": "number" },
+            "min_delta_vs_baseline": {
+              "type": "number",
+              "description": "When ``type: relative`` and a baseline file is provided, the gate fails if (actual − baseline_actual) < min_delta_vs_baseline."
+            },
+            "max_delta_vs_baseline": {
+              "type": "number",
+              "description": "Symmetric to min_delta_vs_baseline; useful for cost / latency gates that should not regress upward."
+            },
             "per_tag_overrides": { "type": "object", "additionalProperties": { "type": "number" } }
           }
         },

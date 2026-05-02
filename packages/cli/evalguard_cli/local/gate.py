@@ -71,11 +71,21 @@ def evaluate_gates(
     metrics: dict[str, Any],
     *,
     layers: dict[str, dict[str, Any]] | None = None,
+    baseline: dict[str, Any] | None = None,
 ) -> list[GateResult]:
-    """Evaluate both legacy and per-layer gates against ``metrics``."""
+    """Evaluate both legacy and per-layer gates against ``metrics``.
+
+    ``baseline`` is a metrics dict from a prior run (typically a
+    ``main``-branch run loaded via ``baseline_io.load_baseline``). When
+    present and a per-layer gate has ``threshold.type: relative``, the
+    gate compares ``actual − baseline_actual`` against
+    ``min_delta_vs_baseline`` / ``max_delta_vs_baseline``. When absent,
+    relative rules are skipped and only absolute rules run — the same
+    YAML works with or without a baseline.
+    """
     out: list[GateResult] = []
     out.extend(_evaluate_legacy(legacy_gates or [], metrics))
-    out.extend(_evaluate_layers(layers or {}, metrics))
+    out.extend(_evaluate_layers(layers or {}, metrics, baseline=baseline))
     return out
 
 
@@ -113,17 +123,27 @@ def _evaluate_legacy(gates: list[dict[str, Any]], metrics: dict[str, Any]) -> li
 # per-layer shape
 
 
-def _evaluate_layers(layers: dict[str, dict[str, Any]], metrics: dict[str, Any]) -> list[GateResult]:
+def _evaluate_layers(
+    layers: dict[str, dict[str, Any]],
+    metrics: dict[str, Any],
+    *,
+    baseline: dict[str, Any] | None = None,
+) -> list[GateResult]:
     results: list[GateResult] = []
     by_evaluator = metrics.get("by_evaluator", {}) or {}
     by_layer = metrics.get("by_layer", {}) or {}
     by_tag = metrics.get("by_tag", {}) or {}
+
+    base_by_evaluator = (baseline or {}).get("by_evaluator", {}) or {}
+    base_by_layer = (baseline or {}).get("by_layer", {}) or {}
+    base_by_tag = (baseline or {}).get("by_tag", {}) or {}
 
     for layer_name, gate in layers.items():
         idx = LAYER_INDEX.get(layer_name)
         severity = gate.get("severity", "block")
         agg = gate.get("aggregation", "pass_rate")
         threshold = gate.get("threshold") or {}
+        threshold_type = threshold.get("type", "absolute")
         evaluator_id = gate.get("evaluator")
 
         details: list[dict[str, Any]] = []
@@ -172,6 +192,38 @@ def _evaluate_layers(layers: dict[str, dict[str, Any]], metrics: dict[str, Any])
                     "actual": tag_actual, "passed": ok,
                 })
                 passed = passed and ok
+
+            # 4) relative thresholds (Δ vs baseline). Only fires when both
+            #    a baseline is provided AND the threshold type is "relative".
+            if threshold_type == "relative" and baseline is not None and actual is not None:
+                base_actual, _ = _resolve_aggregation(
+                    agg, layer_name, idx, evaluator_id,
+                    by_evaluator=base_by_evaluator,
+                    by_layer=base_by_layer,
+                    by_tag=base_by_tag,
+                )
+                if base_actual is not None:
+                    delta = actual - base_actual
+                    if "min_delta_vs_baseline" in threshold:
+                        target = float(threshold["min_delta_vs_baseline"])
+                        ok = delta >= target
+                        details.append({
+                            "metric": f"{label}.delta_vs_baseline",
+                            "op": ">=", "target": target,
+                            "actual": delta,
+                            "baseline": base_actual, "passed": ok,
+                        })
+                        passed = passed and ok
+                    if "max_delta_vs_baseline" in threshold:
+                        target = float(threshold["max_delta_vs_baseline"])
+                        ok = delta <= target
+                        details.append({
+                            "metric": f"{label}.delta_vs_baseline",
+                            "op": "<=", "target": target,
+                            "actual": delta,
+                            "baseline": base_actual, "passed": ok,
+                        })
+                        passed = passed and ok
 
         # 4) custom_check Python escape hatch
         custom_execution: dict[str, Any] | None = None
