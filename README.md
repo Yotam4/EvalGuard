@@ -156,6 +156,24 @@ cost_cap_usd: 2.00
 Plugins register additional providers via the `evalguard.providers`
 entry-point group.
 
+## GitHub Action
+
+Phase 1 ships a Docker action at `packages/action/` that wraps the CLI
+and posts a sticky PR comment. Drop the example workflow at
+`.github/workflows/evalguard-example.yml` into your own repo, point it
+at your `evalguard.yaml`, and every PR gets a comment with per-trial
+verdicts, gate results, and Δ-vs-baseline metrics.
+
+```yaml
+- uses: ./packages/action
+  with:
+    config: evalguard.yaml
+    baseline:      ${{ github.event_name == 'pull_request' && './.baseline/baseline.json' || '' }}
+    save_baseline: ${{ github.ref == 'refs/heads/main' && './baseline.json' || '' }}
+```
+
+See `packages/action/README.md` for the full input / output reference.
+
 ## Status
 
 - **Phase 0** — CLI, YAML loader with `${ENV}` substitution, local
@@ -187,6 +205,7 @@ design doc and roadmap.
 | `evalguard validate [-c evalguard.yaml]` | Schema-validate + asset-resolve in <1s, no provider calls |
 | `evalguard run [-c evalguard.yaml] [--baseline f.json] [--save-baseline f.json]` | Run pipeline; exit 0/2 by gate severity |
 | `evalguard diff <run_a> <run_b>` | Side-by-side metric Δ between two local runs |
+| `evalguard comment <run_id> [--baseline f.json] [--out file.md]` | Render a sticky PR-comment markdown body |
 | `evalguard view` | List recent runs |
 | `evalguard view <run_id>` | Rows table + per-layer rollup + gates |
 | `evalguard view <run_id> --trial T` | Per-trial drill-down |

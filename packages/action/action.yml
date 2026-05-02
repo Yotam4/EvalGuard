@@ -1,0 +1,74 @@
+name: 'EvalGuard'
+description: |
+  Run EvalGuard on a PR and post a sticky markdown comment with
+  per-trial verdicts, gate results, and Δ-vs-baseline metrics.
+  Use the same action on the default branch with ``save_baseline``
+  to refresh the artifact PRs compare against.
+author: 'EvalGuard'
+branding:
+  icon: 'shield'
+  color: 'green'
+
+inputs:
+  config:
+    description: 'Path to evalguard.yaml.'
+    required: false
+    default: 'evalguard.yaml'
+  baseline:
+    description: |
+      Path to a baseline JSON file produced by a prior
+      ``evalguard run --save-baseline ...``. When provided, ``relative``
+      threshold gates are evaluated and the PR comment includes a
+      Δ-vs-baseline table. Typically downloaded from a ``main`` artifact.
+    required: false
+    default: ''
+  save_baseline:
+    description: |
+      When set, write a baseline file at this path at end of run.
+      Use this on pushes to the default branch; upload the resulting
+      file as a workflow artifact for PR runs to consume.
+    required: false
+    default: ''
+  comment:
+    description: 'Post a sticky PR comment ("true" / "false").'
+    required: false
+    default: 'true'
+  marker:
+    description: |
+      HTML-comment marker that identifies the sticky comment for
+      update. Override to host multiple stickies on one PR.
+    required: false
+    default: '<!-- evalguard:pr-comment -->'
+  pr_number:
+    description: 'PR number (auto-detected on pull_request events).'
+    required: false
+    default: ''
+  github_token:
+    description: 'Token for posting comments. Defaults to ${{ github.token }}.'
+    required: false
+    default: ${{ github.token }}
+  fail_fast:
+    description: 'Pass --fail-fast to evalguard run.'
+    required: false
+    default: 'false'
+
+outputs:
+  exit_code:
+    description: 'Exit code from `evalguard run` (0 pass, 2 gate fail, 1 infra error).'
+  run_id:
+    description: 'The run ID produced by this invocation.'
+  comment_url:
+    description: 'URL of the posted PR comment, if any.'
+
+runs:
+  using: 'docker'
+  image: 'Dockerfile'
+  env:
+    EVALGUARD_INPUT_CONFIG: ${{ inputs.config }}
+    EVALGUARD_INPUT_BASELINE: ${{ inputs.baseline }}
+    EVALGUARD_INPUT_SAVE_BASELINE: ${{ inputs.save_baseline }}
+    EVALGUARD_INPUT_COMMENT: ${{ inputs.comment }}
+    EVALGUARD_INPUT_MARKER: ${{ inputs.marker }}
+    EVALGUARD_INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+    EVALGUARD_INPUT_FAIL_FAST: ${{ inputs.fail_fast }}
+    GITHUB_TOKEN: ${{ inputs.github_token }}
