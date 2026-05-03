@@ -1,0 +1,89 @@
+version: 1
+project: my-text-to-sql-project
+template: text_to_sql
+
+# ── Providers ────────────────────────────────────────────────────────────────
+# Compare candidates side-by-side on the same question set. The mock
+# provider's ``fixed`` mode returns a canned ``output``; individual rows
+# can override the canned output by setting their own ``params: { output: ... }``
+# (see datasets/golden.jsonl) so the smoke run produces real SQL per row.
+providers:
+  - id: mock:sql-strong
+    config:
+      mode: fixed
+      output: "SELECT 1;"
+  # - id: openai:gpt-4o-mini
+  #   config:
+  #     api_key: ${OPENAI_API_KEY}
+  #     temperature: 0.0
+  #     response_format: { type: text }
+
+# ── Systems (DB connections) ─────────────────────────────────────────────────
+# Top-level ``systems:`` is the configurable slot for any external system an
+# evaluator needs (e.g. shadow databases, vector stores). Values support
+# ${ENV} substitution so credentials stay out of the repo. Built-in
+# evaluators that don't need a system simply ignore this block.
+#
+# Future evaluators that will consume this block:
+#   - heuristic.dry_run_on_shadow_db   — run the SQL on ``shadow``
+#   - heuristic.result_set_equivalence — compare result sets between
+#     candidate and expected against ``shadow``
+systems:
+  shadow:
+    kind:    sqlite
+    url:     "${SHADOW_DB_URL:-sqlite:///./.evalguard/shadow.db}"
+    dialect: postgres
+    schema:  schemas/db.sql
+
+prompts:
+  - id: text2sql_v1
+    file: prompts/text2sql.md
+
+datasets:
+  - id: questions
+    file: datasets/golden.jsonl
+
+# ── Layer 1 — heuristics ────────────────────────────────────────────────────
+# ``sql_parses`` requires the [textsql] extra:
+#     pip install 'evalguard-evaluators[textsql]'
+heuristics:
+  - id: parses
+    type: sql_parses
+    dialect: postgres
+    strip_fences: true
+    require_select: true
+  - type: not_contains
+    value: "DROP TABLE"          # paranoid guard against destructive output
+
+# ── Layer 3 — query intent judge ────────────────────────────────────────────
+# Pointwise judge with a SQL-specific rubric. For real eval, swap
+# ``mock_pointwise`` for ``pointwise`` and point ``model:`` at a real LLM.
+judges:
+  - id: query_intent_match
+    type: mock_pointwise
+    score: 4.5
+    threshold: 4.0
+    # For real eval:
+    # type: pointwise
+    # model: openai:gpt-4o
+    # rubric_file: rubrics/intent_match.md
+    # params: { temperature: 0.0 }
+
+run_mode: short_circuit_blocking_only
+
+# ── Gates ────────────────────────────────────────────────────────────────────
+layers:
+  heuristics:                     # Layer 1 — must parse
+    severity: block
+    aggregation: pass_rate
+    threshold: { min: 1.0 }       # zero tolerance for syntactically-broken SQL
+
+  judge_offline:                  # Layer 3 — intent match
+    severity: block
+    aggregation: pass_rate
+    threshold: { min: 0.85 }
+
+cost_cap_usd: 5.00
+concurrency: 4
+
+cache: { dir: .evalguard/cache, enabled: true }

@@ -11,14 +11,20 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-openai = ["openai>=1.40"]
+openai  = ["openai>=1.40"]
+textsql = ["sqlglot>=23.0"]
 
 [project.entry-points."evalguard.evaluators"]
-"heuristic.json_schema" = "evalguard_evaluators.heuristics.json_schema:JsonSchemaHeuristic"
-"heuristic.not_contains" = "evalguard_evaluators.heuristics.not_contains:NotContainsHeuristic"
-"heuristic.length" = "evalguard_evaluators.heuristics.length:LengthHeuristic"
-"judge.pointwise" = "evalguard_evaluators.judges.pointwise:PointwiseJudge"
-"judge.mock_pointwise" = "evalguard_evaluators.judges.pointwise:MockPointwiseJudge"
+"heuristic.json_schema"    = "evalguard_evaluators.heuristics.json_schema:JsonSchemaHeuristic"
+"heuristic.not_contains"   = "evalguard_evaluators.heuristics.not_contains:NotContainsHeuristic"
+"heuristic.length"         = "evalguard_evaluators.heuristics.length:LengthHeuristic"
+"heuristic.sql_parses"     = "evalguard_evaluators.heuristics.sql_parses:SqlParsesHeuristic"
+"metric.faithfulness"      = "evalguard_evaluators.metrics.rag:FaithfulnessMetric"
+"metric.answer_relevancy"  = "evalguard_evaluators.metrics.rag:AnswerRelevancyMetric"
+"metric.context_precision" = "evalguard_evaluators.metrics.rag:ContextPrecisionMetric"
+"metric.context_recall"    = "evalguard_evaluators.metrics.rag:ContextRecallMetric"
+"judge.pointwise"          = "evalguard_evaluators.judges.pointwise:PointwiseJudge"
+"judge.mock_pointwise"     = "evalguard_evaluators.judges.pointwise:MockPointwiseJudge"
 
 [project.entry-points."evalguard.providers"]
 "openai" = "evalguard_evaluators.providers.openai_provider:OpenAIProvider"

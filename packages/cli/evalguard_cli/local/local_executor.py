@@ -229,8 +229,31 @@ async def execute(
                 tags = list(row.get("tags") or [])
                 prompt = _render_prompt(prompt_template, row)
 
+                # Per-row provider/params override. ``row.provider`` (e.g.
+                # "openai:gpt-4o") swaps the model used for this row's
+                # completion; ``row.params`` is shallow-merged onto the
+                # trial's provider config (row wins). Cache key reflects
+                # the *effective* (provider, model, params) so two rows
+                # with different overrides don't collide.
+                row_override = row.get("provider")
+                if row_override:
+                    eff_provider_name, eff_model = _split_provider_id(row_override)
+                else:
+                    eff_provider_name, eff_model = provider_name, model
+                row_params = row.get("params") or {}
+                eff_provider_cfg = {**provider_cfg, **row_params} if row_params else provider_cfg
+                if row_override and eff_provider_name != provider_name:
+                    eff_provider = load_provider(eff_provider_name, eff_provider_cfg)
+                elif row_params:
+                    # Same provider class, different params → instantiate a
+                    # fresh provider so the merged config is applied.
+                    eff_provider = load_provider(eff_provider_name, eff_provider_cfg)
+                else:
+                    eff_provider = provider
+                effective_provider_name, effective_model = eff_provider_name, eff_model
+
                 cache_key = ContentCache.key(
-                    provider_name, model, prompt, provider_cfg, input_value
+                    eff_provider_name, eff_model, prompt, eff_provider_cfg, input_value
                 )
                 cached = cache.get(cache_key)
                 if cached is not None:
@@ -242,7 +265,7 @@ async def execute(
                     )
                     cache_hit = True
                 else:
-                    pr = await provider.complete(prompt, model=model)
+                    pr = await eff_provider.complete(prompt, model=eff_model)
                     cache.put(cache_key, {
                         "output": pr.output,
                         "latency_ms": pr.latency_ms,
@@ -275,16 +298,24 @@ async def execute(
                         cost_usd=total_cost,
                     )
 
+                # ``provider``/``model``/``model_params`` reflect what
+                # actually drove the call (post-row-override) so an
+                # auditor can reconstruct stratified runs row-by-row.
+                # ``trial_provider_id`` preserves the trial-level
+                # configured provider for grouping.
                 audit.emit(
                     "provider.called",
                     trial_id=trial_id, row_id=row_id,
-                    subject_id=provider_id,
+                    subject_id=f"{eff_provider_name}:{eff_model}" if row_override or row_params
+                                else provider_id,
                     inputs=prompt,
                     outputs=pr.output,
                     payload={
-                        "provider":         provider_name,
-                        "model":            model,
-                        "model_params":     provider_cfg,
+                        "provider":         eff_provider_name,
+                        "model":            eff_model,
+                        "model_params":     eff_provider_cfg,
+                        "trial_provider_id": provider_id,
+                        "row_override":     bool(row_override) or bool(row_params),
                         "rendered_prompt":  prompt,
                         "raw_response":     pr.output,
                         "raw_provider":     pr.raw,
@@ -295,9 +326,14 @@ async def execute(
                     duration_ms=pr.latency_ms,
                 )
 
+                # ``extra`` exposes the full row to evaluators so RAG /
+                # text_to_sql / agent rows can carry their own fields
+                # (``contexts``, ``question``, ``schema_ref``, …) without
+                # the executor needing to know about every domain shape.
                 ctx = EvalContext(
                     row_id=row_id, input=input_value, expected=expected,
-                    output=pr.output, provider=provider_name, model=model,
+                    output=pr.output, provider=effective_provider_name, model=effective_model,
+                    extra=dict(row) if isinstance(row, dict) else {},
                 )
 
                 scores: list[Score] = []
@@ -409,7 +445,7 @@ async def execute(
                 store.insert_row(
                     run_id, row_id, trial_id=trial_id,
                     input_json=input_value, expected_json=expected,
-                    output=pr.output, provider=provider_name, model=model,
+                    output=pr.output, provider=eff_provider_name, model=eff_model,
                     cost_usd=pr.cost_usd, latency_ms=pr.latency_ms,
                     cache_hit=cache_hit, tags=tags,
                 )
@@ -613,8 +649,6 @@ def _render_prompt(template: str, row: dict[str, Any]) -> str:
     fields: dict[str, Any] = dict(row) if isinstance(row, dict) else {}
     if "input" not in fields:
         fields["input"] = ""
-    if isinstance(fields.get("input"), (dict, list)):
-        fields["input"] = json.dumps(fields["input"], ensure_ascii=False)
 
     def _sub(match: "re.Match[str]") -> str:
         key = match.group(1)
@@ -624,7 +658,14 @@ def _render_prompt(template: str, row: dict[str, Any]) -> str:
                 f"row keys are {sorted(fields)}"
             )
         value = fields[key]
-        return str(value) if value is not None else ""
+        if value is None:
+            return ""
+        # JSON-serialize structured values so RAG ``{contexts}`` (a list
+        # of strings) and SQL ``{schema_ref}`` (a dict) render cleanly
+        # rather than leaking Python repr (``['c1', 'c2']``).
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, ensure_ascii=False)
+        return str(value)
 
     return _PLACEHOLDER_RE.sub(_sub, template)
 

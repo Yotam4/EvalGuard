@@ -135,6 +135,19 @@
         "enabled": { "type": "boolean", "default": true }
       }
     },
+    "systems": {
+      "type": "object",
+      "description": "External systems referenced by evaluators (e.g. databases for the text_to_sql template). Values support ${ENV} substitution so secrets stay out of the repo. Each entry is a free-form object the consuming evaluator interprets — schema validation only enforces 'an object keyed by id'.",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "kind":     { "type": "string", "description": "Free-text label for the system kind, e.g. 'postgres', 'shadow_sqlite', 'snowflake'." },
+          "url":      { "type": "string" },
+          "dialect":  { "type": "string" },
+          "schema":   { "type": ["string", "object"] }
+        }
+      }
+    },
     "concurrency": { "type": "integer", "minimum": 1, "default": 8 },
     "cost_cap_usd": { "type": "number", "minimum": 0 },
     "gate_strategy": {

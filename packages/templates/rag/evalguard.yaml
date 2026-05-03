@@ -1,0 +1,90 @@
+version: 1
+project: my-rag-project
+template: rag
+
+# ── Providers ────────────────────────────────────────────────────────────────
+# RAG runs typically benchmark one generator against the same
+# retriever-supplied contexts. Add multiple providers to compare models on
+# the same golden set. Every config value is forwarded to the SDK.
+providers:
+  - id: mock:rag-strong
+    config: { mode: echo }
+  # - id: openai:gpt-4o-mini
+  #   config:
+  #     api_key: ${OPENAI_API_KEY}
+  #     temperature: 0.0
+  #     max_tokens: 512
+
+# Prompt placeholders read from the dataset row. RAG rows carry
+# ``question`` and ``contexts`` (a list of strings); see datasets/golden.jsonl.
+# List values are JSON-serialized when interpolated.
+prompts:
+  - id: rag_v1
+    file: prompts/rag.md
+
+datasets:
+  - id: rag_golden
+    file: datasets/golden.jsonl
+
+# ── Layer 1 — heuristics (cheap deterministic) ──────────────────────────────
+# Catch the worst format failures before paying for retrieval-quality metrics.
+heuristics:
+  - type: length
+    min: 1
+    max: 2000
+  - type: not_contains
+    value: "I don't know"        # remove this if "abstain" is a valid answer
+
+# ── Layer 2 — RAG metrics (deterministic n-gram proxies for RAGAS) ──────────
+# These are token-overlap proxies, not LLM-backed. They run in <10ms / row,
+# require no API key, and correlate well enough with LLM-based RAGAS for CI
+# regression-detection. For higher fidelity, register an LLM-backed plugin
+# under the ``evalguard.evaluators`` entry-point with the same id.
+metrics:
+  - id: faithfulness
+    type: faithfulness
+    threshold: 0.5
+  - id: answer_relevancy
+    type: answer_relevancy
+    threshold: 0.3
+  - id: context_precision
+    type: context_precision
+    threshold: 0.4
+    relevance_min: 0.10           # a context "counts" if ≥10% of expected_answer tokens appear in it
+  - id: context_recall
+    type: context_recall
+    threshold: 0.5
+
+# ── Layer 3 — offline LLM-as-judge (optional) ───────────────────────────────
+# Uncomment to add a holistic LLM verdict on top of the proxy metrics.
+# judges:
+#   - id: rag_quality
+#     type: pointwise
+#     model: openai:gpt-4o
+#     rubric_file: rubrics/rag_quality.md
+#     threshold: 4.0
+#     params: { temperature: 0.0 }
+
+run_mode: short_circuit_blocking_only
+
+# ── Gates ────────────────────────────────────────────────────────────────────
+layers:
+  heuristics:
+    severity: block
+    aggregation: pass_rate
+    threshold: { min: 1.0 }
+
+  metrics:                        # Layer 2 — RAG metrics roll-up
+    severity: warn                # warn first; tighten to ``block`` when stable
+    aggregation: pass_rate
+    threshold: { min: 0.80 }
+
+  # judge_offline:                # uncomment if you enabled the LLM judge above
+  #   severity: block
+  #   aggregation: pass_rate
+  #   threshold: { min: 0.90 }
+
+cost_cap_usd: 5.00
+concurrency: 4
+
+cache: { dir: .evalguard/cache, enabled: true }

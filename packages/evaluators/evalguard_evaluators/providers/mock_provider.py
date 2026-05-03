@@ -4,7 +4,9 @@ Useful for examples, CI, and tests where calling a real LLM is undesirable.
 Behaviour is configurable via the ``mode`` field:
 
 - ``echo``         return the input verbatim
-- ``expected``     return the row's ``expected`` field (set on the call)
+- ``fixed``        return the verbatim string in ``output`` (e.g. canned SQL
+  for the text_to_sql template demo). Per-row dataset overrides can swap
+  this on individual rows.
 - ``json_summary`` return ``{"summary": "...", "topic": "..."}`` shaped to
   match the quickstart example schema
 - ``judge_score``  return ``{"score": <score>, "reason": "..."}`` parseable
@@ -29,12 +31,14 @@ class MockProvider:
         self._latency_ms: int = 5
         self._score: float = 4.5
         self._cost_per_call: float = 0.0
+        self._fixed_output: str = ""
 
     def configure(self, cfg: dict[str, Any]) -> None:
         self._mode = cfg.get("mode", "json_summary")
         self._latency_ms = int(cfg.get("latency_ms", 5))
         self._score = float(cfg.get("score", 4.5))
         self._cost_per_call = float(cfg.get("cost_per_call", 0.0))
+        self._fixed_output = str(cfg.get("output", ""))
 
     async def complete(
         self,
@@ -46,6 +50,8 @@ class MockProvider:
         start = time.monotonic()
         if self._mode == "echo":
             output = prompt
+        elif self._mode == "fixed":
+            output = self._fixed_output
         elif self._mode == "json_summary":
             output = self._fake_summary(prompt)
         elif self._mode == "judge_score":

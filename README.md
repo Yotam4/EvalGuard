@@ -186,6 +186,14 @@ See `packages/action/README.md` for the full input / output reference.
 - **Phase 1** — Docker-based GitHub Action in `packages/action/`,
   sticky PR comments, relative thresholds, baseline save/load flow, and
   action-shape tests.
+- **Phase 1c** — `evalguard push` no-op fallback for the future server,
+  schema-drift canaries for `actor_type` / `severity` / `gate_status`.
+- **Tier B (broaden eval surface)** — `rag` template + Layer-2 RAGAS-proxy
+  metrics (`faithfulness`, `answer_relevancy`, `context_precision`,
+  `context_recall`); `text_to_sql` template + `sql_parses` heuristic
+  (sqlglot, optional `[textsql]` extra); top-level `systems:` block for
+  external connections; per-row `provider` / `params` overrides for
+  stratified eval.
 
 ## Coming next
 
@@ -299,7 +307,7 @@ packages/
   cli/                evalguard CLI + local executor
   evaluators/         heuristics, metrics, judges, providers
   schemas/            evalguard.yaml JSON schema
-  templates/          starter scaffolds (text_gen; rag/text_to_sql planned)
+  templates/          starter scaffolds (text_gen, rag, text_to_sql)
   action/             (planned) GitHub Action
 examples/
   quickstart-summarizer/
