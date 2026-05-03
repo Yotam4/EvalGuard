@@ -190,10 +190,18 @@ See `packages/action/README.md` for the full input / output reference.
   schema-drift canaries for `actor_type` / `severity` / `gate_status`.
 - **Tier B (broaden eval surface)** — `rag` template + Layer-2 RAGAS-proxy
   metrics (`faithfulness`, `answer_relevancy`, `context_precision`,
-  `context_recall`); `text_to_sql` template + `sql_parses` heuristic
-  (sqlglot, optional `[textsql]` extra); top-level `systems:` block for
-  external connections; per-row `provider` / `params` overrides for
+  `context_recall`); `text_to_sql` template + three SQL heuristics
+  (`sql_parses` via sqlglot, `dry_run_on_shadow_db` and
+  `result_set_equivalence` via stdlib SQLite); top-level `systems:` block
+  inlined into evaluator specs at YAML-load time so `version_id` covers
+  the system binding; per-row `provider` / `params` overrides for
   stratified eval.
+- **Tier C (production observability)** — bounded exponential-backoff
+  provider retry with `provider.retry` / `provider.failed` audit events
+  (rows mark failed without killing the trial); statistical-threshold
+  gates via Welch's two-sample t-test (`threshold.type: ttest`) using
+  per-evaluator score samples persisted in baseline files
+  (`BASELINE_SCHEMA_VERSION = 1.1.0`).
 
 ## Coming next
 

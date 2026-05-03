@@ -14,7 +14,7 @@
     "actor_meta":     { "type": "object" },
     "metrics": {
       "type": "object",
-      "description": "Mirrors the dict produced by SqliteStore.compute_metrics(): flat scalars plus by_evaluator / by_layer / by_tag sub-dicts."
+      "description": "Mirrors the dict produced by SqliteStore.compute_metrics(): flat scalars plus by_evaluator / by_layer / by_tag sub-dicts. Schema 1.1.0+ also carries per-evaluator score samples under metrics.samples (a map evaluator_id → array of raw values) so statistical-threshold gates (Welch's t-test) can run on the baseline side."
     }
   }
 }

@@ -186,6 +186,8 @@
             "trial.finalized",
             "row.short_circuited",
             "provider.called",
+            "provider.retry",
+            "provider.failed",
             "evaluator.heuristic.invoked",
             "evaluator.metric.invoked",
             "evaluator.judge.invoked",

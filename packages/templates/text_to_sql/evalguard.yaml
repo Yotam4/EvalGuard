@@ -18,22 +18,21 @@ providers:
   #     temperature: 0.0
   #     response_format: { type: text }
 
-# ── Systems (DB connections) ─────────────────────────────────────────────────
-# Top-level ``systems:`` is the configurable slot for any external system an
-# evaluator needs (e.g. shadow databases, vector stores). Values support
-# ${ENV} substitution so credentials stay out of the repo. Built-in
-# evaluators that don't need a system simply ignore this block.
+# ── Systems (shadow DB) ──────────────────────────────────────────────────────
+# Top-level ``systems:`` is the configurable slot any evaluator can reference
+# via ``system: <name>`` (resolved at YAML-load time so the evaluator's
+# ``version_id`` covers the binding). ``${ENV}`` substitution keeps
+# credentials out of the repo.
 #
-# Future evaluators that will consume this block:
-#   - heuristic.dry_run_on_shadow_db   — run the SQL on ``shadow``
-#   - heuristic.result_set_equivalence — compare result sets between
-#     candidate and expected against ``shadow``
+# The default shadow URL is a local SQLite file so the template runs with
+# zero infrastructure. Point it at a throwaway Postgres / MySQL when the
+# corresponding plugin is installed.
 systems:
   shadow:
     kind:    sqlite
     url:     "${SHADOW_DB_URL:-sqlite:///./.evalguard/shadow.db}"
-    dialect: postgres
-    schema:  schemas/db.sql
+    dialect: sqlite               # set to postgres/mysql/snowflake when you swap kind
+    schema:  schemas/db.sql       # DDL bootstrapped before each row's evaluation
 
 prompts:
   - id: text2sql_v1
@@ -44,14 +43,28 @@ datasets:
     file: datasets/golden.jsonl
 
 # ── Layer 1 — heuristics ────────────────────────────────────────────────────
+# Three layered checks, cheap → expensive:
+#   1. parses         — sqlglot syntactic validation (no DB)
+#   2. dry_run        — does it execute against the shadow DB?
+#   3. result_match   — does it return the same result set as the expected SQL?
+#
 # ``sql_parses`` requires the [textsql] extra:
 #     pip install 'evalguard-evaluators[textsql]'
+# ``dry_run_on_shadow_db`` and ``result_set_equivalence`` use stdlib sqlite3
+# for the default ``kind: sqlite`` system — no extra install needed.
 heuristics:
   - id: parses
     type: sql_parses
-    dialect: postgres
+    dialect: sqlite
     strip_fences: true
     require_select: true
+  - id: dry_run
+    type: dry_run_on_shadow_db
+    system: shadow
+  - id: result_match
+    type: result_set_equivalence
+    system: shadow
+    ordered: false              # compare as multiset; flip to true for ORDER BY tests
   - type: not_contains
     value: "DROP TABLE"          # paranoid guard against destructive output
 
@@ -73,10 +86,10 @@ run_mode: short_circuit_blocking_only
 
 # ── Gates ────────────────────────────────────────────────────────────────────
 layers:
-  heuristics:                     # Layer 1 — must parse
+  heuristics:                     # Layer 1 — must parse + execute + match
     severity: block
     aggregation: pass_rate
-    threshold: { min: 1.0 }       # zero tolerance for syntactically-broken SQL
+    threshold: { min: 1.0 }       # zero tolerance: any of the three failing → block
 
   judge_offline:                  # Layer 3 — intent match
     severity: block

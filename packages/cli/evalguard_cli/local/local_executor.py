@@ -37,6 +37,11 @@ from evalguard_cli.local.audit import (
 )
 from evalguard_cli.local.cache import ContentCache
 from evalguard_cli.local.gate import LAYER_INDEX
+from evalguard_cli.local.retry import (
+    ProviderFailed,
+    RetryPolicy,
+    call_with_retry,
+)
 from evalguard_cli.local.sqlite_store import SqliteStore
 from evalguard_cli.local.yaml_loader import LoadedConfig
 from evalguard_evaluators import EvalContext, ProviderResult, Score
@@ -159,6 +164,10 @@ async def execute(
         if gate.get("severity", "block") == "block" and name in LAYER_INDEX
     }
 
+    # Run-wide default retry policy; per-provider ``config.retry``
+    # overrides it inside the trial loop.
+    run_retry_cfg = cfg.raw.get("retry") or {}
+
     # Run-level shared budget across all trials.
     cost_cap = float(cfg.raw.get("cost_cap_usd", 0)) or None
     total_cost = 0.0
@@ -175,7 +184,12 @@ async def execute(
 
     for provider_spec in provider_specs:
         provider_id = provider_spec["id"]
-        provider_cfg = provider_spec.get("config", {})
+        raw_provider_cfg = provider_spec.get("config", {})
+        # Operational keys (retry, etc.) are stripped from the SDK-bound
+        # config so they don't leak into provider.complete() kwargs and
+        # so cache-key stability is preserved when users tune them.
+        provider_cfg = {k: v for k, v in raw_provider_cfg.items() if k not in {"retry"}}
+        provider_retry_cfg = raw_provider_cfg.get("retry")
         provider_name, model = _split_provider_id(provider_id)
 
         if cost_capped.is_set():
@@ -184,6 +198,12 @@ async def execute(
             continue
 
         provider = load_provider(provider_name, provider_cfg)
+        # Retry policy: per-provider ``config.retry`` wins over the
+        # run-level ``retry:`` block. Both are optional; either being
+        # absent falls back to ``RetryPolicy``'s defaults.
+        trial_retry_policy = RetryPolicy.from_config(
+            provider_retry_cfg or run_retry_cfg
+        )
         trial_id = f"trial_{uuid.uuid4().hex[:12]}"
         store.start_trial(
             trial_id, run_id,
@@ -241,10 +261,13 @@ async def execute(
                 else:
                     eff_provider_name, eff_model = provider_name, model
                 row_params = row.get("params") or {}
-                eff_provider_cfg = {**provider_cfg, **row_params} if row_params else provider_cfg
+                # Strip operational keys from the SDK-bound config (same
+                # rationale as the trial-level strip above).
+                row_sdk_params = {k: v for k, v in row_params.items() if k not in {"retry"}}
+                eff_provider_cfg = {**provider_cfg, **row_sdk_params} if row_sdk_params else provider_cfg
                 if row_override and eff_provider_name != provider_name:
                     eff_provider = load_provider(eff_provider_name, eff_provider_cfg)
-                elif row_params:
+                elif row_sdk_params:
                     # Same provider class, different params → instantiate a
                     # fresh provider so the merged config is applied.
                     eff_provider = load_provider(eff_provider_name, eff_provider_cfg)
@@ -265,7 +288,75 @@ async def execute(
                     )
                     cache_hit = True
                 else:
-                    pr = await eff_provider.complete(prompt, model=eff_model)
+                    # Per-trial retry policy with optional per-row override
+                    # via ``row.params.retry``. ``on_retry`` emits a
+                    # ``provider.retry`` audit event per attempt so an
+                    # operator can see the back-pressure live.
+                    row_retry_cfg = (row_params or {}).get("retry") if row_params else None
+                    eff_policy = (
+                        RetryPolicy.from_config(row_retry_cfg) if row_retry_cfg
+                        else trial_retry_policy
+                    )
+
+                    def _on_retry(attempt: int, exc: BaseException, delay_ms: int) -> None:
+                        audit.emit(
+                            "provider.retry",
+                            trial_id=trial_id, row_id=row_id,
+                            subject_id=f"{eff_provider_name}:{eff_model}",
+                            payload={
+                                "provider":      eff_provider_name,
+                                "model":         eff_model,
+                                "attempt":       attempt,
+                                "max_retries":   eff_policy.max_retries,
+                                "delay_ms":      delay_ms,
+                                "error_type":    type(exc).__name__,
+                                "error":         str(exc)[:240],
+                                "cache_key":     cache_key,
+                            },
+                        )
+
+                    try:
+                        pr = await call_with_retry(
+                            coro_factory=lambda: eff_provider.complete(prompt, model=eff_model),
+                            policy=eff_policy,
+                            on_retry=_on_retry,
+                        )
+                    except ProviderFailed as fail:
+                        # Final failure: emit ``provider.failed``, mark the
+                        # row as evaluator-failed (no scores), and return
+                        # without raising so the rest of the trial proceeds.
+                        audit.emit(
+                            "provider.failed",
+                            trial_id=trial_id, row_id=row_id,
+                            subject_id=f"{eff_provider_name}:{eff_model}",
+                            payload={
+                                "provider":     eff_provider_name,
+                                "model":        eff_model,
+                                "attempts":     fail.attempts,
+                                "n_attempts":   len(fail.attempts),
+                                "error_type":   type(fail.cause).__name__,
+                                "error":        str(fail.cause)[:240],
+                                "trial_provider_id": provider_id,
+                                "row_override": bool(row_override) or bool(row_params),
+                            },
+                        )
+                        store.insert_row(
+                            run_id, row_id, trial_id=trial_id,
+                            input_json=input_value, expected_json=expected,
+                            output="", provider=eff_provider_name, model=eff_model,
+                            cost_usd=0.0, latency_ms=0,
+                            cache_hit=False, tags=tags,
+                        )
+                        if not quiet:
+                            console.print(
+                                f"  [red]✗[/red] {row_id}  "
+                                f"[dim](provider failed after "
+                                f"{len(fail.attempts)} attempt(s): "
+                                f"{type(fail.cause).__name__})[/dim]"
+                            )
+                        if fail_fast:
+                            aborted.set()
+                        return 0.0, False, True
                     cache.put(cache_key, {
                         "output": pr.output,
                         "latency_ms": pr.latency_ms,

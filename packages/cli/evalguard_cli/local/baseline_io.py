@@ -20,7 +20,12 @@ from typing import Any
 
 import jsonschema
 
-BASELINE_SCHEMA_VERSION = "1.0.0"
+# 1.1.0 adds an optional ``metrics.samples`` sub-dict (per-evaluator
+# score arrays) so statistical-threshold gates (Welch's t-test) can
+# compare baseline vs current distributions, not just point estimates.
+# 1.0.0 baselines remain readable; gates that require samples skip
+# non-blockingly when they're absent.
+BASELINE_SCHEMA_VERSION = "1.1.0"
 
 
 @dataclass

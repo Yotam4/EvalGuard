@@ -559,9 +559,25 @@ class SqliteStore:
             flat[f"layer{layer}.row_pass_rate"] = agg["row_pass_rate"]
             flat[f"layer{layer}.mean"] = agg["mean"]
 
+        # Per-evaluator score samples — the raw values that feed
+        # statistical-threshold gates (Welch's t-test). Cheap to fetch
+        # (a single SELECT, ordered for reproducibility) and cheap to
+        # serialize into a baseline file (~8 bytes × n_rows × n_evaluators).
+        samples: dict[str, list[float]] = {}
+        with self._conn() as c2:
+            for r in c2.execute(
+                f"""SELECT evaluator_id, value
+                    FROM scores
+                    WHERE run_id=? {scope_clause}
+                    ORDER BY evaluator_id, trial_id, row_id, id""",
+                (run_id, *scope_args),
+            ):
+                samples.setdefault(r["evaluator_id"], []).append(float(r["value"] or 0.0))
+
         flat["by_evaluator"] = by_evaluator
         flat["by_layer"] = by_layer
         flat["by_tag"] = by_tag
+        flat["samples"] = samples
         return flat
 
     # --- read helpers ------------------------------------------------------

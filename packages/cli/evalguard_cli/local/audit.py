@@ -46,6 +46,8 @@ EVENT_KINDS: dict[str, tuple[str, str | None]] = {
     "trial.finalized":           ("Activity", "trial"),
     "row.short_circuited":       ("Activity", "row"),
     "provider.called":           ("Activity", "provider"),
+    "provider.retry":            ("Activity", "provider"),
+    "provider.failed":           ("Activity", "provider"),
     "evaluator.heuristic.invoked": ("Activity", "heuristic"),
     "evaluator.metric.invoked":  ("Activity", "metric"),
     "evaluator.judge.invoked":   ("Activity", "judge"),

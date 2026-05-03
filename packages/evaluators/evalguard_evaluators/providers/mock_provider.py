@@ -32,6 +32,10 @@ class MockProvider:
         self._score: float = 4.5
         self._cost_per_call: float = 0.0
         self._fixed_output: str = ""
+        # Fault-injection knobs for testing retry / failure paths.
+        self._fail_first_n: int = 0
+        self._fail_with: str = ""
+        self._fail_count: int = 0   # in-instance counter
 
     def configure(self, cfg: dict[str, Any]) -> None:
         self._mode = cfg.get("mode", "json_summary")
@@ -39,6 +43,9 @@ class MockProvider:
         self._score = float(cfg.get("score", 4.5))
         self._cost_per_call = float(cfg.get("cost_per_call", 0.0))
         self._fixed_output = str(cfg.get("output", ""))
+        self._fail_first_n = int(cfg.get("fail_first_n", 0))
+        self._fail_with = str(cfg.get("fail_with", ""))
+        self._fail_count = 0
 
     async def complete(
         self,
@@ -47,6 +54,18 @@ class MockProvider:
         model: str,
         params: dict[str, Any] | None = None,
     ) -> ProviderResult:
+        # Fault injection: ``fail_first_n`` raises a transient-looking
+        # rate-limit error on the first N calls (so retry can succeed
+        # on attempt N+1); ``fail_with`` raises every call until set
+        # back. Default RetryPolicy patterns match these messages.
+        if self._fail_first_n and self._fail_count < self._fail_first_n:
+            self._fail_count += 1
+            raise RuntimeError(
+                f"429 rate limit exceeded (mock fault {self._fail_count}/{self._fail_first_n})"
+            )
+        if self._fail_with:
+            raise RuntimeError(self._fail_with)
+
         start = time.monotonic()
         if self._mode == "echo":
             output = prompt

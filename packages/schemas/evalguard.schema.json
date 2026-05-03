@@ -135,6 +135,22 @@
         "enabled": { "type": "boolean", "default": true }
       }
     },
+    "retry": {
+      "type": "object",
+      "description": "Run-wide default retry policy for provider calls. Per-provider overrides live under each provider's ``config.retry``. Retry is bounded exponential backoff with jitter; ``retry_on`` is a list of regex patterns matched (case-insensitively) against ``f'{type(exc).__name__}: {exc}'``.",
+      "additionalProperties": false,
+      "properties": {
+        "max_retries":   { "type": "integer", "minimum": 0, "default": 3 },
+        "base_delay_ms": { "type": "integer", "minimum": 0, "default": 1000 },
+        "max_delay_ms":  { "type": "integer", "minimum": 0, "default": 30000 },
+        "jitter":        { "type": "number",  "minimum": 0, "maximum": 1, "default": 0.25 },
+        "retry_on":      {
+          "type":  "array",
+          "items": { "type": "string" },
+          "description": "Regex patterns. Default covers 429/5xx/timeout/connection-reset/temporarily-unavailable."
+        }
+      }
+    },
     "systems": {
       "type": "object",
       "description": "External systems referenced by evaluators (e.g. databases for the text_to_sql template). Values support ${ENV} substitution so secrets stay out of the repo. Each entry is a free-form object the consuming evaluator interprets — schema validation only enforces 'an object keyed by id'.",
@@ -199,7 +215,7 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "type":              { "type": "string", "enum": ["absolute", "relative"], "default": "absolute" },
+            "type":              { "type": "string", "enum": ["absolute", "relative", "ttest"], "default": "absolute" },
             "min":               { "type": "number" },
             "max":               { "type": "number" },
             "min_delta_vs_baseline": {
@@ -209,6 +225,18 @@
             "max_delta_vs_baseline": {
               "type": "number",
               "description": "Symmetric to min_delta_vs_baseline; useful for cost / latency gates that should not regress upward."
+            },
+            "alpha": {
+              "type": "number", "minimum": 0, "maximum": 1,
+              "description": "``type: ttest`` significance level. Default 0.05."
+            },
+            "alternative": {
+              "type": "string", "enum": ["less", "greater", "two_sided"],
+              "description": "``type: ttest`` directionality. Default ``less`` (regression-detection: fail when current is significantly lower than baseline)."
+            },
+            "min_n": {
+              "type": "integer", "minimum": 2,
+              "description": "``type: ttest`` minimum sample size on each side. Below this, the gate skips non-blockingly."
             },
             "per_tag_overrides": { "type": "object", "additionalProperties": { "type": "number" } }
           }

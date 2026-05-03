@@ -69,9 +69,13 @@ def load_config(path: Path) -> LoadedConfig:
 
     prompts = _load_prompts(resolved.get("prompts", []), resolver, assets)
     datasets = _load_datasets(resolved.get("datasets", []), resolver, base, assets)
-    _inline_evaluator_files(resolved.get("heuristics", []), resolver, base, assets, kind="heuristic")
-    _inline_evaluator_files(resolved.get("metrics", []), resolver, base, assets, kind="metric")
-    _inline_evaluator_files(resolved.get("judges", []), resolver, base, assets, kind="judge")
+    systems = resolved.get("systems") or {}
+    _inline_evaluator_files(resolved.get("heuristics", []), resolver, base, assets,
+                            kind="heuristic", systems=systems)
+    _inline_evaluator_files(resolved.get("metrics", []), resolver, base, assets,
+                            kind="metric", systems=systems)
+    _inline_evaluator_files(resolved.get("judges", []), resolver, base, assets,
+                            kind="judge", systems=systems)
 
     config_hash = _sha256_canonical(resolved)
     return LoadedConfig(
@@ -137,13 +141,21 @@ def _inline_evaluator_files(
     assets: list[AssetVersion],
     *,
     kind: str,
+    systems: dict[str, Any] | None = None,
 ) -> None:
     """Replace ``schema_file`` / ``rubric_file`` with inline ``schema`` / ``rubric``.
 
     Evaluators receive content directly and never touch the filesystem; this
     is the seam that lets us swap to ``ref://`` refs without changing any
     evaluator code.
+
+    When an evaluator declares ``system: <name>``, the matching entry from
+    the top-level ``systems:`` block is inlined as ``_system`` so the
+    evaluator can read it from its own ``configure(cfg)`` call without
+    needing global state. The reference is resolved at YAML-load time so
+    the spec's ``version_id`` covers the system binding.
     """
+    systems = systems or {}
     for spec in specs:
         ev_id = spec.get("id", spec.get("type", kind))
         if "schema_file" in spec:
@@ -161,6 +173,31 @@ def _inline_evaluator_files(
             spec["rubric"] = blob
             spec["rubric_version_id"] = v
             spec.pop("rubric_file")
+        if "system" in spec:
+            sys_name = spec["system"]
+            if sys_name not in systems:
+                raise ValueError(
+                    f"evaluator {ev_id!r} references system {sys_name!r} but no "
+                    f"such entry exists under top-level ``systems:``. "
+                    f"Available: {sorted(systems)}"
+                )
+            sys_cfg = dict(systems[sys_name])
+            # Resolve a ``schema:`` field that points at a file (e.g.
+            # ``schema: schemas/db.sql``) into inline content so the
+            # evaluator never touches the filesystem.
+            if isinstance(sys_cfg.get("schema"), str) and sys_cfg["schema"].endswith(
+                (".sql", ".ddl", ".json")
+            ):
+                blob = resolver.resolve_text({"file": sys_cfg["schema"]})
+                sv = _sha256_text(blob)
+                assets.append(AssetVersion(
+                    "schema", f"{ev_id}.system.{sys_name}", sv,
+                    f"file:{sys_cfg['schema']}",
+                ))
+                sys_cfg["schema_source"] = sys_cfg["schema"]
+                sys_cfg["schema"] = blob
+                sys_cfg["schema_version_id"] = sv
+            spec["_system"] = {"name": sys_name, **sys_cfg}
         # Hash the final spec (post-inlining) so evaluator versions track config + assets.
         spec["version_id"] = _sha256_canonical({k: v for k, v in spec.items() if k != "version_id"})
         assets.append(AssetVersion(kind, ev_id, spec["version_id"], "inline"))

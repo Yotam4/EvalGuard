@@ -207,8 +207,45 @@ def _evaluate_layers(
                 })
                 passed = passed and ok
 
-            # 4) relative thresholds (Δ vs baseline). Only fires when both
-            #    a baseline is provided AND the threshold type is "relative".
+            # 4a) statistical thresholds — Welch's two-sample t-test on
+            #     per-evaluator score samples, baseline vs current. Only
+            #     fires when both sides have samples; missing samples skip
+            #     non-blockingly so a 1.0.0 baseline doesn't tank a gate.
+            if threshold_type == "ttest":
+                if not evaluator_id:
+                    details.append({
+                        "metric": f"{layer_name}.ttest", "op": "config",
+                        "target": float("nan"), "actual": float("nan"),
+                        "passed": False,
+                        "error": "ttest threshold requires 'evaluator: <id>' to scope the comparison",
+                    })
+                    passed = False
+                else:
+                    cur_samples = (metrics.get("samples", {}) or {}).get(evaluator_id, [])
+                    base_samples = (
+                        ((baseline or {}).get("samples", {}) or {}).get(evaluator_id, [])
+                        if baseline is not None else []
+                    )
+                    min_n = int(threshold.get("min_n", 2))
+                    if len(cur_samples) < min_n or len(base_samples) < min_n:
+                        details.append({
+                            "metric": f"{evaluator_id}.ttest",
+                            "op": "skip", "target": float(min_n),
+                            "actual": float(min(len(cur_samples), len(base_samples))),
+                            "passed": True,
+                            "reason": "insufficient samples on baseline or current side; ttest skipped",
+                        })
+                    else:
+                        result = _welch_for_gate(
+                            cur_samples, base_samples,
+                            alpha=float(threshold.get("alpha", 0.05)),
+                            alternative=str(threshold.get("alternative", "less")),
+                        )
+                        details.append(result)
+                        passed = passed and result["passed"]
+
+            # 4b) relative thresholds (Δ vs baseline). Only fires when both
+            #     a baseline is provided AND the threshold type is "relative".
             if threshold_type == "relative" and baseline is not None and actual is not None:
                 base_actual, _ = _resolve_aggregation(
                     agg, layer_name, idx, evaluator_id,
@@ -373,6 +410,51 @@ def _coerce_float(value: Any) -> float:
         return float(value)
     except (TypeError, ValueError):
         return float("nan")
+
+
+def _welch_for_gate(
+    current: list[float], baseline: list[float],
+    *, alpha: float, alternative: str,
+) -> dict[str, Any]:
+    """Run Welch's t-test and shape its result into a gate-detail dict.
+
+    ``alternative`` controls the directionality of the test:
+
+    - ``less``       — fail if current < baseline at significance ``alpha``.
+                       This is the canonical regression-detection use case.
+    - ``greater``    — fail if current > baseline (e.g. cost / latency).
+    - ``two_sided``  — fail on any significant difference.
+    """
+    # Imported lazily so the dependency-free CLI import path stays fast.
+    from evalguard_cli.local.stats import welchs_t_test
+
+    res = welchs_t_test(current, baseline)
+    if alternative == "less":
+        p = res.p_less
+    elif alternative == "greater":
+        p = res.p_greater
+    else:
+        alternative = "two_sided"
+        p = res.p_two_sided
+    significant = p < alpha
+    # "Pass" means we did NOT detect a significant regression in the
+    # bad direction. Operators want a green gate when the new run is
+    # not statistically worse.
+    passed = not significant
+    return {
+        "metric":        "ttest.p_value",
+        "op":            "<", "target": float(alpha),
+        "actual":        float(p),
+        "passed":        passed,
+        "alternative":   alternative,
+        "t_stat":        float(res.t_stat),
+        "dof":           float(res.dof),
+        "n_current":     int(res.n1),
+        "n_baseline":    int(res.n2),
+        "mean_current":  float(res.mean1),
+        "mean_baseline": float(res.mean2),
+        "delta_mean":    float(res.mean1 - res.mean2),
+    }
 
 
 # ---------------------------------------------------------------------------

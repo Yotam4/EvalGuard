@@ -19,6 +19,8 @@ textsql = ["sqlglot>=23.0"]
 "heuristic.not_contains"   = "evalguard_evaluators.heuristics.not_contains:NotContainsHeuristic"
 "heuristic.length"         = "evalguard_evaluators.heuristics.length:LengthHeuristic"
 "heuristic.sql_parses"     = "evalguard_evaluators.heuristics.sql_parses:SqlParsesHeuristic"
+"heuristic.dry_run_on_shadow_db"   = "evalguard_evaluators.heuristics.dry_run_on_shadow_db:DryRunOnShadowDbHeuristic"
+"heuristic.result_set_equivalence" = "evalguard_evaluators.heuristics.result_set_equivalence:ResultSetEquivalenceHeuristic"
 "metric.faithfulness"      = "evalguard_evaluators.metrics.rag:FaithfulnessMetric"
 "metric.answer_relevancy"  = "evalguard_evaluators.metrics.rag:AnswerRelevancyMetric"
 "metric.context_precision" = "evalguard_evaluators.metrics.rag:ContextPrecisionMetric"
