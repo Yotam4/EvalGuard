@@ -439,17 +439,33 @@ class SqliteStore:
 
             pass_rate = 0.0
             if n_rows:
-                failed_rows = int(
+                # A row passes iff it has at least one score AND none
+                # of its scores failed. Rows with NO scores (e.g. a
+                # provider-call exhausted its retry budget) are
+                # counted as failed — pre-fix they leaked through as
+                # passing because the old query only looked at scores
+                # with passed=0 and missed the zero-score case
+                # entirely.
+                row_scope = "AND r.trial_id=?" if trial_id else ""
+                passed_rows = int(
                     c.execute(
-                        f"""SELECT COUNT(*) AS f FROM (
-                              SELECT trial_id, row_id FROM scores
-                              WHERE run_id=? {scope_clause} AND passed=0
-                              GROUP BY trial_id, row_id
-                            )""",
+                        f"""SELECT COUNT(*) AS p FROM run_rows r
+                            WHERE r.run_id=? {row_scope}
+                              AND EXISTS (
+                                SELECT 1 FROM scores s
+                                WHERE s.run_id=r.run_id AND s.row_id=r.row_id
+                                  AND (s.trial_id IS r.trial_id OR s.trial_id = r.trial_id)
+                              )
+                              AND NOT EXISTS (
+                                SELECT 1 FROM scores s
+                                WHERE s.run_id=r.run_id AND s.row_id=r.row_id
+                                  AND (s.trial_id IS r.trial_id OR s.trial_id = r.trial_id)
+                                  AND s.passed=0
+                              )""",
                         (run_id, *scope_args),
-                    ).fetchone()["f"] or 0
+                    ).fetchone()["p"] or 0
                 )
-                pass_rate = (n_rows - failed_rows) / n_rows
+                pass_rate = passed_rows / n_rows
 
             by_evaluator: dict[str, dict[str, float]] = {}
             evaluator_layer: dict[str, int] = {}
@@ -692,6 +708,13 @@ class SqliteStore:
             ).fetchall()
         out: list[dict[str, Any]] = []
         for r in rows:
+            n_scores = int(r["n_scores"] or 0)
+            n_failed = int(r["n_failed"] or 0)
+            # A row passes iff it has at least one score AND none of
+            # them failed. Zero-score rows (provider-failure path)
+            # were previously reported as passing because n_failed=0
+            # — that hid the failure in the view.
+            row_passed = n_scores > 0 and n_failed == 0
             out.append({
                 "row_id":    r["row_id"],
                 "trial_id":  r["trial_id"],
@@ -701,8 +724,8 @@ class SqliteStore:
                 "latency_ms": int(r["latency_ms"] or 0),
                 "cache_hit": bool(r["cache_hit"]),
                 "tags":      json.loads(r["tags_json"] or "[]"),
-                "n_scores":  int(r["n_scores"] or 0),
-                "passed":    int(r["n_failed"] or 0) == 0,
+                "n_scores":  n_scores,
+                "passed":    row_passed,
             })
         return out
 

@@ -121,6 +121,10 @@ class ResultSetEquivalenceHeuristic:
                                "error":  str(e)[:240]})]
 
             if expected_result is not None:
+                if not isinstance(expected_result, (list, tuple)):
+                    return [Score(self.id, self.kind, self.layer, 0.0, False,
+                                  {"reason": "expected_result_not_a_list",
+                                   "got_type": type(expected_result).__name__})]
                 exp_rows = _normalize_rows(list(expected_result))
                 exp_source = "literal"
             else:

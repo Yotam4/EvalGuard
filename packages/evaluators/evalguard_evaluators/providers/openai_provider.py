@@ -38,7 +38,15 @@ class OpenAIProvider:
     def configure(self, cfg: dict[str, Any]) -> None:
         self._api_key = cfg.get("api_key") or os.environ.get("OPENAI_API_KEY")
         self._base_url = cfg.get("base_url")
-        self._default_params = {k: v for k, v in cfg.items() if k not in {"api_key", "base_url"}}
+        # ``retry`` is an evalguard-operational key the executor
+        # normally strips before reaching here; filter it again as
+        # defense-in-depth so a direct caller (or a future code path)
+        # never accidentally forwards it as a SDK kwarg, which the
+        # OpenAI client would reject.
+        self._default_params = {
+            k: v for k, v in cfg.items()
+            if k not in {"api_key", "base_url", "retry"}
+        }
         self._client = None  # invalidate on reconfigure
 
     def _get_client(self) -> Any:

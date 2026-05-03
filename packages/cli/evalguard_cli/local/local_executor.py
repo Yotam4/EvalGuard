@@ -205,11 +205,16 @@ async def execute(
             provider_retry_cfg or run_retry_cfg
         )
         trial_id = f"trial_{uuid.uuid4().hex[:12]}"
+        # ``raw_provider_cfg`` (with operational keys like ``retry``)
+        # goes to the trial record and the audit event so an auditor
+        # can reconstruct the FULL criteria the user set — not just
+        # the SDK-bound subset. ``provider_cfg`` (stripped) is what
+        # actually drove ``load_provider`` and the cache key.
         store.start_trial(
             trial_id, run_id,
             provider_id=provider_id, provider=provider_name, model=model,
             prompt_id=prompt_id, prompt_version_id=prompt_version_id,
-            config=provider_cfg,
+            config=raw_provider_cfg,
         )
         audit.emit(
             "trial.started",
@@ -218,7 +223,8 @@ async def execute(
             payload={
                 "provider":          provider_name,
                 "model":             model,
-                "provider_config":   provider_cfg,
+                "provider_config":   raw_provider_cfg,
+                "retry":             provider_retry_cfg or run_retry_cfg or None,
                 "prompt_id":         prompt_id,
                 "prompt_version_id": prompt_version_id,
             },
@@ -260,14 +266,16 @@ async def execute(
                     eff_provider_name, eff_model = _split_provider_id(row_override)
                 else:
                     eff_provider_name, eff_model = provider_name, model
+                # ``row.params`` is reserved for SDK-bound provider
+                # config (temperature, output, max_tokens, …) and is
+                # shallow-merged onto the trial provider's stripped
+                # config. ``row.retry`` (operational) is read separately
+                # below so it never leaks into ``provider.complete``.
                 row_params = row.get("params") or {}
-                # Strip operational keys from the SDK-bound config (same
-                # rationale as the trial-level strip above).
-                row_sdk_params = {k: v for k, v in row_params.items() if k not in {"retry"}}
-                eff_provider_cfg = {**provider_cfg, **row_sdk_params} if row_sdk_params else provider_cfg
+                eff_provider_cfg = {**provider_cfg, **row_params} if row_params else provider_cfg
                 if row_override and eff_provider_name != provider_name:
                     eff_provider = load_provider(eff_provider_name, eff_provider_cfg)
-                elif row_sdk_params:
+                elif row_params:
                     # Same provider class, different params → instantiate a
                     # fresh provider so the merged config is applied.
                     eff_provider = load_provider(eff_provider_name, eff_provider_cfg)
@@ -289,10 +297,13 @@ async def execute(
                     cache_hit = True
                 else:
                     # Per-trial retry policy with optional per-row override
-                    # via ``row.params.retry``. ``on_retry`` emits a
-                    # ``provider.retry`` audit event per attempt so an
-                    # operator can see the back-pressure live.
-                    row_retry_cfg = (row_params or {}).get("retry") if row_params else None
+                    # via top-level ``row.retry``. (``params`` is reserved
+                    # for SDK-bound config, so retry — operational —
+                    # belongs at the row top-level next to ``provider``.)
+                    # ``on_retry`` emits a ``provider.retry`` audit event
+                    # per attempt so an operator can see the back-pressure
+                    # live.
+                    row_retry_cfg = row.get("retry") if isinstance(row, dict) else None
                     eff_policy = (
                         RetryPolicy.from_config(row_retry_cfg) if row_retry_cfg
                         else trial_retry_policy
@@ -337,7 +348,7 @@ async def execute(
                                 "error_type":   type(fail.cause).__name__,
                                 "error":        str(fail.cause)[:240],
                                 "trial_provider_id": provider_id,
-                                "row_override": bool(row_override) or bool(row_params),
+                                "row_override": bool(row_override) or bool(row_params) or bool(row_retry_cfg),
                             },
                         )
                         store.insert_row(
@@ -406,7 +417,7 @@ async def execute(
                         "model":            eff_model,
                         "model_params":     eff_provider_cfg,
                         "trial_provider_id": provider_id,
-                        "row_override":     bool(row_override) or bool(row_params),
+                        "row_override":     bool(row_override) or bool(row_params) or bool(row_retry_cfg),
                         "rendered_prompt":  prompt,
                         "raw_response":     pr.output,
                         "raw_provider":     pr.raw,

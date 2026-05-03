@@ -154,6 +154,19 @@ def test_result_set_equivalence_skips_when_no_expected():
     assert "skipped" in s.raw["reason"]
 
 
+def test_result_set_equivalence_rejects_non_list_expected_result():
+    """A misshapen ``expected_result`` (scalar / dict / int) must
+    surface as a clear failure, not crash with a TypeError. Previously
+    ``list(expected_result)`` would raise on a scalar."""
+    h = ResultSetEquivalenceHeuristic()
+    h.configure({"_system": _system()})
+    s = _run(h, _ctx("SELECT id FROM customers;",
+                     expected_result=42))   # scalar, not a list
+    assert not s.passed
+    assert s.raw["reason"] == "expected_result_not_a_list"
+    assert s.raw["got_type"] == "int"
+
+
 def test_result_set_equivalence_fails_on_candidate_execution_error():
     h = ResultSetEquivalenceHeuristic()
     h.configure({"_system": _system()})

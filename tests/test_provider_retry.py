@@ -279,6 +279,115 @@ def test_run_continues_when_one_row_exhausts_retries(tmp_path: Path):
     assert verify_chain(store, record.run_id)["ok"]
 
 
+def test_pass_rate_counts_retry_failed_row_as_failed(tmp_path: Path):
+    """Regression: a row whose provider call exhausted retries used
+    to be classified as PASSING in compute_metrics because the old
+    query only counted rows that had at least one failed *score* —
+    zero-score rows leaked through. After the fix, pass_rate
+    correctly reflects the failure: 1 of 2 rows passed → 0.5."""
+    (tmp_path / "datasets").mkdir()
+    (tmp_path / "datasets" / "g.jsonl").write_text(
+        '{"id":"good","input":"q"}\n'
+        '{"id":"bad","input":"q","params":{"fail_with":"429 always"}}\n'
+    )
+    cfg_path = tmp_path / "evalguard.yaml"
+    cfg_path.write_text(
+        "version: 1\nproject: t\n"
+        "providers: [{ id: 'mock:m', config: { mode: echo, latency_ms: 0 } }]\n"
+        "datasets: [{ id: g, file: datasets/g.jsonl }]\n"
+        "cache: { enabled: false }\n"
+        "concurrency: 1\n"
+        "retry: { max_retries: 0, base_delay_ms: 0, jitter: 0 }\n"
+        "heuristics: [{ id: len, type: length, max: 1000 }]\n"
+    )
+    cfg = load_config(cfg_path)
+    store = SqliteStore(tmp_path / "local.db")
+    store.init_schema()
+    record = asyncio.run(execute(cfg, store=store, quiet=True))
+
+    metrics = store.compute_metrics(record.run_id)
+    assert metrics["row_count"] == 2.0
+    assert metrics["pass_rate"] == 0.5
+
+    rows = {r["row_id"]: r for r in store.list_rows(record.run_id)}
+    assert rows["good"]["passed"] is True
+    assert rows["good"]["n_scores"] == 1
+    assert rows["bad"]["passed"] is False        # zero-score → fail
+    assert rows["bad"]["n_scores"] == 0
+
+
+def test_row_level_retry_override(tmp_path: Path):
+    """A row can carry a top-level ``retry: {...}`` block to override
+    the trial-level retry budget on a per-row basis. The override
+    must NOT live under ``params`` (which is reserved for SDK config)."""
+    (tmp_path / "datasets").mkdir()
+    (tmp_path / "datasets" / "g.jsonl").write_text(
+        # Row 1: uses trial default (max_retries=1) and fails because
+        # fail_first_n=4 needs 4 retries to succeed.
+        '{"id":"r1","input":"a","params":{"fail_first_n":4}}\n'
+    )
+    cfg_path = tmp_path / "evalguard.yaml"
+    cfg_path.write_text(
+        "version: 1\nproject: t\n"
+        "providers: [{ id: 'mock:m', config: { mode: echo, latency_ms: 0 } }]\n"
+        "datasets: [{ id: g, file: datasets/g.jsonl }]\n"
+        "cache: { enabled: false }\n"
+        "retry: { max_retries: 1, base_delay_ms: 0, jitter: 0 }\n"
+    )
+    cfg = load_config(cfg_path)
+    store = SqliteStore(tmp_path / "local.db")
+    store.init_schema()
+    record = asyncio.run(execute(cfg, store=store, quiet=True))
+    events = store.list_events(record.run_id)
+    # Trial default of max_retries=1 → 1 retry, then fails.
+    assert sum(1 for e in events if e["kind"] == "provider.retry") == 1
+    assert sum(1 for e in events if e["kind"] == "provider.failed") == 1
+
+    # Now redo with row-level retry override that's generous enough.
+    (tmp_path / "datasets" / "g.jsonl").write_text(
+        '{"id":"r2","input":"a","params":{"fail_first_n":4},'
+        '"retry":{"max_retries":5,"base_delay_ms":0,"jitter":0}}\n'
+    )
+    cfg = load_config(cfg_path)
+    record2 = asyncio.run(execute(cfg, store=store, quiet=True))
+    events2 = store.list_events(record2.run_id)
+    # Row-level override wins → 4 retries → succeeds.
+    assert sum(1 for e in events2 if e["kind"] == "provider.retry") == 4
+    assert sum(1 for e in events2 if e["kind"] == "provider.called") == 1
+    assert sum(1 for e in events2 if e["kind"] == "provider.failed") == 0
+
+
+def test_trial_started_audit_records_full_provider_config_including_retry(tmp_path: Path):
+    """Audit fidelity: the ``trial.started`` event must carry the
+    user's full retry config so an auditor can reconstruct exactly
+    what budget was in force, even though retry is stripped before
+    being passed to the SDK / load_provider."""
+    (tmp_path / "datasets").mkdir()
+    (tmp_path / "datasets" / "g.jsonl").write_text('{"id":"r1","input":"a"}\n')
+    cfg_path = tmp_path / "evalguard.yaml"
+    cfg_path.write_text(
+        "version: 1\nproject: t\n"
+        "providers:\n"
+        "  - id: 'mock:m'\n"
+        "    config:\n"
+        "      mode: echo\n"
+        "      latency_ms: 0\n"
+        "      retry: { max_retries: 7, base_delay_ms: 50, jitter: 0.1 }\n"
+        "datasets: [{ id: g, file: datasets/g.jsonl }]\n"
+        "cache: { enabled: false }\n"
+    )
+    cfg = load_config(cfg_path)
+    store = SqliteStore(tmp_path / "local.db")
+    store.init_schema()
+    record = asyncio.run(execute(cfg, store=store, quiet=True))
+    [trial_started] = [e for e in store.list_events(record.run_id)
+                       if e["kind"] == "trial.started"]
+    cfg_in_event = trial_started["payload"]["provider_config"]
+    assert cfg_in_event.get("retry") == {"max_retries": 7, "base_delay_ms": 50, "jitter": 0.1}
+    # And the dedicated ``retry`` field at the top of the payload too.
+    assert trial_started["payload"]["retry"]["max_retries"] == 7
+
+
 def test_per_provider_retry_overrides_run_default(tmp_path: Path):
     """Provider-level ``config.retry`` wins over the run-level default."""
     (tmp_path / "datasets").mkdir()
