@@ -24,10 +24,15 @@ from pathlib import Path
 from typing import Any
 
 
+# Canonical actor-type vocabulary. Drift-tested against
+# ``evalguard.run.schema.json`` in ``tests/test_schema_drift.py``.
+ACTOR_TYPES: tuple[str, ...] = ("cli", "ci", "api_key", "system")
+
+
 @dataclass
 class Actor:
     actor_id: str
-    actor_type: str          # "cli" | "ci" | "api_key" | "system"
+    actor_type: str          # one of ACTOR_TYPES
     actor_meta: dict[str, Any]
 
 

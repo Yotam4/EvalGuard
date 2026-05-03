@@ -47,6 +47,13 @@ LAYER_INDEX: dict[str, int] = {
     "human":         5,
 }
 
+# Canonical gate severities. Drift-tested against the JSON schemas.
+SEVERITIES: tuple[str, ...] = ("block", "warn", "log")
+
+# Canonical gate-status values produced by ``run_cmd`` for trials and runs.
+# "none" is the sentinel for "no gates configured".
+GATE_STATUSES: tuple[str, ...] = ("passed", "failed", "warned", "none")
+
 
 @dataclass
 class GateResult:
