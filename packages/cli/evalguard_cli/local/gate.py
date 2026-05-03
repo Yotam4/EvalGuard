@@ -54,6 +54,10 @@ SEVERITIES: tuple[str, ...] = ("block", "warn", "log")
 # "none" is the sentinel for "no gates configured".
 GATE_STATUSES: tuple[str, ...] = ("passed", "failed", "warned", "none")
 
+# Canonical threshold types accepted under ``layers.<name>.threshold.type``.
+# Drift-tested against ``evalguard.schema.json``.
+THRESHOLD_TYPES: tuple[str, ...] = ("absolute", "relative", "ttest")
+
 
 @dataclass
 class GateResult:
@@ -221,28 +225,48 @@ def _evaluate_layers(
                     })
                     passed = False
                 else:
-                    cur_samples = (metrics.get("samples", {}) or {}).get(evaluator_id, [])
-                    base_samples = (
-                        ((baseline or {}).get("samples", {}) or {}).get(evaluator_id, [])
-                        if baseline is not None else []
-                    )
-                    min_n = int(threshold.get("min_n", 2))
-                    if len(cur_samples) < min_n or len(base_samples) < min_n:
+                    # Distinguish "evaluator not configured in the
+                    # current run" (config error → fail loudly) from
+                    # "configured but not enough samples" (skip
+                    # non-blockingly so a fresh PR with a new evaluator
+                    # doesn't tank against an old baseline).
+                    cur_evals = metrics.get("by_evaluator", {}) or {}
+                    if evaluator_id not in cur_evals:
                         details.append({
-                            "metric": f"{evaluator_id}.ttest",
-                            "op": "skip", "target": float(min_n),
-                            "actual": float(min(len(cur_samples), len(base_samples))),
-                            "passed": True,
-                            "reason": "insufficient samples on baseline or current side; ttest skipped",
+                            "metric":  f"{evaluator_id}.ttest",
+                            "op":      "config",
+                            "target":  float("nan"),
+                            "actual":  float("nan"),
+                            "passed":  False,
+                            "error":   (
+                                f"unknown evaluator {evaluator_id!r}; available: "
+                                f"{sorted(cur_evals)}"
+                            ),
                         })
+                        passed = False
                     else:
-                        result = _welch_for_gate(
-                            cur_samples, base_samples,
-                            alpha=float(threshold.get("alpha", 0.05)),
-                            alternative=str(threshold.get("alternative", "less")),
+                        cur_samples = (metrics.get("samples", {}) or {}).get(evaluator_id, [])
+                        base_samples = (
+                            ((baseline or {}).get("samples", {}) or {}).get(evaluator_id, [])
+                            if baseline is not None else []
                         )
-                        details.append(result)
-                        passed = passed and result["passed"]
+                        min_n = int(threshold.get("min_n", 2))
+                        if len(cur_samples) < min_n or len(base_samples) < min_n:
+                            details.append({
+                                "metric": f"{evaluator_id}.ttest",
+                                "op": "skip", "target": float(min_n),
+                                "actual": float(min(len(cur_samples), len(base_samples))),
+                                "passed": True,
+                                "reason": "insufficient samples on baseline or current side; ttest skipped",
+                            })
+                        else:
+                            result = _welch_for_gate(
+                                cur_samples, base_samples,
+                                alpha=float(threshold.get("alpha", 0.05)),
+                                alternative=str(threshold.get("alternative", "less")),
+                            )
+                            details.append(result)
+                            passed = passed and result["passed"]
 
             # 4b) relative thresholds (Δ vs baseline). Only fires when both
             #     a baseline is provided AND the threshold type is "relative".

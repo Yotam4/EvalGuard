@@ -114,12 +114,26 @@ def _connect_and_seed(path: str, schema_blob: str | None) -> sqlite3.Connection:
 
     DDL is run inside a single executescript() so multi-statement
     bootstrap works. Errors propagate to the caller as sqlite3.Error.
+
+    The 30-second busy timeout protects against cross-process
+    contention (e.g. CI running ``evalguard`` while a developer
+    inspects the same shadow DB with ``sqlite3``). Within one
+    asyncio process there is no concurrent access — heuristic
+    ``evaluate`` is sync from the event-loop's perspective, so the
+    timeout is purely defensive.
     """
     if path != ":memory:":
         # Make sure the parent dir exists for fresh shadow files.
         from pathlib import Path
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=30.0)
+    if path != ":memory:":
+        # WAL allows concurrent readers without write-lock contention,
+        # which matters when a user / CI pipeline inspects the file
+        # while a run is in progress. Pragma is per-connection but
+        # the journal mode persists in the file once set.
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
     if schema_blob:
         conn.executescript(schema_blob)
         conn.commit()

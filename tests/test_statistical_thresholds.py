@@ -228,13 +228,9 @@ def test_ttest_gate_requires_evaluator_scope():
 
 def test_ttest_alternative_greater_fails_on_cost_regression():
     """``alternative: greater`` is the cost/latency variant — fails when
-    the current side is significantly *higher* than baseline."""
-    layers = {"cost_gate": {
-        "severity": "warn",
-        "evaluator": "judge",   # using 'judge' as a stand-in for any per-row metric
-        "threshold": {"type": "ttest", "alpha": 0.05, "alternative": "greater"},
-    }}
-    # Re-key the gate as a layer name. Instead, use one of the real layers:
+    the current side is significantly *higher* than baseline. We pin
+    to ``judge_offline`` (a registered LAYER_INDEX key) and reuse the
+    ``judge`` evaluator id as a stand-in for any per-row numeric metric."""
     layers = {"judge_offline": {
         "severity": "warn",
         "evaluator": "judge",
@@ -247,3 +243,19 @@ def test_ttest_alternative_greater_fails_on_cost_regression():
     detail = next(d for d in g.details if d["metric"] == "ttest.p_value")
     assert detail["alternative"] == "greater"
     assert detail["delta_mean"] > 0
+
+
+def test_ttest_gate_fails_loudly_on_unknown_evaluator():
+    """A typo'd ``evaluator: <id>`` must be a hard failure, not a
+    silent skip — silent skips hide config bugs in CI."""
+    layers = {"judge_offline": {
+        "severity": "block",
+        "evaluator": "judge_typo",   # not present in metrics.by_evaluator
+        "threshold": {"type": "ttest", "alpha": 0.05},
+    }}
+    cur  = _metrics([4.5] * 10)    # samples for "judge", NOT "judge_typo"
+    base = _metrics([4.5] * 10)
+    [g] = evaluate_gates(None, cur, layers=layers, baseline=base)
+    assert not g.passed
+    detail = next(d for d in g.details if d["op"] == "config")
+    assert "unknown evaluator 'judge_typo'" in detail["error"]

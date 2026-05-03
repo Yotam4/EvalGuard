@@ -17,7 +17,7 @@ import json
 from pathlib import Path
 
 from evalguard_cli.local.actor import ACTOR_TYPES
-from evalguard_cli.local.gate import GATE_STATUSES, SEVERITIES
+from evalguard_cli.local.gate import GATE_STATUSES, SEVERITIES, THRESHOLD_TYPES
 
 
 _SCHEMAS = Path(__file__).resolve().parents[1] / "packages" / "schemas"
@@ -91,3 +91,21 @@ def test_gate_status_run_schema_matches_code():
             f"run-schema {label}.gate_status {sorted(enum)} != "
             f"GATE_STATUSES {sorted(GATE_STATUSES)}"
         )
+
+
+# ---------------------------------------------------------------------------
+# threshold.type
+
+
+def test_threshold_type_input_schema_matches_code():
+    """Input-schema ``layerGate.threshold.type`` enum must match
+    ``THRESHOLD_TYPES``. New threshold mechanisms (statistical,
+    relative, future bootstrap CI, etc.) MUST be added in both
+    surfaces or the gate engine silently accepts unknown types."""
+    enum = set(_INPUT_SCHEMA["$defs"]["layerGate"]
+                            ["properties"]["threshold"]
+                            ["properties"]["type"]["enum"])
+    assert enum == set(THRESHOLD_TYPES), (
+        f"input-schema threshold.type {sorted(enum)} != "
+        f"THRESHOLD_TYPES {sorted(THRESHOLD_TYPES)}"
+    )
