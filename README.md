@@ -91,11 +91,43 @@ prompts:
 datasets:
   - id: golden
     file: datasets/golden.jsonl       # rows: { id, input, expected, tags[] }
+                                      # rag rows: { question, contexts[], expected_answer }
+                                      # text_to_sql rows: { question, schema_ref, expected_sql, expected_result? }
+                                      # any row may carry per-row overrides:
+                                      #   provider: openai:gpt-4o
+                                      #   params:   { temperature: 0.5 }     (SDK pass-through)
+                                      #   retry:    { max_retries: 5 }       (operational)
+
+# External systems an evaluator can reference via ``system: <name>``.
+# Inlined into the evaluator's spec at YAML-load time so ``version_id``
+# covers the binding. Used by the text_to_sql template's shadow-DB
+# heuristics; ignored if no evaluator references it.
+systems:
+  shadow:
+    kind:   sqlite
+    url:    "${SHADOW_DB_URL:-sqlite:///./.evalguard/shadow.db}"
+    schema: schemas/db.sql              # DDL bootstrapped before each row
+
+# Run-wide retry policy for provider calls. Per-provider override:
+# put ``retry:`` inside any provider's ``config:`` block. Per-row
+# override: put ``retry:`` at the top level of a dataset row.
+retry:
+  max_retries: 3
+  base_delay_ms: 1000
+  max_delay_ms: 30000
+  jitter: 0.25
+  # retry_on: list of regex patterns matched (case-insensitively) against
+  # f"{type(exc).__name__}: {exc}". Default covers 429 / 5xx / timeout /
+  # connection-reset / temporarily-unavailable.
 
 heuristics:                            # Layer 1 — cheap deterministic
   - { type: json_schema, schema_file: schemas/out.json }
   - { type: length, max: 600 }
   - { type: not_contains, value: "As an AI" }
+
+metrics:                               # Layer 2 — RAG / semantic-similarity
+  - { id: faithfulness,      type: faithfulness,      threshold: 0.5 }
+  - { id: context_recall,    type: context_recall,    threshold: 0.5 }
 
 judges:                                # Layer 3 — LLM-as-judge
   - id: helpfulness
@@ -113,27 +145,32 @@ layers:                                # one configurable gate per pyramid step
     aggregation: pass_rate
     threshold: { min: 1.0 }
 
+  # Combine an absolute floor with a Δ-vs-baseline check on the same
+  # gate. When ``evalguard run --baseline path.json`` is invoked,
+  # ``min_delta_vs_baseline`` fires; without ``--baseline`` it's a no-op
+  # so PR runs and local runs share the same YAML.
   judge_offline:
     severity: block
     aggregation: pass_rate_by_tag
     threshold:
-      min: 0.90
+      type: relative                   # absolute | relative | ttest
+      min: 0.90                        # absolute floor (always enforced)
+      min_delta_vs_baseline: -0.02     # fail if pass_rate dropped >2 pp vs baseline
       per_tag_overrides:
         safety:      1.00              # zero tolerance on safety
         helpfulness: 0.85              # adversarial cases get more slack
 
-  # ── Δ-vs-baseline gates (used by the GitHub Action; opt-in) ─────────────
-  # When ``evalguard run --baseline path.json`` is invoked, ``relative``
-  # rules fire: actual − baseline-actual must clear ``min_delta_vs_baseline``
-  # (or stay under ``max_delta_vs_baseline`` for cost / latency).
-  # Without ``--baseline`` the same rules are no-ops, so PR runs and
-  # local runs both work with the same YAML.
-  judge_offline_relative:                # alias, layer reuse is fine
+  # Statistical-threshold gate: Welch's two-sample t-test on per-evaluator
+  # score samples. Requires ``--baseline`` (per-row scores live there) and
+  # ``evaluator: <id>`` to scope the comparison.
+  metrics:
     severity: warn
-    aggregation: pass_rate
+    evaluator: faithfulness
     threshold:
-      type: relative
-      min_delta_vs_baseline: -0.02       # fail if pass_rate dropped >2 pp
+      type: ttest
+      alpha: 0.05
+      alternative: less                # fail if current is significantly LOWER than baseline
+      min_n: 30                        # skip non-blockingly below this sample size
 
   human:                               # custom Python escape hatch
     severity: log
@@ -207,7 +244,7 @@ See `packages/action/README.md` for the full input / output reference.
 
 | Phase | Deliverable |
 |---|---|
-| 1.5 | Published `evalguard/action@v1`; statistical thresholds; baseline registry polish |
+| 1.5 | Published `evalguard/action@v1`; baseline registry polish |
 | 2 | Optional FastAPI server (multi-project, RBAC, Next.js UI mirroring YAML control panels) |
 | 3 | OTLP / `gen_ai.*` ingest; online sampler; drift detection |
 | 4 | Argilla-style human review queue; κ tracking; promote-to-golden flow |
@@ -225,6 +262,7 @@ details live alongside the shipped packages and tests in this repo.
 | `evalguard run [-c evalguard.yaml] [--baseline f.json] [--save-baseline f.json]` | Run pipeline; exit 0/2 by gate severity |
 | `evalguard diff <run_a> <run_b>` | Side-by-side metric Δ between two local runs |
 | `evalguard comment <run_id> [--baseline f.json] [--out file.md]` | Render a sticky PR-comment markdown body |
+| `evalguard push <run_id\|--last> [--server URL] [--token TOK] [--dry-run]` | Upload a run to a remote EvalGuard server (no-op + hint when unconfigured) |
 | `evalguard view` | List recent runs |
 | `evalguard view <run_id>` | Rows table + per-layer rollup + gates |
 | `evalguard view <run_id> --trial T` | Per-trial drill-down |
@@ -244,6 +282,8 @@ details live alongside the shipped packages and tests in this repo.
 | `run.finalized` | Final overall status is recorded |
 | `trial.started` / `trial.finalized` | Per (provider × prompt) trial |
 | `provider.called` | An LLM API call (the trial's main call **or** a judge's nested call — distinguishable via `payload.is_judge_call`) |
+| `provider.retry` | A provider call failed with a retryable error; one event per retry attempt with `attempt`, `delay_ms`, `error_type`, `error` |
+| `provider.failed` | A provider call exhausted its retry budget (or hit a non-retryable error). Carries the per-attempt summary; the row is recorded with empty output and the trial keeps running |
 | `evaluator.heuristic.invoked` / `metric.invoked` / `judge.invoked` | An evaluator scored a row |
 | `row.short_circuited` | A row failed an upstream block-severity layer; later layers were skipped |
 | `gate.evaluated` | A gate was applied to a trial's metrics |

@@ -46,7 +46,10 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "metrics": { "type": "object" },
+        "metrics": {
+          "type": "object",
+          "description": "Run-level metrics aggregated across all trials. Same shape as trial.metrics."
+        },
         "gates":   { "type": "array", "items": { "$ref": "#/$defs/gate" } }
       }
     },
@@ -97,7 +100,10 @@
         "gate_status":       { "type": ["string", "null"], "enum": [null, "passed", "failed", "warned", "none"] },
         "started_at":        { "type": ["string", "null"] },
         "finished_at":       { "type": ["string", "null"] },
-        "metrics":           { "type": "object" },
+        "metrics":           {
+          "type": "object",
+          "description": "Mirrors SqliteStore.compute_metrics(): flat scalars (row_count, cost_usd, pass_rate, <evaluator>.mean, <evaluator>.pass_rate, layer<n>.*) plus structured sub-dicts by_evaluator / by_layer / by_tag. Schema 1.0.0+ also includes ``samples`` (per-evaluator raw value arrays) for statistical-threshold gates."
+        },
         "gates":             { "type": "array", "items": { "$ref": "#/$defs/gate" } },
         "rows":              { "type": "array", "items": { "$ref": "#/$defs/row" } }
       }
