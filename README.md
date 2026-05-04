@@ -211,6 +211,30 @@ verdicts, gate results, and Δ-vs-baseline metrics.
 
 See `packages/action/README.md` for the full input / output reference.
 
+## Server (optional)
+
+`apps/api/` ships a FastAPI server that accepts pushed runs and
+serves them under the same JSON contract `view --json` produces.
+Same config, two deployment modes — local-only (CLI + SQLite) or
+shared (server + every CLI runner pushes to it for org-wide
+visibility).
+
+```bash
+# Run the server
+export EVALGUARD_API_KEY=$(openssl rand -hex 32)
+uvicorn evalguard_api.main:app --host 0.0.0.0 --port 8787
+
+# Point the CLI at it
+export EVALGUARD_SERVER=https://evalguard.example.com
+export EVALGUARD_API_TOKEN=$EVALGUARD_API_KEY
+evalguard run                     # local
+evalguard push --last             # → POST /v1/runs
+```
+
+`apps/api/README.md` has the full endpoint reference, configuration
+matrix, and Docker quickstart. License: Apache-2.0 (server core),
+separate from the MIT-licensed CLI.
+
 ## Status
 
 - **Phase 0** — CLI, YAML loader with `${ENV}` substitution, local
@@ -239,13 +263,21 @@ See `packages/action/README.md` for the full input / output reference.
   gates via Welch's two-sample t-test (`threshold.type: ttest`) using
   per-evaluator score samples persisted in baseline files
   (`BASELINE_SCHEMA_VERSION = 1.1.0`).
+- **Tier D (server skeleton)** — FastAPI app at `apps/api/` with
+  `POST /v1/runs` (the real `evalguard push` target), `GET /v1/runs`
+  (list), `GET /v1/runs/{id}` (full payload + server envelope). Single
+  shared bearer auth or open mode for local dev; auto-generated OpenAPI
+  + Swagger UI; SQLite default with `DATABASE_URL` seam ready for the
+  Postgres port. Pydantic ingest model mirrors `evalguard.run.schema.json`
+  with a drift canary roundtrip test.
 
 ## Coming next
 
 | Phase | Deliverable |
 |---|---|
 | 1.5 | Published `evalguard/action@v1`; baseline registry polish |
-| 2 | Optional FastAPI server (multi-project, RBAC, Next.js UI mirroring YAML control panels) |
+| 2.5 | Postgres + Alembic + RLS for `apps/api/`; per-org API keys; Org/Project CRUD endpoints |
+| 2.6 | Next.js UI: Runs / Datasets / Prompts / Judges / Settings — consumes the same JSON contract `view --json` produces |
 | 3 | OTLP / `gen_ai.*` ingest; online sampler; drift detection |
 | 4 | Argilla-style human review queue; κ tracking; promote-to-golden flow |
 | 5 | Enterprise tier (SSO / SCIM / audit / dedicated) under ELv2 in `apps/api/ee/` |
@@ -350,17 +382,22 @@ $ evalguard audit export run_abc -f otel-json | otel-collector ingest
 ## Repo layout
 
 ```
-apps/                 (planned: api, web, worker)
+apps/
+  api/                FastAPI server (Apache-2.0): /v1/runs ingest + read
+                      (planned: web, worker)
 packages/
   cli/                evalguard CLI + local executor
   evaluators/         heuristics, metrics, judges, providers
-  schemas/            evalguard.yaml JSON schema
+  schemas/            evalguard.yaml + run + baseline JSON schemas
   templates/          starter scaffolds (text_gen, rag, text_to_sql)
-  action/             (planned) GitHub Action
+  action/             Phase-1 Docker GitHub Action
 examples/
   quickstart-summarizer/
-tests/                pytest — yaml loader, cache, gate, judges, executor,
-                      env subst, custom_check, layered gates
+tests/                pytest — loader, cache, gate, judges, executor,
+                      env subst, custom_check, layered gates, retry,
+                      stats / ttest, shadow-DB, schema drift, push, …
+  api/                pytest — FastAPI: health, auth, runs roundtrip,
+                      conflict, list, pydantic drift canary
 ```
 
 ## License
