@@ -51,17 +51,29 @@ CREATE TABLE IF NOT EXISTS projects (
 );
 CREATE INDEX IF NOT EXISTS idx_projects_org ON projects(org_id);
 
--- Per-org API keys table reserved for Phase 2.5; the MVP uses a
--- single env-configured key in auth.py and validates against that.
+-- Per-org API keys. The token plaintext is **never** stored — only its
+-- sha256 hash. ``prefix`` keeps the first 12 chars of the token (e.g.
+-- ``evk_a1b2c3d4``) so an operator can identify a key in the UI / logs
+-- without exposing the secret. ``name`` is a human label ("ci-prod",
+-- "alice-laptop", …) so listing returns something useful.
+--
+-- ``scopes_csv`` is a comma-separated list of scope strings.  Empty
+-- string means "org-scoped only" — i.e. the key can act on its
+-- ``org_id`` and nothing else.  ``admin`` means "cross-org": typically
+-- assigned to the bootstrap key materialized from ``EVALGUARD_API_KEY``.
 CREATE TABLE IF NOT EXISTS api_keys (
-  key_id        TEXT PRIMARY KEY,
-  org_id        TEXT NOT NULL REFERENCES orgs(org_id),
-  hashed_key    TEXT NOT NULL,
-  scopes_csv    TEXT NOT NULL DEFAULT '',
-  created_at    TEXT NOT NULL,
-  last_used_at  TEXT
+  key_id          TEXT PRIMARY KEY,
+  org_id          TEXT NOT NULL REFERENCES orgs(org_id),
+  prefix          TEXT NOT NULL,
+  hashed_key      TEXT NOT NULL UNIQUE,
+  name            TEXT NOT NULL,
+  scopes_csv      TEXT NOT NULL DEFAULT '',
+  created_at      TEXT NOT NULL,
+  revoked_at      TEXT,
+  last_used_at    TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_api_keys_org ON api_keys(org_id);
+CREATE INDEX IF NOT EXISTS idx_api_keys_org   ON api_keys(org_id);
+CREATE INDEX IF NOT EXISTS idx_api_keys_hash  ON api_keys(hashed_key);
 
 -- Run-shape ----------------------------------------------------------------
 -- Tables mirror the CLI's local schema 1:1 (so ``serializer.run_to_dict``
@@ -245,7 +257,12 @@ def upsert_project(
     """Look up (or create) a project by ``project_name`` within ``org_id``.
 
     The CLI sends ``project: "<name>"`` in every run payload; the
-    server uses that name verbatim as the slug. Returns ``project_id``.
+    server uses that name verbatim as the slug.  Lookup is by
+    composite ``(org_id, slug)`` — the project_id PK itself is a
+    random opaque id so two orgs may have a project with the same
+    slug without colliding on the global PK.
+
+    Returns ``project_id``.
     """
     row = conn.execute(
         "SELECT project_id FROM projects WHERE org_id=? AND slug=?",
@@ -253,7 +270,8 @@ def upsert_project(
     ).fetchone()
     if row is not None:
         return row["project_id"]
-    project_id = f"proj_{project_name}"
+    import secrets as _secrets   # local import keeps stdlib usage close to call site
+    project_id = "proj_" + _secrets.token_hex(8)
     conn.execute(
         "INSERT INTO projects(project_id, org_id, slug, name, created_at) VALUES (?,?,?,?,?)",
         (project_id, org_id, project_name, project_name, now_iso()),
@@ -271,3 +289,218 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     except Exception:
         conn.rollback()
         raise
+
+
+# ---------------------------------------------------------------------------
+# API-key plaintext / hash helpers.
+#
+# Token shape: ``evk_<32 hex>``. The prefix is searchable so secret
+# scanners (GitHub, gitleaks, trufflehog) catch leaks; the entropy
+# is 128 bits which is overkill for a bearer but cheap.
+#
+# Storage: only ``sha256(token)`` lands in the DB. The plaintext is
+# returned to the caller exactly once (POST response on creation) and
+# never recoverable again — losing it forces a regenerate.
+
+import hashlib  # noqa: E402 — placed here so the helpers below are co-located
+import secrets  # noqa: E402
+
+_TOKEN_PREFIX = "evk_"
+_TOKEN_RANDOM_BYTES = 16  # 32 hex chars after the prefix
+
+
+def generate_token() -> str:
+    """Generate a fresh bearer token. Returned to the caller exactly
+    once; the server only persists ``hash_token(token)``."""
+    return _TOKEN_PREFIX + secrets.token_hex(_TOKEN_RANDOM_BYTES)
+
+
+def hash_token(token: str) -> str:
+    """Stable hash of a token suitable for ``api_keys.hashed_key``."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def token_prefix(token: str) -> str:
+    """First ``len('evk_') + 8`` chars — enough to identify a key in
+    the UI without exposing the secret. ``evk_a1b2c3d4`` is the result
+    for the typical token."""
+    return token[: len(_TOKEN_PREFIX) + 8]
+
+
+# ---------------------------------------------------------------------------
+# API-key persistence
+
+
+def find_key_by_hash(
+    conn: sqlite3.Connection, hashed: str,
+) -> dict | None:
+    """Look up an active api_key by its hash. Returns None for unknown
+    or revoked keys (revoked_at not null). Touches ``last_used_at`` on
+    hit so an operator can see which keys are live traffic."""
+    row = conn.execute(
+        """SELECT key_id, org_id, prefix, name, scopes_csv,
+                  created_at, revoked_at, last_used_at
+           FROM api_keys WHERE hashed_key=? AND revoked_at IS NULL""",
+        (hashed,),
+    ).fetchone()
+    if row is None:
+        return None
+    conn.execute(
+        "UPDATE api_keys SET last_used_at=? WHERE key_id=?",
+        (now_iso(), row["key_id"]),
+    )
+    conn.commit()
+    return dict(row)
+
+
+def create_api_key(
+    conn: sqlite3.Connection,
+    *,
+    org_id: str,
+    name: str,
+    scopes: list[str] | None = None,
+    token: str | None = None,
+) -> tuple[str, dict]:
+    """Create a new api_key row. Returns ``(plaintext_token, key_row)``.
+
+    ``token`` is normally generated server-side; tests / bootstrap
+    pass an explicit value to make the hash deterministic.
+    """
+    plaintext = token or generate_token()
+    hashed = hash_token(plaintext)
+    key_id = "key_" + secrets.token_hex(8)
+    scopes_csv = ",".join(s.strip() for s in (scopes or []) if s.strip())
+    conn.execute(
+        """INSERT INTO api_keys(
+              key_id, org_id, prefix, hashed_key, name, scopes_csv,
+              created_at, revoked_at, last_used_at)
+           VALUES (?,?,?,?,?,?,?,NULL,NULL)""",
+        (
+            key_id, org_id, token_prefix(plaintext), hashed,
+            name, scopes_csv, now_iso(),
+        ),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM api_keys WHERE key_id=?", (key_id,),
+    ).fetchone()
+    return plaintext, dict(row)
+
+
+def list_api_keys_for_org(
+    conn: sqlite3.Connection, org_id: str,
+) -> list[dict]:
+    rows = conn.execute(
+        """SELECT key_id, org_id, prefix, name, scopes_csv,
+                  created_at, revoked_at, last_used_at
+           FROM api_keys WHERE org_id=?
+           ORDER BY created_at DESC""",
+        (org_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def revoke_api_key(
+    conn: sqlite3.Connection, key_id: str,
+) -> bool:
+    """Mark a key revoked. Returns True if a row was affected."""
+    cur = conn.execute(
+        "UPDATE api_keys SET revoked_at=? WHERE key_id=? AND revoked_at IS NULL",
+        (now_iso(), key_id),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def get_api_key(
+    conn: sqlite3.Connection, key_id: str,
+) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM api_keys WHERE key_id=?", (key_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+# ---------------------------------------------------------------------------
+# Org / Project CRUD
+
+
+def create_org(
+    conn: sqlite3.Connection, *, slug: str, name: str,
+) -> dict:
+    org_id = f"org_{slug}"
+    conn.execute(
+        "INSERT INTO orgs(org_id, slug, name, created_at) VALUES (?,?,?,?)",
+        (org_id, slug, name, now_iso()),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM orgs WHERE org_id=?", (org_id,),
+    ).fetchone()
+    return dict(row)
+
+
+def get_org(conn: sqlite3.Connection, org_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM orgs WHERE org_id=?", (org_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def get_org_by_slug(conn: sqlite3.Connection, slug: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM orgs WHERE slug=?", (slug,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def list_orgs(conn: sqlite3.Connection) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM orgs ORDER BY created_at",
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def create_project_explicit(
+    conn: sqlite3.Connection,
+    *,
+    org_id: str,
+    slug: str,
+    name: str | None = None,
+) -> dict:
+    """Project create with explicit slug + name. ``upsert_project``
+    above is the run-ingest-driven path; this is the user-facing
+    ``POST /v1/projects`` path. Like upsert_project, uses a random
+    opaque ``project_id`` so the (org_id, slug) composite is the
+    real uniqueness boundary."""
+    project_id = "proj_" + secrets.token_hex(8)
+    conn.execute(
+        "INSERT INTO projects(project_id, org_id, slug, name, created_at) "
+        "VALUES (?,?,?,?,?)",
+        (project_id, org_id, slug, name or slug, now_iso()),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM projects WHERE project_id=?", (project_id,),
+    ).fetchone()
+    return dict(row)
+
+
+def get_project_by_slug(
+    conn: sqlite3.Connection, *, org_id: str, slug: str,
+) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM projects WHERE org_id=? AND slug=?",
+        (org_id, slug),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def list_projects_for_org(
+    conn: sqlite3.Connection, org_id: str,
+) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM projects WHERE org_id=? ORDER BY created_at",
+        (org_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]

@@ -270,13 +270,21 @@ separate from the MIT-licensed CLI.
   + Swagger UI; SQLite default with `DATABASE_URL` seam ready for the
   Postgres port. Pydantic ingest model mirrors `evalguard.run.schema.json`
   with a drift canary roundtrip test.
+- **Phase 2.5a (multi-tenancy made real)** — per-org API keys backed
+  by the `api_keys` table (token = `evk_<32 hex>`, sha256-hashed at
+  rest, plaintext returned exactly once on creation); `EVALGUARD_API_KEY`
+  becomes an idempotent admin-key bootstrap. Org / Project / API-key
+  CRUD endpoints. `/v1/runs` ingest scopes to caller's org; cross-org
+  GET returns 404 (no enumeration leak); list endpoints silently scope
+  to caller's org. Project ids are random opaque so `(org_id, slug)`
+  is the uniqueness boundary — two orgs can both have a `demo` project.
 
 ## Coming next
 
 | Phase | Deliverable |
 |---|---|
 | 1.5 | Published `evalguard/action@v1`; baseline registry polish |
-| 2.5 | Postgres + Alembic + RLS for `apps/api/`; per-org API keys; Org/Project CRUD endpoints |
+| 2.5b | Postgres + Alembic + SQLAlchemy core for `apps/api/`; RLS policies as defense-in-depth on top of the application-layer auth |
 | 2.6 | Next.js UI: Runs / Datasets / Prompts / Judges / Settings — consumes the same JSON contract `view --json` produces |
 | 3 | OTLP / `gen_ai.*` ingest; online sampler; drift detection |
 | 4 | Argilla-style human review queue; κ tracking; promote-to-golden flow |

@@ -36,9 +36,18 @@ curl -s -H "Authorization: Bearer $EVALGUARD_API_KEY" \
 | Method | Path | Notes |
 |---|---|---|
 | `GET`  | `/v1/health`         | No auth. Returns `{status, version, mode, db}`. |
-| `POST` | `/v1/runs`           | Auth. Ingest a run. 201 with `Location` header; 409 on duplicate `run_id`. |
-| `GET`  | `/v1/runs`           | Auth. List recent runs. Query: `project=<slug>&limit=20`. |
-| `GET`  | `/v1/runs/{run_id}`  | Auth. Full run JSON + server-injected `server` envelope. |
+| `POST` | `/v1/orgs`           | Admin. Create a new tenant. 409 on duplicate slug. |
+| `GET`  | `/v1/orgs`           | Auth. List visible orgs (admin: all; member: own). |
+| `GET`  | `/v1/orgs/{org_id}`  | Member of org or admin. |
+| `POST` | `/v1/orgs/{org_id}/api_keys` | Member of org or admin. Returns plaintext token **once** + summary. |
+| `GET`  | `/v1/orgs/{org_id}/api_keys` | Member of org or admin. Listing never includes plaintext / hashed values. |
+| `DELETE` | `/v1/api_keys/{key_id}` | Member of key's org or admin. Idempotent. |
+| `POST` | `/v1/projects`       | Member. `?org_id=` admin-only override. 409 on duplicate slug *within same org*. |
+| `GET`  | `/v1/projects`       | Member. Scoped to caller's org by default. |
+| `GET`  | `/v1/projects/{slug}` | Member. 404 (not 403) on cross-org probe. |
+| `POST` | `/v1/runs`           | Member. Ingest under caller's org. 201 + `Location`; 409 on duplicate `run_id`. |
+| `GET`  | `/v1/runs`           | Member. Scoped to caller's org. Query: `project=<slug>&limit=20`. |
+| `GET`  | `/v1/runs/{run_id}`  | Member. 404 on cross-org access (no info leak). |
 | `GET`  | `/openapi.json`      | OpenAPI 3 spec (auto-generated). |
 | `GET`  | `/docs`              | Swagger UI. |
 
@@ -58,18 +67,43 @@ All settings come from the environment. Defaults in parens.
 
 ## Multi-tenancy model
 
-The schema is multi-tenant from day one (tables: `orgs`, `projects`,
-`api_keys`, plus run-shape tables with `project_id` FK). The MVP
-operates as a **single tenant** by default — every push goes to the
-default org, project resolution comes from the `project: <name>`
-field in the run payload (auto-creating projects on first sight).
+Three-level hierarchy: **Org → Project → Run**. Every authenticated
+caller resolves to a `Principal(org_id, key_id, scopes)`. The
+`api_keys` table is the source of truth: each token's sha256 hash
+sits in a row; the row's `org_id` is the caller's tenant; the row's
+`scopes_csv` decides whether they can act cross-org (`admin`) or
+only on their own org (empty).
 
-Phase 2.5 will land:
+**Token shape:** server-minted tokens are `evk_<32 hex>` — the
+`evk_` prefix is searchable by secret-scanners (GitHub, gitleaks,
+trufflehog) so leaks get caught quickly. The `EVALGUARD_API_KEY`
+env-bootstrap token is materialized as an `admin` key in the
+default org on first startup; it can be any string the operator
+chose (so existing single-tenant deployments don't have to rotate).
 
-- Per-org API keys (the `api_keys` table is reserved for this).
-- Postgres + Alembic + RLS policies (the schema is structurally
-  ready; the change is the driver and migration tooling).
-- Org/Project CRUD endpoints.
+**Cross-tenant guarantees:**
+
+- `GET /v1/runs/{run_id}` returns 404 (not 403) when the run is in
+  another org. Same response as "id never existed" — no enumeration
+  leak.
+- `GET /v1/runs` and `GET /v1/projects` listings are silently
+  scoped: members see only their own org's rows. Per-row 403 would
+  leak existence.
+- `GET /v1/orgs` does the same: members see one entry (their own).
+- `POST /v1/projects?org_id=other-org` is **403** for non-admin
+  callers explicitly targeting a foreign org — that path can't
+  produce ambiguity.
+
+**Project ids** are random opaque (`proj_<random16>`); the
+`(org_id, slug)` composite is the uniqueness boundary. Two orgs may
+both have a `demo` project without colliding.
+
+What's in 2.5b (next):
+
+- Postgres + Alembic + SQLAlchemy core (DATABASE_URL is the seam;
+  the SQLite schema mirrors the eventual Postgres tables).
+- Postgres-only RLS policies as defense-in-depth on top of the
+  application-layer auth shipped here.
 
 ## Persistence shape
 

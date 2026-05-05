@@ -189,6 +189,116 @@ def test_first_push_to_a_new_project_provisions_it(client, auth_headers, tmp_pat
 # Persistence — the denormalized tables shadow payload_json correctly
 
 
+# ---------------------------------------------------------------------------
+# Cross-tenant isolation
+#
+# These are the most important tests in the file: they pin that one
+# tenant's runs are invisible to another. Every regression here is a
+# multi-tenancy security incident.
+
+
+def test_member_cannot_see_run_pushed_by_another_org(
+    client, auth_headers, make_org, make_member_token, tmp_path,
+):
+    """An admin pushes a run into org_acme; a member of org_default
+    must get a 404 (not 403, not the data) when GETting it. 404 is
+    deliberate — exposing the existence of the run id elsewhere
+    would leak across tenants."""
+    make_org("acme")
+    # Mint member tokens in BOTH orgs so we exercise both directions.
+    member_default = make_member_token("org_default", name="d")
+    member_acme    = make_member_token("org_acme",    name="a")
+
+    # Push a run through the admin token, scoped to acme via that
+    # member's org context.
+    payload = _produce_real_run(tmp_path, "secret-acme-project")
+    r = client.post(
+        "/v1/runs", json=payload,
+        headers={"Authorization": f"Bearer {member_acme}"},
+    )
+    assert r.status_code == 201
+
+    # Member of org_default can't see it.
+    r404 = client.get(
+        f"/v1/runs/{payload['run_id']}",
+        headers={"Authorization": f"Bearer {member_default}"},
+    )
+    assert r404.status_code == 404
+    assert "not found" in r404.json()["detail"].lower()
+
+    # Member of org_acme CAN see it.
+    r200 = client.get(
+        f"/v1/runs/{payload['run_id']}",
+        headers={"Authorization": f"Bearer {member_acme}"},
+    )
+    assert r200.status_code == 200
+
+
+def test_list_does_not_leak_other_orgs_runs(
+    client, auth_headers, make_org, make_member_token, tmp_path,
+):
+    """The default ``GET /v1/runs`` listing for a member must include
+    only their own org's runs, no matter what's in other orgs."""
+    make_org("acme")
+    member_default = make_member_token("org_default", name="d")
+    member_acme    = make_member_token("org_acme",    name="a")
+
+    p_default = _produce_real_run(tmp_path / "d", "default-proj")
+    p_acme    = _produce_real_run(tmp_path / "a", "acme-proj")
+    client.post("/v1/runs", json=p_default,
+                headers={"Authorization": f"Bearer {member_default}"})
+    client.post("/v1/runs", json=p_acme,
+                headers={"Authorization": f"Bearer {member_acme}"})
+
+    # Member of default sees only their run.
+    r = client.get(
+        "/v1/runs",
+        headers={"Authorization": f"Bearer {member_default}"},
+    )
+    visible_ids = {x["run_id"] for x in r.json()["runs"]}
+    assert p_default["run_id"] in visible_ids
+    assert p_acme["run_id"] not in visible_ids
+
+    # Admin sees both.
+    r2 = client.get("/v1/runs", headers=auth_headers)
+    visible_admin = {x["run_id"] for x in r2.json()["runs"]}
+    assert {p_default["run_id"], p_acme["run_id"]} <= visible_admin
+
+
+def test_same_project_name_in_different_orgs_does_not_collide(
+    client, auth_headers, make_org, make_member_token, tmp_path,
+):
+    """Two orgs may both have a project named 'demo' — runs land
+    in distinct project_ids and don't show up in each other's
+    listings."""
+    make_org("acme")
+    member_default = make_member_token("org_default", name="d")
+    member_acme    = make_member_token("org_acme",    name="a")
+
+    p_default = _produce_real_run(tmp_path / "d", "demo")
+    p_acme    = _produce_real_run(tmp_path / "a", "demo")
+    r1 = client.post("/v1/runs", json=p_default,
+                     headers={"Authorization": f"Bearer {member_default}"})
+    r2 = client.post("/v1/runs", json=p_acme,
+                     headers={"Authorization": f"Bearer {member_acme}"})
+    assert r1.json()["project_id"] != r2.json()["project_id"]
+
+    # Each member's filter on project=demo returns ONLY their run.
+    r_d = client.get(
+        "/v1/runs?project=demo",
+        headers={"Authorization": f"Bearer {member_default}"},
+    )
+    ids_d = {x["run_id"] for x in r_d.json()["runs"]}
+    assert ids_d == {p_default["run_id"]}
+
+    r_a = client.get(
+        "/v1/runs?project=demo",
+        headers={"Authorization": f"Bearer {member_acme}"},
+    )
+    ids_a = {x["run_id"] for x in r_a.json()["runs"]}
+    assert ids_a == {p_acme["run_id"]}
+
+
 def test_trials_and_rows_are_denormalized(client, auth_headers, tmp_path):
     """Querying the DB beyond payload_json must work — that's why the
     server denormalizes trials / rows / gates / assets at ingest. This

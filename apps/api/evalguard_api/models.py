@@ -227,3 +227,79 @@ class RunSummary(_Loose):
 class RunList(_Strict):
     runs: list[RunSummary]
     next: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Org / Project / API-key resources
+#
+# Slugs are URL-safe lowercase identifiers (a-z, 0-9, hyphen). Names
+# are free-form display text. Both shapes are picked to round-trip
+# cleanly through CLI / UI / OpenAPI without escaping.
+
+_SLUG_PATTERN = r"^[a-z0-9][a-z0-9-]{0,62}$"
+
+
+class OrgCreate(_Strict):
+    slug: str = Field(pattern=_SLUG_PATTERN,
+                      description="URL-safe identifier; lowercase, hyphens, ≤63 chars.")
+    name: str = Field(min_length=1, max_length=200)
+
+
+class OrgOut(_Strict):
+    org_id:     str
+    slug:       str
+    name:       str
+    created_at: str
+
+
+class ProjectCreate(_Strict):
+    slug: str = Field(pattern=_SLUG_PATTERN)
+    name: str | None = Field(default=None, max_length=200)
+
+
+class ProjectOut(_Strict):
+    project_id: str
+    org_id:     str
+    slug:       str
+    name:       str
+    created_at: str
+
+
+class ApiKeyCreate(_Strict):
+    name:   str = Field(min_length=1, max_length=200,
+                        description="Human label; not a secret.")
+    scopes: list[str] = Field(default_factory=list,
+                              description="e.g. ['admin']. Empty = org-scoped.")
+
+
+class ApiKeySummary(_Strict):
+    """Listing shape — never carries the plaintext token."""
+
+    key_id:        str
+    org_id:        str
+    prefix:        str
+    name:          str
+    scopes:        list[str]
+    created_at:    str
+    revoked_at:    str | None = None
+    last_used_at:  str | None = None
+
+
+class ApiKeyCreated(_Strict):
+    """The ``POST`` response — INCLUDES the plaintext token, exactly
+    once. Clients must capture it; the server never reveals it again."""
+
+    key:   ApiKeySummary
+    token: str = Field(description="Plaintext bearer token. Save it now — it is not retrievable later.")
+
+
+class OrgList(_Strict):
+    orgs: list[OrgOut]
+
+
+class ProjectList(_Strict):
+    projects: list[ProjectOut]
+
+
+class ApiKeyList(_Strict):
+    keys: list[ApiKeySummary]

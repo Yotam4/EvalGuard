@@ -23,7 +23,7 @@ from fastapi.responses import JSONResponse
 
 from evalguard_api.auth import Principal, require_principal
 from evalguard_api.db import (
-    connect, ensure_default_tenancy, now_iso, transaction, upsert_project,
+    connect, now_iso, transaction, upsert_project,
 )
 from evalguard_api.models import RunIngest, RunList, RunOut, RunSummary
 
@@ -54,17 +54,16 @@ def ingest_run(
     request: Request,
     principal: Principal = Depends(require_principal),
 ) -> JSONResponse:
-    settings = request.app.state.settings
     conn = _conn(request)
     try:
-        # Resolve tenancy: default org always exists (lifespan ensures
-        # it); the project name from the run payload becomes the slug.
-        org_id, _ = ensure_default_tenancy(
-            conn,
-            org_slug=settings.default_org_slug,
-            project_slug=settings.default_project_slug,
+        # The run lands in the *caller's* org — there's no client-
+        # supplied org parameter, by design. ``run_to_dict()``'s
+        # ``project: <name>`` field becomes the project slug within
+        # that org. Two orgs may host projects with identical slugs
+        # without collision.
+        project_id = upsert_project(
+            conn, org_id=principal.org_id, project_name=body.project,
         )
-        project_id = upsert_project(conn, org_id=org_id, project_name=body.project)
 
         # Conflict on duplicate run_id. The canonical merge story
         # (server-side reconciliation across multiple pushes) is
@@ -112,31 +111,39 @@ def list_runs(
     request: Request,
     project: str | None = Query(default=None, description="Filter by project slug."),
     limit: int = Query(default=20, ge=1, le=200),
-    _: Principal = Depends(require_principal),
+    principal: Principal = Depends(require_principal),
 ) -> RunList:
+    """List recent runs visible to the caller.
+
+    Org members see only runs in their own org; admins see every
+    run unless ``project`` narrows the listing further. The org
+    filter is implicit so a member can never enumerate a foreign
+    org's runs by listing without a filter.
+    """
     conn = _conn(request)
     try:
+        # WHERE clause assembled with parameters — never f-strings —
+        # so user input can't reach the SQL surface.
+        clauses: list[str] = []
+        args: list = []
+        if not principal.is_admin:
+            clauses.append("project_id IN (SELECT project_id FROM projects WHERE org_id = ?)")
+            args.append(principal.org_id)
         if project is not None:
-            rows = conn.execute(
-                """SELECT run_id, project_name AS project, status, gate_status,
-                          started_at, finished_at,
-                          row_count, row_pass_count, row_fail_count, cost_usd,
-                          ingested_at, ingested_by
-                   FROM runs
-                   WHERE project_name = ?
-                   ORDER BY ingested_at DESC, rowid DESC LIMIT ?""",
-                (project, limit),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """SELECT run_id, project_name AS project, status, gate_status,
-                          started_at, finished_at,
-                          row_count, row_pass_count, row_fail_count, cost_usd,
-                          ingested_at, ingested_by
-                   FROM runs
-                   ORDER BY ingested_at DESC, rowid DESC LIMIT ?""",
-                (limit,),
-            ).fetchall()
+            clauses.append("project_name = ?")
+            args.append(project)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        args.append(limit)
+        rows = conn.execute(
+            f"""SELECT run_id, project_name AS project, status, gate_status,
+                       started_at, finished_at,
+                       row_count, row_pass_count, row_fail_count, cost_usd,
+                       ingested_at, ingested_by
+                FROM runs
+                {where}
+                ORDER BY ingested_at DESC, rowid DESC LIMIT ?""",
+            tuple(args),
+        ).fetchall()
         return RunList(runs=[RunSummary(**dict(r)) for r in rows], next=None)
     finally:
         conn.close()
@@ -150,15 +157,32 @@ def list_runs(
 def get_run(
     run_id: str,
     request: Request,
-    _: Principal = Depends(require_principal),
+    principal: Principal = Depends(require_principal),
 ) -> RunOut:
+    """Fetch a run by id.
+
+    Cross-org reads return **404** rather than 403 — exposing the
+    existence of a run in another org would let a curious caller
+    enumerate run_ids across tenants. The 404 is identical to the
+    "this id never existed" response.
+    """
     conn = _conn(request)
     try:
         row = conn.execute(
-            "SELECT payload_json, ingested_at, ingested_by, project_id FROM runs WHERE run_id=?",
+            """SELECT runs.payload_json, runs.ingested_at, runs.ingested_by,
+                      runs.project_id, projects.org_id AS owning_org_id
+               FROM runs
+               JOIN projects ON projects.project_id = runs.project_id
+               WHERE runs.run_id=?""",
             (run_id,),
         ).fetchone()
         if row is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Run {run_id!r} not found.",
+            )
+        if not principal.is_admin and row["owning_org_id"] != principal.org_id:
+            # Same status / detail as the genuine 404 — no info leak.
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Run {run_id!r} not found.",

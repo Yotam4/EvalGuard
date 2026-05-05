@@ -15,8 +15,14 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from evalguard_api.config import Settings, load_settings
-from evalguard_api.db import connect, ensure_default_tenancy, init_schema
+from evalguard_api.db import (
+    connect, create_api_key, ensure_default_tenancy, find_key_by_hash,
+    hash_token, init_schema,
+)
+from evalguard_api.routes.api_keys import router as api_keys_router
 from evalguard_api.routes.health import router as health_router
+from evalguard_api.routes.orgs import router as orgs_router
+from evalguard_api.routes.projects import router as projects_router
 from evalguard_api.routes.runs import router as runs_router
 
 logger = logging.getLogger("evalguard.api")
@@ -42,11 +48,31 @@ async def lifespan(app: FastAPI):
         conn = connect(path)
         try:
             init_schema(conn)
-            ensure_default_tenancy(
+            org_id, _ = ensure_default_tenancy(
                 conn,
                 org_slug=settings.default_org_slug,
                 project_slug=settings.default_project_slug,
             )
+            # Idempotent admin-key bootstrap: when ``EVALGUARD_API_KEY``
+            # is set, ensure an api_keys row exists with that token's
+            # hash and ``admin`` scope. Re-startups are no-ops; rotating
+            # the env var creates a new admin key (the old one stays
+            # active until manually revoked, matching how operators
+            # handle leaked credentials).
+            if settings.api_key:
+                existing = find_key_by_hash(conn, hash_token(settings.api_key))
+                if existing is None:
+                    create_api_key(
+                        conn,
+                        org_id=org_id,
+                        name="bootstrap (env)",
+                        scopes=["admin"],
+                        token=settings.api_key,
+                    )
+                    logger.info(
+                        "Bootstrap admin key materialized in org=%s "
+                        "(from $EVALGUARD_API_KEY).", org_id,
+                    )
         finally:
             conn.close()
         logger.info("EvalGuard API ready · db=%s · mode=%s",
@@ -78,6 +104,9 @@ def build_app(settings: Settings | None = None) -> FastAPI:
         allow_credentials=False,
     )
     app.include_router(health_router)
+    app.include_router(orgs_router)
+    app.include_router(projects_router)
+    app.include_router(api_keys_router)
     app.include_router(runs_router)
     return app
 
