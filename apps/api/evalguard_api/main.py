@@ -1,8 +1,16 @@
 """FastAPI application entry.
 
-The lifespan handler initializes the database (idempotent — every
-CREATE TABLE is IF NOT EXISTS) and provisions the default org +
-project so the very first push has a tenant to attach to.
+The lifespan handler:
+
+1. Builds a SQLAlchemy ``Engine`` from settings (SQLite default,
+   Postgres if ``EVALGUARD_DATABASE_URL`` points there).
+2. Runs ``alembic upgrade head`` programmatically — replaces the
+   Phase-1 ``init_schema()`` with proper schema versioning so future
+   schema changes ship as Alembic migrations.
+3. Provisions the default org + project so the very first push has
+   a tenant to attach to.
+4. Idempotently materializes ``EVALGUARD_API_KEY`` as an admin
+   api_keys row.
 """
 
 from __future__ import annotations
@@ -10,14 +18,17 @@ from __future__ import annotations
 import logging
 import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 
+from alembic import command as alembic_command
+from alembic.config import Config as AlembicConfig
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from evalguard_api.config import Settings, load_settings
 from evalguard_api.db import (
-    connect, create_api_key, ensure_default_tenancy, find_key_by_hash,
-    hash_token, init_schema,
+    create_api_key, ensure_default_tenancy, find_key_by_hash,
+    hash_token, make_engine,
 )
 from evalguard_api.routes.api_keys import router as api_keys_router
 from evalguard_api.routes.health import router as health_router
@@ -26,6 +37,24 @@ from evalguard_api.routes.projects import router as projects_router
 from evalguard_api.routes.runs import router as runs_router
 
 logger = logging.getLogger("evalguard.api")
+
+
+def _alembic_config(database_url: str) -> AlembicConfig:
+    """Build an Alembic ``Config`` programmatically.
+
+    Programmatic upgrade doesn't require the ``alembic.ini`` file —
+    the .ini exists for CLI invocations (``alembic revision``,
+    ``alembic upgrade``) which operators run by hand. Building the
+    config in code instead means the wheel doesn't need to ship a
+    config file at a specific path, and the migration script
+    location is unambiguous regardless of where the package is
+    installed.
+    """
+    here = Path(__file__).resolve().parent
+    cfg = AlembicConfig()
+    cfg.set_main_option("script_location", str(here / "migrations"))
+    cfg.set_main_option("sqlalchemy.url", database_url)
+    return cfg
 
 
 @asynccontextmanager
@@ -37,47 +66,47 @@ async def lifespan(app: FastAPI):
             "Do NOT expose this server beyond local dev."
         )
 
-    path = settings.sqlite_path
-    if path is None:
-        logger.warning(
-            "Non-sqlite DATABASE_URL %r — Postgres support lands in Phase 2.5; "
-            "current build only honours sqlite URLs.",
-            settings.database_url,
+    # 1. Build the engine. The same engine is used by every route
+    #    through ``request.app.state.engine`` for connection-pool reuse.
+    engine = make_engine(settings)
+    app.state.engine = engine
+
+    # 2. Apply all pending Alembic migrations. Idempotent —
+    #    ``alembic_version`` tracks the applied revision; re-startups
+    #    are no-ops once head has been reached.
+    alembic_command.upgrade(_alembic_config(settings.database_url), "head")
+
+    # 3. Default org / project + admin-key bootstrap.
+    with engine.begin() as conn:
+        org_id, _ = ensure_default_tenancy(
+            conn,
+            org_slug=settings.default_org_slug,
+            project_slug=settings.default_project_slug,
         )
-    else:
-        conn = connect(path)
-        try:
-            init_schema(conn)
-            org_id, _ = ensure_default_tenancy(
-                conn,
-                org_slug=settings.default_org_slug,
-                project_slug=settings.default_project_slug,
-            )
-            # Idempotent admin-key bootstrap: when ``EVALGUARD_API_KEY``
-            # is set, ensure an api_keys row exists with that token's
-            # hash and ``admin`` scope. Re-startups are no-ops; rotating
-            # the env var creates a new admin key (the old one stays
-            # active until manually revoked, matching how operators
-            # handle leaked credentials).
-            if settings.api_key:
-                existing = find_key_by_hash(conn, hash_token(settings.api_key))
-                if existing is None:
-                    create_api_key(
-                        conn,
-                        org_id=org_id,
-                        name="bootstrap (env)",
-                        scopes=["admin"],
-                        token=settings.api_key,
-                    )
-                    logger.info(
-                        "Bootstrap admin key materialized in org=%s "
-                        "(from $EVALGUARD_API_KEY).", org_id,
-                    )
-        finally:
-            conn.close()
-        logger.info("EvalGuard API ready · db=%s · mode=%s",
-                    path, "open" if settings.is_open_mode else "auth")
-    yield
+        if settings.api_key:
+            existing = find_key_by_hash(conn, hash_token(settings.api_key))
+            if existing is None:
+                create_api_key(
+                    conn,
+                    org_id=org_id,
+                    name="bootstrap (env)",
+                    scopes=["admin"],
+                    token=settings.api_key,
+                )
+                logger.info(
+                    "Bootstrap admin key materialized in org=%s "
+                    "(from $EVALGUARD_API_KEY).", org_id,
+                )
+
+    logger.info(
+        "EvalGuard API ready · dialect=%s · mode=%s",
+        engine.dialect.name,
+        "open" if settings.is_open_mode else "auth",
+    )
+    try:
+        yield
+    finally:
+        engine.dispose()
 
 
 def build_app(settings: Settings | None = None) -> FastAPI:
@@ -99,7 +128,7 @@ def build_app(settings: Settings | None = None) -> FastAPI:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(settings.cors_origins),
-        allow_methods=["GET", "POST"],
+        allow_methods=["GET", "POST", "DELETE"],
         allow_headers=["authorization", "content-type"],
         allow_credentials=False,
     )

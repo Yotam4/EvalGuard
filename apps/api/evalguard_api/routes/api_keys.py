@@ -15,27 +15,22 @@ non-admin members can only create org-scoped keys (empty scopes).
 
 from __future__ import annotations
 
-import sqlite3
-
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.engine import Connection
 
 from evalguard_api.auth import (
     Principal, require_admin, require_org_member, require_principal,
 )
 from evalguard_api.db import (
-    connect, create_api_key, get_api_key, get_org, list_api_keys_for_org,
+    create_api_key, get_api_key, get_org, list_api_keys_for_org,
     revoke_api_key,
 )
+from evalguard_api.deps import get_conn
 from evalguard_api.models import (
     ApiKeyCreate, ApiKeyCreated, ApiKeyList, ApiKeySummary,
 )
 
 router = APIRouter()
-
-
-def _conn(request: Request) -> sqlite3.Connection:
-    settings = request.app.state.settings
-    return connect(settings.sqlite_path or ":memory:")
 
 
 def _to_summary(row: dict) -> ApiKeySummary:
@@ -65,35 +60,27 @@ def _to_summary(row: dict) -> ApiKeySummary:
 def create(
     org_id: str,
     body: ApiKeyCreate,
-    request: Request,
+    conn: Connection = Depends(get_conn),
     principal: Principal = Depends(require_principal),
 ) -> ApiKeyCreated:
     require_org_member(principal, org_id)
 
-    # Privileged scopes need admin. Without this guard, an org member
-    # could grant their key ``admin`` and escalate cross-org.
+    # Privilege escalation guard: only admins can mint admin keys.
     if "admin" in body.scopes:
         require_admin(principal)
 
-    conn = _conn(request)
-    try:
-        if get_org(conn, org_id) is None:
-            # Should be unreachable for admins (require_org_member
-            # passes them) — but covers the edge of an admin asking
-            # about a non-existent org.
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Org {org_id!r} not found.",
-            )
-        plaintext, row = create_api_key(
-            conn, org_id=org_id, name=body.name, scopes=body.scopes,
+    if get_org(conn, org_id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Org {org_id!r} not found.",
         )
-        return ApiKeyCreated(
-            key=_to_summary(row),
-            token=plaintext,
-        )
-    finally:
-        conn.close()
+    plaintext, row = create_api_key(
+        conn, org_id=org_id, name=body.name, scopes=body.scopes,
+    )
+    return ApiKeyCreated(
+        key=_to_summary(row),
+        token=plaintext,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -107,15 +94,11 @@ def create(
 )
 def list_(
     org_id: str,
-    request: Request,
+    conn: Connection = Depends(get_conn),
     principal: Principal = Depends(require_principal),
 ) -> ApiKeyList:
     require_org_member(principal, org_id)
-    conn = _conn(request)
-    try:
-        return ApiKeyList(keys=[_to_summary(r) for r in list_api_keys_for_org(conn, org_id)])
-    finally:
-        conn.close()
+    return ApiKeyList(keys=[_to_summary(r) for r in list_api_keys_for_org(conn, org_id)])
 
 
 # ---------------------------------------------------------------------------
@@ -129,27 +112,19 @@ def list_(
 )
 def revoke(
     key_id: str,
-    request: Request,
+    conn: Connection = Depends(get_conn),
     principal: Principal = Depends(require_principal),
 ):
-    conn = _conn(request)
-    try:
-        existing = get_api_key(conn, key_id)
-        if existing is None:
-            # No information leak — same response whether the key
-            # exists in another org or doesn't exist at all.
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Key {key_id!r} not found.",
-            )
-        # Members of the key's org may revoke their own keys; admins
-        # may revoke any. ``require_org_member`` enforces both.
-        require_org_member(principal, existing["org_id"])
+    existing = get_api_key(conn, key_id)
+    if existing is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Key {key_id!r} not found.",
+        )
+    require_org_member(principal, existing["org_id"])
 
-        if existing.get("revoked_at"):
-            # Idempotent: re-revoking a revoked key is a no-op success.
-            return None
-        revoke_api_key(conn, key_id)
+    if existing.get("revoked_at"):
+        # Idempotent: re-revoking a revoked key is a no-op success.
         return None
-    finally:
-        conn.close()
+    revoke_api_key(conn, key_id)
+    return None

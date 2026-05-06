@@ -9,7 +9,15 @@ dependencies = [
   "fastapi>=0.118",
   "uvicorn>=0.30",
   "pydantic>=2.7",
+  "sqlalchemy>=2.0",
+  "alembic>=1.13",
 ]
+
+[project.optional-dependencies]
+# Postgres deployments install ``evalguard-api[postgres]`` to pull in
+# psycopg3.  SQLite-only deployments stay slim — the default install
+# only carries SQLAlchemy + Alembic, both pure Python.
+postgres = ["psycopg[binary]>=3.1"]
 
 [project.scripts]
 evalguard-api = "evalguard_api.main:run"

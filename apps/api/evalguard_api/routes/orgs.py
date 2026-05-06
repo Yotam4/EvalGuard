@@ -18,25 +18,20 @@ mutation requires careful cascade handling that's out of MVP scope.
 
 from __future__ import annotations
 
-import sqlite3
-
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.engine import Connection
 
 from evalguard_api.auth import (
     Principal, filter_orgs_visible_to, require_admin,
     require_org_member, require_principal,
 )
 from evalguard_api.db import (
-    connect, create_org, get_org, get_org_by_slug, list_orgs,
+    create_org, get_org, get_org_by_slug, list_orgs,
 )
+from evalguard_api.deps import get_conn
 from evalguard_api.models import OrgCreate, OrgList, OrgOut
 
 router = APIRouter()
-
-
-def _conn(request: Request) -> sqlite3.Connection:
-    settings = request.app.state.settings
-    return connect(settings.sqlite_path or ":memory:")
 
 
 # ---------------------------------------------------------------------------
@@ -47,21 +42,17 @@ def _conn(request: Request) -> sqlite3.Connection:
              status_code=status.HTTP_201_CREATED, tags=["orgs"])
 def create(
     body: OrgCreate,
-    request: Request,
+    conn: Connection = Depends(get_conn),
     principal: Principal = Depends(require_principal),
 ) -> OrgOut:
     require_admin(principal)
-    conn = _conn(request)
-    try:
-        if get_org_by_slug(conn, body.slug) is not None:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"Org slug {body.slug!r} already exists.",
-            )
-        row = create_org(conn, slug=body.slug, name=body.name)
-        return OrgOut(**row)
-    finally:
-        conn.close()
+    if get_org_by_slug(conn, body.slug) is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Org slug {body.slug!r} already exists.",
+        )
+    row = create_org(conn, slug=body.slug, name=body.name)
+    return OrgOut(**row)
 
 
 # ---------------------------------------------------------------------------
@@ -70,18 +61,12 @@ def create(
 
 @router.get("/v1/orgs", response_model=OrgList, tags=["orgs"])
 def list_(
-    request: Request,
+    conn: Connection = Depends(get_conn),
     principal: Principal = Depends(require_principal),
 ) -> OrgList:
-    conn = _conn(request)
-    try:
-        rows = list_orgs(conn)
-        # Scope down to what the caller may see. Org members see one
-        # entry; admins see everything.
-        visible = filter_orgs_visible_to(principal, rows)
-        return OrgList(orgs=[OrgOut(**r) for r in visible])
-    finally:
-        conn.close()
+    rows = list_orgs(conn)
+    visible = filter_orgs_visible_to(principal, rows)
+    return OrgList(orgs=[OrgOut(**r) for r in visible])
 
 
 # ---------------------------------------------------------------------------
@@ -91,18 +76,14 @@ def list_(
 @router.get("/v1/orgs/{org_id}", response_model=OrgOut, tags=["orgs"])
 def get(
     org_id: str,
-    request: Request,
+    conn: Connection = Depends(get_conn),
     principal: Principal = Depends(require_principal),
 ) -> OrgOut:
     require_org_member(principal, org_id)
-    conn = _conn(request)
-    try:
-        row = get_org(conn, org_id)
-        if row is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Org {org_id!r} not found.",
-            )
-        return OrgOut(**row)
-    finally:
-        conn.close()
+    row = get_org(conn, org_id)
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Org {org_id!r} not found.",
+        )
+    return OrgOut(**row)

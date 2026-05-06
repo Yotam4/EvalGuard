@@ -278,13 +278,23 @@ separate from the MIT-licensed CLI.
   GET returns 404 (no enumeration leak); list endpoints silently scope
   to caller's org. Project ids are random opaque so `(org_id, slug)`
   is the uniqueness boundary — two orgs can both have a `demo` project.
+- **Phase 2.5b (durability swap)** — query layer ported from
+  hand-rolled `sqlite3` to SQLAlchemy 2.0 core (every helper / route
+  uses `text()` with named binds; same code runs against SQLite or
+  Postgres). Alembic ships migrations: `0001_initial` builds the
+  schema from `MetaData`, `0002_rls_policies` is **Postgres-only** and
+  enables Row-Level Security with `app.org_id` / `app.is_admin`
+  session GUCs. Postgres support via the `[postgres]` install extra
+  (`psycopg[binary]>=3.1`); the runtime auto-applies pending
+  migrations on startup. The integration suite at
+  `tests/api/test_postgres.py` is gated by `EVALGUARD_TEST_POSTGRES_URL`
+  so SQLite-only contributors don't need a running pg.
 
 ## Coming next
 
 | Phase | Deliverable |
 |---|---|
 | 1.5 | Published `evalguard/action@v1`; baseline registry polish |
-| 2.5b | Postgres + Alembic + SQLAlchemy core for `apps/api/`; RLS policies as defense-in-depth on top of the application-layer auth |
 | 2.6 | Next.js UI: Runs / Datasets / Prompts / Judges / Settings — consumes the same JSON contract `view --json` produces |
 | 3 | OTLP / `gen_ai.*` ingest; online sampler; drift detection |
 | 4 | Argilla-style human review queue; κ tracking; promote-to-golden flow |

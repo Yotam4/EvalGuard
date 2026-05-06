@@ -28,7 +28,7 @@ from typing import Iterable
 from fastapi import Header, HTTPException, Request, status
 
 from evalguard_api.config import Settings
-from evalguard_api.db import connect, find_key_by_hash, hash_token
+from evalguard_api.db import find_key_by_hash, hash_token
 
 
 # ---------------------------------------------------------------------------
@@ -104,12 +104,12 @@ def require_principal(
     if scheme.lower() != "bearer" or not token:
         _challenge("Authorization must be 'Bearer <token>'.")
 
-    # Hash and look up. ``find_key_by_hash`` filters out revoked keys.
-    conn = connect(settings.sqlite_path or ":memory:")
-    try:
+    # Hash and look up via the per-app engine. ``find_key_by_hash``
+    # filters out revoked keys; ``last_used_at`` is touched as a
+    # side effect so an operator can see live keys.
+    engine = request.app.state.engine
+    with engine.begin() as conn:
         key_row = find_key_by_hash(conn, hash_token(token))
-    finally:
-        conn.close()
     if key_row is None:
         _challenge("Invalid or revoked API key.")
 

@@ -98,12 +98,71 @@ chose (so existing single-tenant deployments don't have to rotate).
 `(org_id, slug)` composite is the uniqueness boundary. Two orgs may
 both have a `demo` project without colliding.
 
-What's in 2.5b (next):
+## Postgres deployment (Phase 2.5b)
 
-- Postgres + Alembic + SQLAlchemy core (DATABASE_URL is the seam;
-  the SQLite schema mirrors the eventual Postgres tables).
-- Postgres-only RLS policies as defense-in-depth on top of the
-  application-layer auth shipped here.
+Install with the `postgres` extra and point `EVALGUARD_DATABASE_URL`
+at your cluster:
+
+```bash
+uv pip install -e 'apps/api[postgres]'
+export EVALGUARD_DATABASE_URL=postgresql+psycopg://evalguard:secret@db:5432/evalguard
+export EVALGUARD_API_KEY=$(openssl rand -hex 32)
+uvicorn evalguard_api.main:app --host 0.0.0.0 --port 8787
+```
+
+The lifespan applies all pending Alembic migrations on every
+startup (idempotent; tracked in `alembic_version`). Bring an empty
+database — schema, default tenancy, and the bootstrap admin key
+are all materialized on first boot.
+
+### Migrations
+
+| Action | Command |
+|---|---|
+| Apply pending migrations | runtime auto-applies on startup; or manually: `cd apps/api && alembic upgrade head` |
+| Generate a new migration from a `metadata` change | `cd apps/api && alembic revision --autogenerate -m "<message>"` |
+| Roll back one revision | `cd apps/api && alembic downgrade -1` |
+
+Migration scripts live in `apps/api/evalguard_api/migrations/versions/`.
+`0002_rls_policies.py` is **Postgres-only** (no-ops on SQLite via an
+`op.get_bind().dialect.name` check).
+
+### Row-Level Security
+
+When the server runs against Postgres, `0002_rls_policies` enables
+RLS on every table that carries tenant data (`projects`, `api_keys`,
+`runs`, `trials`, `run_rows`, `gate_results`, `assets`, `events`)
+and creates `*_tenant_isolation` policies that enforce visibility
+based on two session-local GUCs set per-transaction in `deps.get_conn`:
+
+- `app.org_id` — caller's `Principal.org_id`
+- `app.is_admin` — `"1"` for admin scope, `"0"` otherwise
+
+RLS enforces the same contract as the application-layer guards in
+`auth.py` — at the database level, so a query that forgets a
+`WHERE org_id = …` filter (or a future code path that bypasses the
+route guards) still can't leak across tenants. Admin scope bypasses
+the policies (intentional — admin keys are the only way to inspect
+cross-org state).
+
+### Testing against Postgres
+
+The default test suite runs on SQLite. The Postgres integration
+suite at `tests/api/test_postgres.py` is gated by
+`EVALGUARD_TEST_POSTGRES_URL`:
+
+```bash
+docker run --rm -d --name eg-test-pg -p 5433:5432 \
+  -e POSTGRES_USER=test -e POSTGRES_PASSWORD=test -e POSTGRES_DB=eg_test \
+  postgres:16-alpine
+
+export EVALGUARD_TEST_POSTGRES_URL=postgresql+psycopg://test:test@localhost:5433/eg_test
+pytest tests/api/test_postgres.py
+```
+
+These tests verify Alembic applies cleanly, RLS is actually
+enabled (queries `pg_class.relrowsecurity`), and cross-tenant
+access is blocked at the DB layer in addition to the app layer.
 
 ## Persistence shape
 

@@ -13,27 +13,22 @@ up in API logs and audit dashboards.
 
 from __future__ import annotations
 
-import sqlite3
-
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy.engine import Connection
 
 from evalguard_api.auth import (
-    Principal, require_admin, require_org_member, require_principal,
+    Principal, require_org_member, require_principal,
 )
 from evalguard_api.db import (
-    connect, create_project_explicit, get_org, get_project_by_slug,
+    create_project_explicit, get_org, get_project_by_slug,
     list_projects_for_org,
 )
+from evalguard_api.deps import get_conn
 from evalguard_api.models import (
     ProjectCreate, ProjectList, ProjectOut,
 )
 
 router = APIRouter()
-
-
-def _conn(request: Request) -> sqlite3.Connection:
-    settings = request.app.state.settings
-    return connect(settings.sqlite_path or ":memory:")
 
 
 def _resolve_target_org(
@@ -63,31 +58,27 @@ def _resolve_target_org(
              status_code=status.HTTP_201_CREATED, tags=["projects"])
 def create(
     body: ProjectCreate,
-    request: Request,
     org_id: str | None = Query(default=None,
                                description="Admin-only: target a different org."),
+    conn: Connection = Depends(get_conn),
     principal: Principal = Depends(require_principal),
 ) -> ProjectOut:
     target_org = _resolve_target_org(principal, org_id)
     require_org_member(principal, target_org)
-    conn = _conn(request)
-    try:
-        if get_org(conn, target_org) is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Org {target_org!r} not found.",
-            )
-        if get_project_by_slug(conn, org_id=target_org, slug=body.slug) is not None:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"Project {body.slug!r} already exists in org {target_org!r}.",
-            )
-        row = create_project_explicit(
-            conn, org_id=target_org, slug=body.slug, name=body.name,
+    if get_org(conn, target_org) is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Org {target_org!r} not found.",
         )
-        return ProjectOut(**row)
-    finally:
-        conn.close()
+    if get_project_by_slug(conn, org_id=target_org, slug=body.slug) is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Project {body.slug!r} already exists in org {target_org!r}.",
+        )
+    row = create_project_explicit(
+        conn, org_id=target_org, slug=body.slug, name=body.name,
+    )
+    return ProjectOut(**row)
 
 
 # ---------------------------------------------------------------------------
@@ -96,17 +87,13 @@ def create(
 
 @router.get("/v1/projects", response_model=ProjectList, tags=["projects"])
 def list_(
-    request: Request,
     org_id: str | None = Query(default=None),
+    conn: Connection = Depends(get_conn),
     principal: Principal = Depends(require_principal),
 ) -> ProjectList:
     target_org = _resolve_target_org(principal, org_id)
-    conn = _conn(request)
-    try:
-        rows = list_projects_for_org(conn, target_org)
-        return ProjectList(projects=[ProjectOut(**r) for r in rows])
-    finally:
-        conn.close()
+    rows = list_projects_for_org(conn, target_org)
+    return ProjectList(projects=[ProjectOut(**r) for r in rows])
 
 
 # ---------------------------------------------------------------------------
@@ -116,23 +103,15 @@ def list_(
 @router.get("/v1/projects/{slug}", response_model=ProjectOut, tags=["projects"])
 def get(
     slug: str,
-    request: Request,
     org_id: str | None = Query(default=None),
+    conn: Connection = Depends(get_conn),
     principal: Principal = Depends(require_principal),
 ) -> ProjectOut:
     target_org = _resolve_target_org(principal, org_id)
-    conn = _conn(request)
-    try:
-        row = get_project_by_slug(conn, org_id=target_org, slug=slug)
-        if row is None:
-            # 404 (not 403) when slug doesn't exist in target org. The
-            # member-vs-admin distinction is enforced at the org level
-            # in ``_resolve_target_org`` so we won't reach here for an
-            # unauthorized cross-org probe.
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Project {slug!r} not found in org {target_org!r}.",
-            )
-        return ProjectOut(**row)
-    finally:
-        conn.close()
+    row = get_project_by_slug(conn, org_id=target_org, slug=slug)
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project {slug!r} not found in org {target_org!r}.",
+        )
+    return ProjectOut(**row)
