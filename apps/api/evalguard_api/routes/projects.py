@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.engine import Connection
+from sqlalchemy.exc import IntegrityError
 
 from evalguard_api.auth import (
     Principal, require_org_member, require_principal,
@@ -75,9 +76,19 @@ def create(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Project {body.slug!r} already exists in org {target_org!r}.",
         )
-    row = create_project_explicit(
-        conn, org_id=target_org, slug=body.slug, name=body.name,
-    )
+    try:
+        with conn.begin_nested():
+            row = create_project_explicit(
+                conn, org_id=target_org, slug=body.slug, name=body.name,
+            )
+    except IntegrityError:
+        # Concurrent admin POST raced us — the (org_id, slug) UNIQUE
+        # caught it. Translate to 409 (not the 500 the raw error
+        # would produce). Same pattern as orgs.create.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Project {body.slug!r} already exists in org {target_org!r}.",
+        )
     return ProjectOut(**row)
 
 

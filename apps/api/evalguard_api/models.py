@@ -55,29 +55,30 @@ class Score(_Strict):
 class Row(BaseModel):
     """``additionalProperties: true`` in the schema — clients can add
     domain-specific fields (RAG ``contexts``, text_to_sql
-    ``schema_ref``, etc.) without bumping the schema version."""
+    ``schema_ref``, etc.) without bumping the schema version.
+
+    Numeric constraints mirror ``$defs.row`` in
+    ``evalguard.run.schema.json`` — ``minimum: 0`` on the count
+    columns. Without these, an adversarial / buggy client could
+    push ``n_scores: -1`` and the JSON Schema would reject it
+    while Pydantic silently accepts.
+    """
 
     model_config = ConfigDict(extra="allow")
 
     row_id:     str
     passed:     bool
-    n_scores:   int = 0
+    n_scores:   int   = Field(default=0, ge=0)
     provider:   str | None = None
     model:      str | None = None
-    cost_usd:   float = 0.0
-    latency_ms: int = 0
-    cache_hit:  bool = False
+    cost_usd:   float = Field(default=0.0, ge=0)
+    latency_ms: int   = Field(default=0, ge=0)
+    cache_hit:  bool  = False
     tags:       list[str] = Field(default_factory=list)
     input:      Any = None
     expected:   Any = None
     output:     str | None = None
     scores:     list[Score] = Field(default_factory=list)
-
-
-class GateDetail(BaseModel):
-    """Gate details are polymorphic (absolute / relative / ttest /
-    custom_check / skip / config-error) — keep ``extra='allow'``."""
-    model_config = ConfigDict(extra="allow")
 
 
 class Gate(_Strict):
@@ -86,21 +87,27 @@ class Gate(_Strict):
     blocking:  bool | None = None
     passed:    bool
     layer:     int | None = Field(default=None, ge=1, le=5)
+    # ``details`` is intentionally polymorphic — gate detail shapes
+    # vary by threshold type (absolute / relative / ttest /
+    # custom_check / skip / config-error). Pinning a typed model
+    # would force every new threshold type to update Pydantic in
+    # lockstep; ``dict[str, Any]`` matches the JSON Schema's
+    # ``"items": {}`` and lets the gate engine evolve freely.
     details:   list[dict[str, Any]] = Field(default_factory=list)
 
 
 class Trial(_Strict):
-    trial_id:          str
+    trial_id:          str = Field(pattern=r"^trial_[a-z0-9]{8,}$")
     provider_id:       str
     provider:          str
     model:             str
     prompt_id:         str | None = None
     prompt_version_id: str | None = None
     config:            dict[str, Any] = Field(default_factory=dict)
-    row_count:         int = 0
-    row_pass_count:    int = 0
-    row_fail_count:    int = 0
-    cost_usd:          float = 0.0
+    row_count:         int   = Field(default=0, ge=0)
+    row_pass_count:    int   = Field(default=0, ge=0)
+    row_fail_count:    int   = Field(default=0, ge=0)
+    cost_usd:          float = Field(default=0.0, ge=0)
     status:            str | None = None
     gate_status:       str | None = None
     started_at:        str | None = None
@@ -171,17 +178,20 @@ class RunIngest(_Strict):
 
     schema_version: str = Field(pattern=r"^\d+\.\d+\.\d+$")
     run_id:         str = Field(pattern=r"^run_[a-z0-9]{8,}$")
-    project:        str
+    project:        str = Field(min_length=1, max_length=200)
     config_hash:    str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     status:         str | None = None
     row_status:     str | None = None
     gate_status:    str | None = None
     started_at:     str | None = None
     finished_at:    str | None = None
-    row_count:      int = 0
-    row_pass_count: int = 0
-    row_fail_count: int = 0
-    cost_usd:       float = 0.0
+    # ``ge=0`` constraints mirror the JSON Schema's ``minimum: 0``
+    # so a hostile client can't push negative counts that pass
+    # Pydantic but would fail downstream validators.
+    row_count:      int   = Field(default=0, ge=0)
+    row_pass_count: int   = Field(default=0, ge=0)
+    row_fail_count: int   = Field(default=0, ge=0)
+    cost_usd:       float = Field(default=0.0, ge=0)
     assets:         list[Asset] = Field(default_factory=list)
     trials:         list[Trial] = Field(default_factory=list)
     comparison:     Comparison | None = None

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.engine import Connection
+from sqlalchemy.exc import IntegrityError
 
 from evalguard_api.auth import (
     Principal, filter_orgs_visible_to, require_admin,
@@ -46,12 +47,23 @@ def create(
     principal: Principal = Depends(require_principal),
 ) -> OrgOut:
     require_admin(principal)
+    # Pre-check is the fast path; the savepoint+INSERT is the
+    # race-safe path. Without the savepoint, two concurrent admins
+    # both hitting the SELECT-miss window would both INSERT, and
+    # the second one's UNIQUE violation would surface as 500.
     if get_org_by_slug(conn, body.slug) is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Org slug {body.slug!r} already exists.",
         )
-    row = create_org(conn, slug=body.slug, name=body.name)
+    try:
+        with conn.begin_nested():
+            row = create_org(conn, slug=body.slug, name=body.name)
+    except IntegrityError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Org slug {body.slug!r} already exists.",
+        )
     return OrgOut(**row)
 
 

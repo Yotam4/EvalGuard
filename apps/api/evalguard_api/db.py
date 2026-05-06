@@ -40,6 +40,7 @@ from typing import Iterator, TYPE_CHECKING
 
 from sqlalchemy import Engine, create_engine, event, text
 from sqlalchemy.engine import Connection
+from sqlalchemy.exc import IntegrityError
 
 if TYPE_CHECKING:
     from evalguard_api.config import Settings
@@ -422,6 +423,18 @@ def upsert_project(
     random opaque id so two orgs may have a project with the same
     slug without colliding on the global PK.
 
+    Race-safe: under concurrent first-pushes to a brand-new
+    project, two transactions may both miss the ``SELECT`` and
+    race to ``INSERT``.  On Postgres the second one would hit the
+    ``UNIQUE(org_id, slug)`` constraint and surface as 500.  We
+    wrap the insert in a savepoint so a constraint violation can
+    be caught without poisoning the outer transaction, then refetch
+    the row the winning thread inserted.
+
+    SQLite serializes writes via its single-writer lock so this
+    race is theoretical there, but the savepoint adds only a tiny
+    overhead and keeps the code one path.
+
     Returns ``project_id``.
     """
     row = conn.execute(
@@ -431,14 +444,29 @@ def upsert_project(
     if row is not None:
         return row[0]
     project_id = "proj_" + secrets.token_hex(8)
-    conn.execute(
-        text("INSERT INTO projects(project_id, org_id, slug, name, created_at) "
-             "VALUES (:project_id, :org_id, :slug, :name, :created_at)"),
-        {"project_id": project_id, "org_id": org_id,
-         "slug": project_name, "name": project_name,
-         "created_at": now_iso()},
-    )
-    return project_id
+    try:
+        with conn.begin_nested():
+            conn.execute(
+                text("INSERT INTO projects(project_id, org_id, slug, name, created_at) "
+                     "VALUES (:project_id, :org_id, :slug, :name, :created_at)"),
+                {"project_id": project_id, "org_id": org_id,
+                 "slug": project_name, "name": project_name,
+                 "created_at": now_iso()},
+            )
+        return project_id
+    except IntegrityError:
+        # Concurrent first-push raced us — the other transaction
+        # inserted the same (org_id, slug) and the savepoint
+        # rolled back ours. Refetch to get the winning project_id.
+        winning = conn.execute(
+            text("SELECT project_id FROM projects WHERE org_id=:org AND slug=:slug"),
+            {"org": org_id, "slug": project_name},
+        ).fetchone()
+        if winning is None:
+            # Genuinely something else (e.g., a different constraint
+            # violation) — re-raise so the caller surfaces it.
+            raise
+        return winning[0]
 
 
 def create_project_explicit(

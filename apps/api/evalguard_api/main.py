@@ -22,8 +22,9 @@ from pathlib import Path
 
 from alembic import command as alembic_command
 from alembic.config import Config as AlembicConfig
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from evalguard_api.config import Settings, load_settings
 from evalguard_api.db import (
@@ -64,6 +65,19 @@ async def lifespan(app: FastAPI):
         logger.warning(
             "EvalGuard API starting in OPEN mode — no API key configured. "
             "Do NOT expose this server beyond local dev."
+        )
+    elif "*" in settings.cors_origins:
+        # Auth is on but CORS is wide open — a browser at any origin
+        # can land a tab at the API with the user's bearer token in
+        # localStorage and have free reign. This is the default
+        # because dev convenience matters more than the warning, but
+        # production deployments should set EVALGUARD_CORS_ORIGINS
+        # to an explicit allowlist.
+        logger.warning(
+            "EvalGuard API CORS is wide open ('*'). "
+            "Set EVALGUARD_CORS_ORIGINS to a comma-separated allowlist "
+            "(e.g. 'https://app.example.com') before exposing the "
+            "server to a browser-reachable network."
         )
 
     # 1. Build the engine. The same engine is used by every route
@@ -145,6 +159,39 @@ def build_app(settings: Settings | None = None) -> FastAPI:
         allow_headers=["authorization", "content-type"],
         allow_credentials=False,
     )
+
+    # Reject oversize bodies BEFORE Pydantic parses them — a 1 GB
+    # POST would otherwise sit in memory while we marshal a 422.
+    # We only check the advertised ``Content-Length``; chunked
+    # uploads without a length header bypass this check, but every
+    # plausible client (httpx, curl, requests, urllib) sends a
+    # length on POST bodies.
+    @app.middleware("http")
+    async def _enforce_max_body(request: Request, call_next):
+        cl = request.headers.get("content-length")
+        if cl is not None:
+            try:
+                length = int(cl)
+            except ValueError:
+                return JSONResponse(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    content={"detail": "Invalid Content-Length header."},
+                )
+            if length > settings.max_request_bytes:
+                return JSONResponse(
+                    # Starlette renamed the constant in 0.40 ish;
+                    # use the literal status code so we work across
+                    # versions without conditional imports.
+                    status_code=413,
+                    content={
+                        "detail":
+                            f"Request body {length} bytes exceeds the "
+                            f"{settings.max_request_bytes}-byte limit. Set "
+                            f"EVALGUARD_MAX_REQUEST_BYTES higher to allow "
+                            f"larger ingests, or split the run."
+                    },
+                )
+        return await call_next(request)
     app.include_router(health_router)
     app.include_router(orgs_router)
     app.include_router(projects_router)

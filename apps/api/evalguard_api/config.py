@@ -30,6 +30,12 @@ class Settings:
     # Bind
     bind_host: str = "127.0.0.1"
     bind_port: int = 8787
+    # Maximum size of an inbound request body, in bytes. Defends
+    # against adversarial / buggy clients pushing multi-GB payloads
+    # that would OOM a worker. A real run with 10k rows and full
+    # audit events tops out around ~50 MB; the default leaves
+    # headroom while still rejecting obvious abuse.
+    max_request_bytes: int = 100 * 1024 * 1024  # 100 MB
 
     @property
     def is_open_mode(self) -> bool:
@@ -68,4 +74,6 @@ def load_settings() -> Settings:
         cors_origins=_split_csv(os.environ.get("EVALGUARD_CORS_ORIGINS", "*")) or ("*",),
         bind_host=os.environ.get("EVALGUARD_HOST", Settings.bind_host),
         bind_port=int(os.environ.get("EVALGUARD_PORT", Settings.bind_port)),
+        max_request_bytes=int(os.environ.get("EVALGUARD_MAX_REQUEST_BYTES",
+                                              Settings.max_request_bytes)),
     )

@@ -127,7 +127,11 @@ def require_principal(
     return Principal(
         key_id=key_row["key_id"],
         org_id=key_row["org_id"],
-        scopes=tuple(s for s in key_row["scopes_csv"].split(",") if s),
+        # Strip on read AND filter empties — symmetric with the
+        # write path in db.create_api_key, which strips before
+        # joining. Defends against hand-edited CSVs that include
+        # accidental whitespace.
+        scopes=tuple(s.strip() for s in key_row["scopes_csv"].split(",") if s.strip()),
         is_open_mode=False,
     )
 

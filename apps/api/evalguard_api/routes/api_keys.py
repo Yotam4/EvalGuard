@@ -40,7 +40,7 @@ def _to_summary(row: dict) -> ApiKeySummary:
         org_id=row["org_id"],
         prefix=row["prefix"],
         name=row["name"],
-        scopes=[s for s in row["scopes_csv"].split(",") if s],
+        scopes=[s.strip() for s in row["scopes_csv"].split(",") if s.strip()],
         created_at=row["created_at"],
         revoked_at=row.get("revoked_at"),
         last_used_at=row.get("last_used_at"),
