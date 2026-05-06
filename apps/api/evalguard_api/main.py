@@ -27,8 +27,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from evalguard_api.config import Settings, load_settings
 from evalguard_api.db import (
-    create_api_key, ensure_default_tenancy, find_key_by_hash,
-    hash_token, make_engine,
+    apply_admin_rls_context, create_api_key, ensure_default_tenancy,
+    hash_token, key_hash_exists, make_engine,
 )
 from evalguard_api.routes.api_keys import router as api_keys_router
 from evalguard_api.routes.health import router as health_router
@@ -77,15 +77,28 @@ async def lifespan(app: FastAPI):
     alembic_command.upgrade(_alembic_config(settings.database_url), "head")
 
     # 3. Default org / project + admin-key bootstrap.
+    #
+    # The lifespan transaction needs to bypass RLS — it's writing to
+    # ``orgs`` / ``projects`` / ``api_keys`` BEFORE any user request,
+    # so there's no caller-org to scope to. Admin context lets the
+    # writes through; per-request transactions in ``deps.get_conn``
+    # supersede it with the actual principal.
     with engine.begin() as conn:
+        apply_admin_rls_context(conn)
         org_id, _ = ensure_default_tenancy(
             conn,
             org_slug=settings.default_org_slug,
             project_slug=settings.default_project_slug,
         )
         if settings.api_key:
-            existing = find_key_by_hash(conn, hash_token(settings.api_key))
-            if existing is None:
+            # Existence check ignores revoked_at — if an operator
+            # revoked the env-bootstrap key, restarting the server
+            # must not silently re-create it (the UNIQUE constraint
+            # on hashed_key would crash the lifespan, AND the
+            # operator's revocation intent would be undone). To
+            # rotate, either set EVALGUARD_API_KEY to a fresh value
+            # or manually delete the old row.
+            if not key_hash_exists(conn, hash_token(settings.api_key)):
                 create_api_key(
                     conn,
                     org_id=org_id,

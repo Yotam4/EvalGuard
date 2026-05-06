@@ -79,9 +79,18 @@ def get(
     conn: Connection = Depends(get_conn),
     principal: Principal = Depends(require_principal),
 ) -> OrgOut:
-    require_org_member(principal, org_id)
+    """Fetch an org by id.
+
+    Non-members get **404**, not 403 — exposing the existence of an
+    org you can't see leaks information across tenants. A non-member
+    asking for an extant foreign org gets the same response as if
+    the slug never existed.  Mirrors the cross-org behaviour on
+    ``GET /v1/runs/{run_id}``.
+    """
     row = get_org(conn, org_id)
-    if row is None:
+    if row is None or (
+        not principal.is_admin and row["org_id"] != principal.org_id
+    ):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Org {org_id!r} not found.",

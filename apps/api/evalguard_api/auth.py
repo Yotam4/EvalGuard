@@ -28,7 +28,9 @@ from typing import Iterable
 from fastapi import Header, HTTPException, Request, status
 
 from evalguard_api.config import Settings
-from evalguard_api.db import find_key_by_hash, hash_token
+from evalguard_api.db import (
+    apply_admin_rls_context, find_key_by_hash, hash_token,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -107,8 +109,17 @@ def require_principal(
     # Hash and look up via the per-app engine. ``find_key_by_hash``
     # filters out revoked keys; ``last_used_at`` is touched as a
     # side effect so an operator can see live keys.
+    #
+    # On Postgres with RLS enabled (Phase 2.5b migration 0002), the
+    # ``api_keys`` table is policy-protected so a query without
+    # ``app.org_id`` / ``app.is_admin`` set sees zero rows — meaning
+    # auth would always fail.  ``apply_admin_rls_context`` bypasses
+    # the policies for this single internal lookup; the actual
+    # caller-scoped context is set in ``deps.get_conn`` for the
+    # request transaction that follows.
     engine = request.app.state.engine
     with engine.begin() as conn:
+        apply_admin_rls_context(conn)
         key_row = find_key_by_hash(conn, hash_token(token))
     if key_row is None:
         _challenge("Invalid or revoked API key.")

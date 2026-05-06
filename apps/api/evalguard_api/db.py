@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, TYPE_CHECKING
 
-from sqlalchemy import Engine, create_engine, text
+from sqlalchemy import Engine, create_engine, event, text
 from sqlalchemy.engine import Connection
 
 if TYPE_CHECKING:
@@ -71,14 +71,27 @@ def make_engine(settings: "Settings") -> Engine:
             # connection pool — the pool serializes per-connection use.
             connect_args={"check_same_thread": False, "timeout": 30.0},
         )
-        # WAL + synchronous=NORMAL on every new connection. Pragmas
-        # are per-connection on SQLite; the pool may hand the same
-        # connection out repeatedly, so once-set is enough but
-        # idempotent re-application costs nothing.
-        with engine.begin() as conn:
-            conn.execute(text("PRAGMA journal_mode=WAL"))
-            conn.execute(text("PRAGMA synchronous=NORMAL"))
-            conn.execute(text("PRAGMA foreign_keys=ON"))
+        # PRAGMAs need to fire on *every* new pool connection, not
+        # just the initial setup one — ``foreign_keys`` and
+        # ``synchronous`` are connection-local. Without this, FK
+        # enforcement (and the ON DELETE CASCADE chains the schema
+        # declares) silently turns off on the second concurrent
+        # request — verified empirically before this fix landed.
+        #
+        # ``engine.pool`` is the correct target for the ``connect``
+        # event in SQLAlchemy 2.0. Engine-level registration looks
+        # the same in the docs but doesn't reliably forward in 2.0+
+        # (verified by inspecting ``engine.dispatch.connect`` — the
+        # attribute doesn't exist).
+        @event.listens_for(engine.pool, "connect")
+        def _set_sqlite_pragmas(dbapi_conn, _connection_record):
+            cur = dbapi_conn.cursor()
+            try:
+                cur.execute("PRAGMA journal_mode=WAL")
+                cur.execute("PRAGMA synchronous=NORMAL")
+                cur.execute("PRAGMA foreign_keys=ON")
+            finally:
+                cur.close()
         return engine
     # Postgres / anything-SQLAlchemy-supports.
     return create_engine(url, future=True)
@@ -140,6 +153,36 @@ def apply_rls_context(conn: Connection, *, org_id: str, is_admin: bool) -> None:
         text("SELECT set_config('app.is_admin', :v, true)"),
         {"v": "1" if is_admin else "0"},
     )
+
+
+def apply_admin_rls_context(conn: Connection) -> None:
+    """Server-internal RLS bypass — sets ``app.is_admin = '1'`` so
+    ``0002_rls_policies`` lets the transaction see all rows.
+
+    Used by:
+
+    1. ``auth.require_principal`` — the token-lookup query against
+       ``api_keys`` must succeed before we know which org the caller
+       is in. Without this, the lookup runs with the GUC unset; on
+       Postgres ``current_setting('app.org_id', true)`` returns NULL
+       and every row is filtered out, so authentication always
+       fails.
+    2. ``main.lifespan`` — schema bootstrap (default org / project /
+       admin key) runs before any user request, so there's no
+       caller-org to scope to. The lifespan needs unrestricted
+       writes to provision the tenancy.
+
+    The dependency that wraps user requests
+    (``deps.get_conn`` → ``apply_rls_context``) supersedes this
+    setting per-transaction with the actual caller context, so
+    request handlers never run as unconstrained admin.
+    """
+    if conn.engine.dialect.name != "postgresql":
+        return
+    # ``app.org_id`` still gets set (even though admin bypasses) so
+    # the policy expression doesn't dereference a NULL GUC.
+    conn.execute(text("SELECT set_config('app.org_id', '_system_', true)"))
+    conn.execute(text("SELECT set_config('app.is_admin', '1', true)"))
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +286,22 @@ def find_key_by_hash(conn: Connection, hashed: str) -> dict | None:
         {"t": now_iso(), "k": row["key_id"]},
     )
     return dict(row)
+
+
+def key_hash_exists(conn: Connection, hashed: str) -> bool:
+    """Existence check that ignores revocation. Used by the lifespan
+    bootstrap so re-startups after a revoked env-bootstrap key don't
+    crash on the UNIQUE constraint when trying to re-insert.
+
+    Operator semantics: revoking the env-key is permanent until the
+    operator either rotates ``EVALGUARD_API_KEY`` to a new value or
+    manually deletes the row. Mirrors how every secrets manager
+    treats a revoked key — once revoked, that secret is dead."""
+    row = conn.execute(
+        text("SELECT 1 FROM api_keys WHERE hashed_key=:h"),
+        {"h": hashed},
+    ).fetchone()
+    return row is not None
 
 
 def create_api_key(
