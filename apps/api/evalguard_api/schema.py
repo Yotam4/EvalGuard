@@ -97,8 +97,13 @@ runs = Table(
     Column("payload_json",   Text, nullable=False),
     Column("ingested_at",    Text, nullable=False),
     Column("ingested_by",    Text),
+    # 'cli' for runs pushed via ``evalguard push``; 'otlp' for runs
+    # synthesized from OpenTelemetry GenAI traces. Used by the UI
+    # to surface a source badge without joining into payload_json.
+    Column("source",         Text, nullable=False, server_default="cli"),
     Index("idx_runs_project", "project_id", "ingested_at"),
     Index("idx_runs_status",  "status"),
+    Index("idx_runs_source",  "source"),
 )
 
 trials = Table(

@@ -120,5 +120,7 @@ def test_alembic_version_recorded(client):
     engine = client.app.state.engine
     with engine.connect() as conn:
         ver = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-    # Head is 0002_rls_policies (no-op on sqlite, but still applied).
-    assert ver == "0002_rls_policies"
+    # Head bumps as we ship migrations. ``0003_runs_source`` adds the
+    # ingest-source column for Phase 3a (OTLP ingest); future
+    # migrations will keep moving this assertion forward.
+    assert ver == "0003_runs_source"

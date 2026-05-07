@@ -1,0 +1,302 @@
+"""``POST /v1/otlp/v1/traces`` — OTLP/HTTP JSON ingest of GenAI spans.
+
+Tests use the standard OTLP/HTTP JSON shape that any OTel SDK (or
+the OTel collector) would send. The parser is exercised in
+isolation; the route is exercised via TestClient against a real
+in-memory app + Alembic-migrated DB.
+"""
+
+from __future__ import annotations
+
+
+# ---------------------------------------------------------------------------
+# Synthetic OTLP payload helpers — match the OTLP/HTTP JSON shape
+# (proto-to-JSON mapping rules: int64 fields are JSON strings;
+# attribute values use the AnyValue tagged union).
+
+
+def _str_attr(key: str, value: str) -> dict:
+    return {"key": key, "value": {"stringValue": value}}
+
+
+def _int_attr(key: str, value: int) -> dict:
+    # OTLP/HTTP JSON renders int64 as a string to dodge ECMAScript's
+    # 2^53 limit; the parser must accept that form.
+    return {"key": key, "value": {"intValue": str(value)}}
+
+
+def _gen_ai_span(span_id: str, *, model="gpt-4o-mini", error=False, prompt=None, completion=None) -> dict:
+    attrs = [
+        _str_attr("gen_ai.system", "openai"),
+        _str_attr("gen_ai.request.model", model),
+        _str_attr("gen_ai.response.model", model),
+        _int_attr("gen_ai.usage.input_tokens", 12),
+        _int_attr("gen_ai.usage.output_tokens", 34),
+        _str_attr("gen_ai.operation.name", "chat"),
+    ]
+    if prompt is not None:
+        attrs.append(_str_attr("gen_ai.prompt.0.role", "user"))
+        attrs.append(_str_attr("gen_ai.prompt.0.content", prompt))
+    if completion is not None:
+        attrs.append(_str_attr("gen_ai.completion.0.role", "assistant"))
+        attrs.append(_str_attr("gen_ai.completion.0.content", completion))
+    return {
+        "traceId":          "abcdef0123456789abcdef0123456789",
+        "spanId":            span_id,
+        "name":              "chat openai gpt-4o-mini",
+        "kind":              2,            # CLIENT
+        "startTimeUnixNano": "1700000000000000000",
+        "endTimeUnixNano":   "1700000000123000000",  # 123 ms
+        "attributes":        attrs,
+        "status":            {"code": 2 if error else 1},
+    }
+
+
+def _resource_spans(service_name: str, *spans: dict) -> dict:
+    return {
+        "resource": {
+            "attributes": [_str_attr("service.name", service_name)],
+        },
+        "scopeSpans": [
+            {
+                "scope": {"name": "openai-instrumentor", "version": "0.1.0"},
+                "spans": list(spans),
+            },
+        ],
+    }
+
+
+def _otlp_body(*resource_spans: dict) -> dict:
+    return {"resourceSpans": list(resource_spans)}
+
+
+# ---------------------------------------------------------------------------
+# Route smoke
+
+
+def test_otlp_ingest_returns_otlp_shaped_response(client, auth_headers):
+    body = _otlp_body(_resource_spans(
+        "rag-service",
+        _gen_ai_span("span0001", prompt="What is X?", completion="X is ..."),
+    ))
+    r = client.post("/v1/otlp/v1/traces", json=body, headers=auth_headers)
+    assert r.status_code == 200, r.text
+    j = r.json()
+    # OTLP/HTTP success spec — empty partialSuccess.
+    assert j["partialSuccess"] == {}
+    # Our debugging envelope.
+    assert j["evalguard"]["accepted_runs"] == 1
+
+
+def test_otlp_ingest_requires_auth(client):
+    body = _otlp_body(_resource_spans("svc", _gen_ai_span("s")))
+    r = client.post("/v1/otlp/v1/traces", json=body)
+    assert r.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: ingest then read back via /v1/runs
+
+
+def test_otlp_run_appears_in_runs_list_with_otlp_source(client, auth_headers):
+    body = _otlp_body(_resource_spans(
+        "rag-service",
+        _gen_ai_span("span0001", prompt="Q1", completion="A1"),
+        _gen_ai_span("span0002", prompt="Q2", completion="A2"),
+    ))
+    client.post("/v1/otlp/v1/traces", json=body, headers=auth_headers)
+
+    r = client.get("/v1/runs", headers=auth_headers)
+    assert r.status_code == 200
+    runs = r.json()["runs"]
+    # Filter to OTLP-sourced runs (the conftest may push CLI runs too).
+    otlp = [x for x in runs if x["source"] == "otlp"]
+    assert len(otlp) == 1
+    run = otlp[0]
+    assert run["run_id"].startswith("run_otlp_")
+    assert run["project"] == "rag-service"
+    assert run["row_count"] == 2
+    assert run["row_pass_count"] == 2
+    assert run["status"] == "passed"
+
+
+def test_otlp_run_detail_carries_synthesized_trial(client, auth_headers):
+    body = _otlp_body(_resource_spans(
+        "rag-service",
+        _gen_ai_span("span0001", prompt="What is the capital of France?", completion="Paris."),
+    ))
+    post = client.post("/v1/otlp/v1/traces", json=body, headers=auth_headers)
+    assert post.status_code == 200
+    # The runs endpoint surfaces ``run_id``s; OTLP-derived ones are
+    # named ``run_otlp_*``.
+    listing = client.get("/v1/runs", headers=auth_headers).json()
+    run_id = next(r["run_id"] for r in listing["runs"] if r["source"] == "otlp")
+
+    detail = client.get(f"/v1/runs/{run_id}", headers=auth_headers)
+    assert detail.status_code == 200
+    body = detail.json()
+    assert body["project"] == "rag-service"
+    assert len(body["trials"]) == 1
+    trial = body["trials"][0]
+    # Provider/model survive the round-trip via the synthesized trial.
+    assert trial["provider"] == "openai"
+    assert trial["model"]    == "gpt-4o-mini"
+    [row] = trial["rows"]
+    assert row["passed"] is True
+    assert row["latency_ms"] == 123  # endTimeUnixNano - startTimeUnixNano
+    # The actual prompt / completion text rides on input / output.
+    assert row["input"]  == "What is the capital of France?"
+    assert row["output"] == "Paris."
+
+
+# ---------------------------------------------------------------------------
+# Error handling
+
+
+def test_otlp_status_error_marks_row_failed(client, auth_headers):
+    body = _otlp_body(_resource_spans(
+        "rag-service",
+        _gen_ai_span("span0001", error=True),
+    ))
+    client.post("/v1/otlp/v1/traces", json=body, headers=auth_headers)
+    runs = client.get("/v1/runs", headers=auth_headers).json()["runs"]
+    otlp_run = next(r for r in runs if r["source"] == "otlp")
+    assert otlp_run["status"] == "failed"
+    assert otlp_run["row_fail_count"] == 1
+
+
+def test_otlp_skips_non_genai_spans(client, auth_headers):
+    """A trace that mixes GenAI spans with database / HTTP spans
+    must NOT generate rows for the non-GenAI ones."""
+    body = _otlp_body(_resource_spans(
+        "rag-service",
+        _gen_ai_span("span0001"),
+        # A non-GenAI span (e.g., db query) — no gen_ai.* attributes.
+        {
+            "traceId":           "abcdef0123456789abcdef0123456789",
+            "spanId":            "spannogenai00000",
+            "name":              "SELECT users",
+            "kind":              3,
+            "startTimeUnixNano": "1700000000000000000",
+            "endTimeUnixNano":   "1700000000050000000",
+            "attributes":        [_str_attr("db.system", "postgresql")],
+            "status":            {"code": 1},
+        },
+    ))
+    client.post("/v1/otlp/v1/traces", json=body, headers=auth_headers)
+    runs = client.get("/v1/runs", headers=auth_headers).json()["runs"]
+    otlp_run = next(r for r in runs if r["source"] == "otlp")
+    assert otlp_run["row_count"] == 1
+
+
+def test_otlp_no_genai_spans_returns_zero_accepted(client, auth_headers):
+    """Posting a trace with no GenAI spans is a no-op — 200, but
+    no run is created. The OTel collector treats this as success."""
+    body = _otlp_body(_resource_spans(
+        "rag-service",
+        {
+            "traceId":           "abcdef0123456789abcdef0123456789",
+            "spanId":            "spannogenai00000",
+            "name":              "SELECT users",
+            "kind":              3,
+            "startTimeUnixNano": "1700000000000000000",
+            "endTimeUnixNano":   "1700000000050000000",
+            "attributes":        [_str_attr("db.system", "postgresql")],
+            "status":            {"code": 1},
+        },
+    ))
+    r = client.post("/v1/otlp/v1/traces", json=body, headers=auth_headers)
+    assert r.status_code == 200
+    assert r.json()["evalguard"]["accepted_runs"] == 0
+
+
+def test_otlp_rejects_malformed_json(client, auth_headers):
+    r = client.post(
+        "/v1/otlp/v1/traces",
+        content=b"not json",
+        headers={**auth_headers, "content-type": "application/json"},
+    )
+    assert r.status_code == 400
+
+
+def test_otlp_rejects_resource_spans_not_an_array(client, auth_headers):
+    r = client.post(
+        "/v1/otlp/v1/traces",
+        json={"resourceSpans": "not an array"},
+        headers=auth_headers,
+    )
+    assert r.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Project routing via ``service.name``
+
+
+def test_otlp_uses_service_name_as_project(client, auth_headers):
+    body = _otlp_body(_resource_spans(
+        "checkout-service",
+        _gen_ai_span("span0001"),
+    ))
+    client.post("/v1/otlp/v1/traces", json=body, headers=auth_headers)
+    runs = client.get("/v1/runs", headers=auth_headers).json()["runs"]
+    assert any(r["project"] == "checkout-service" for r in runs)
+
+
+def test_otlp_evalguard_project_attr_overrides_service_name(client, auth_headers):
+    """``evalguard.project`` resource attribute lets a user route a
+    trace to a project name distinct from ``service.name`` — useful
+    when one service runs evals for many products."""
+    body = {
+        "resourceSpans": [
+            {
+                "resource": {
+                    "attributes": [
+                        _str_attr("service.name",       "ml-platform"),
+                        _str_attr("evalguard.project", "summarizer-v2"),
+                    ],
+                },
+                "scopeSpans": [
+                    {
+                        "scope": {"name": "x"},
+                        "spans": [_gen_ai_span("span0001")],
+                    },
+                ],
+            },
+        ],
+    }
+    client.post("/v1/otlp/v1/traces", json=body, headers=auth_headers)
+    runs = client.get("/v1/runs", headers=auth_headers).json()["runs"]
+    projects = {r["project"] for r in runs if r["source"] == "otlp"}
+    assert "summarizer-v2" in projects
+    assert "ml-platform" not in projects
+
+
+# ---------------------------------------------------------------------------
+# Cross-org isolation — same contract as /v1/runs
+
+
+def test_otlp_lands_in_callers_org_only(
+    client, auth_headers, make_org, make_member_token,
+):
+    make_org("acme")
+    member_default = make_member_token("org_default", name="d")
+    member_acme    = make_member_token("org_acme",    name="a")
+
+    body = _otlp_body(_resource_spans("rag", _gen_ai_span("span0001")))
+    client.post(
+        "/v1/otlp/v1/traces", json=body,
+        headers={"Authorization": f"Bearer {member_acme}"},
+    )
+
+    # Member of org_default must NOT see the OTLP run from org_acme.
+    runs = client.get(
+        "/v1/runs",
+        headers={"Authorization": f"Bearer {member_default}"},
+    ).json()["runs"]
+    assert all(r["source"] != "otlp" for r in runs)
+    # The acme member sees their own run.
+    runs2 = client.get(
+        "/v1/runs",
+        headers={"Authorization": f"Bearer {member_acme}"},
+    ).json()["runs"]
+    assert any(r["source"] == "otlp" for r in runs2)

@@ -75,6 +75,7 @@ function RunsTable({ runs }: { runs: RunSummary[] }) {
             <Th>Gates</Th>
             <Th align="right">Pass / total</Th>
             <Th align="right">Cost</Th>
+            <Th>Source</Th>
             <Th>Ingested</Th>
           </tr>
         </thead>
@@ -102,6 +103,11 @@ function RunsTable({ runs }: { runs: RunSummary[] }) {
               </Td>
               <Td align="right">
                 <span className="font-mono text-xs">${r.cost_usd.toFixed(4)}</span>
+              </Td>
+              <Td>
+                <Badge tone={r.source === "otlp" ? "info" : "muted"}>
+                  {r.source}
+                </Badge>
               </Td>
               <Td>
                 <span className="text-xs text-[var(--color-fg-muted)]" title={r.ingested_by ?? ""}>

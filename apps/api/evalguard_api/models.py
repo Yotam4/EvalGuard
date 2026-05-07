@@ -230,6 +230,10 @@ class RunSummary(_Loose):
     row_pass_count: int = 0
     row_fail_count: int = 0
     cost_usd:      float = 0.0
+    # Phase 3a: which ingest path produced this row. "cli" = pushed
+    # via ``evalguard push``, "otlp" = synthesized from a posted
+    # OTLP trace.  Default to "cli" for legacy rows.
+    source:        str = "cli"
     ingested_at:   str | None = None
     ingested_by:   str | None = None
 

@@ -97,6 +97,8 @@ export interface RunSummary {
   cost_usd: number;
   ingested_at: string | null;
   ingested_by: string | null;
+  /** Phase 3a: which ingest path produced this row. */
+  source: "cli" | "otlp";
 }
 
 export interface RunListResponse {

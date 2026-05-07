@@ -117,7 +117,7 @@ def list_runs(
         f"""SELECT run_id, project_name AS project, status, gate_status,
                    started_at, finished_at,
                    row_count, row_pass_count, row_fail_count, cost_usd,
-                   ingested_at, ingested_by
+                   ingested_at, ingested_by, source
             FROM runs
             {where}
             ORDER BY ingested_at DESC
@@ -184,6 +184,7 @@ def _persist_run(
     payload: dict,
     project_id: str,
     principal: Principal,
+    source: str = "cli",
 ) -> None:
     """Write the run header + denormalized trial / row / gate / asset /
     event rows. Caller's transaction wraps the whole thing; on any
@@ -193,6 +194,10 @@ def _persist_run(
     Mirrors the CLI's ``serializer.run_to_dict`` shape 1:1 — any drift
     in input shape is caught by Pydantic upstream of this call, so
     here we trust the payload structure.
+
+    ``source`` records which ingest path produced this row: ``'cli'``
+    for ``evalguard push`` or ``'otlp'`` for OTLP-trace synthesis.
+    The UI surfaces it as a badge.
     """
     run_id = payload["run_id"]
     conn.execute(
@@ -201,13 +206,13 @@ def _persist_run(
                   status, row_status, gate_status,
                   started_at, finished_at,
                   cost_usd, row_count, row_pass_count, row_fail_count,
-                  payload_json, ingested_at, ingested_by)
+                  payload_json, ingested_at, ingested_by, source)
                 VALUES (
                   :run_id, :project_id, :project_name, :config_hash,
                   :status, :row_status, :gate_status,
                   :started_at, :finished_at,
                   :cost_usd, :row_count, :row_pass_count, :row_fail_count,
-                  :payload_json, :ingested_at, :ingested_by)"""),
+                  :payload_json, :ingested_at, :ingested_by, :source)"""),
         {
             "run_id":         run_id,
             "project_id":     project_id,
@@ -225,6 +230,7 @@ def _persist_run(
             "payload_json":   json.dumps(payload, default=str),
             "ingested_at":    now_iso(),
             "ingested_by":    principal.key_id,
+            "source":         source,
         },
     )
 
