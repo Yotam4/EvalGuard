@@ -220,6 +220,56 @@ def build_app(settings: Settings | None = None) -> FastAPI:
     # uploads without a length header bypass this check, but every
     # plausible client (httpx, curl, requests, urllib) sends a
     # length on POST bodies.
+    # Structured access log: one JSON line per response. Required
+    # for SOC 2 / ISO 27001 — the audit trail needs to know which
+    # api_key called which route with what outcome and how long it
+    # took. ``key_id`` is populated by ``require_principal`` setting
+    # ``request.state.principal`` (when auth ran); for unauthenticated
+    # paths (``/v1/health``) the field is omitted.
+    @app.middleware("http")
+    async def _access_log(request: Request, call_next):
+        import json as _json
+        import time as _time
+        t0 = _time.monotonic()
+        # Read these BEFORE call_next — once the response is returned
+        # the request scope may have been consumed.
+        method = request.method
+        # Use the matched route's path template (``/v1/runs/{run_id}``)
+        # rather than the literal URL so logs aggregate cleanly. Fall
+        # back to the raw path if the router hasn't matched yet.
+        try:
+            response = await call_next(request)
+        except Exception:
+            elapsed_ms = int((_time.monotonic() - t0) * 1000)
+            principal = getattr(request.state, "principal", None)
+            entry = {
+                "evt":         "http.request",
+                "method":      method,
+                "path":        request.url.path,
+                "status":      500,
+                "duration_ms": elapsed_ms,
+                "key_id":      getattr(principal, "key_id", None),
+                "org_id":      getattr(principal, "org_id", None),
+                "exception":   True,
+            }
+            logger.info(_json.dumps({k: v for k, v in entry.items() if v is not None}))
+            raise
+        elapsed_ms = int((_time.monotonic() - t0) * 1000)
+        principal = getattr(request.state, "principal", None)
+        route = request.scope.get("route")
+        path_template = getattr(route, "path", None) or request.url.path
+        entry = {
+            "evt":         "http.request",
+            "method":      method,
+            "path":        path_template,
+            "status":      response.status_code,
+            "duration_ms": elapsed_ms,
+            "key_id":      getattr(principal, "key_id", None),
+            "org_id":      getattr(principal, "org_id", None),
+        }
+        logger.info(_json.dumps({k: v for k, v in entry.items() if v is not None}))
+        return response
+
     @app.middleware("http")
     async def _enforce_max_body(request: Request, call_next):
         cl = request.headers.get("content-length")

@@ -193,6 +193,16 @@ def get_run(
         "ingested_by": row["ingested_by"],
         "project_id":  row["project_id"],
     }
+    # E.4 — recompute ``audit.event_count`` from ``len(events)`` on
+    # read instead of trusting whatever the client wrote at ingest.
+    # The chain hash is the actual tamper-evidence; the count is for
+    # operator quick-look. Recomputing here means a malicious client
+    # that lied about the count can't surface that lie via GET.
+    audit = payload.get("audit")
+    if isinstance(audit, dict):
+        events = audit.get("events")
+        if isinstance(events, list):
+            audit["event_count"] = len(events)
     return RunOut.model_validate(payload)
 
 

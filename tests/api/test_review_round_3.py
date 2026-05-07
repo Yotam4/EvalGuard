@@ -249,3 +249,105 @@ def test_lifespan_takes_advisory_lock_on_postgres():
     src = Path(__file__).resolve().parents[2] / "apps" / "api" / "evalguard_api" / "main.py"
     body = src.read_text()
     assert "pg_advisory_xact_lock" in body
+
+
+# ---------------------------------------------------------------------------
+# E.1 — api_keys serialization never leaks ``hashed_key``
+
+
+def test_api_key_response_body_never_contains_hashed_key(client, auth_headers):
+    """The DB row carries ``hashed_key`` but the API contract is to
+    project through ``ApiKeySummary`` which omits it. Guard against a
+    future refactor that swaps ``_to_summary`` for ``dict(row)`` (and
+    silently exposes the hash) by asserting on the raw response text
+    — every endpoint that touches an api_key must strip it."""
+    create_resp = client.post(
+        "/v1/orgs/org_default/api_keys",
+        json={"name": "leak-test"},
+        headers=auth_headers,
+    )
+    assert create_resp.status_code == 201
+    list_resp = client.get(
+        "/v1/orgs/org_default/api_keys", headers=auth_headers,
+    )
+    assert list_resp.status_code == 200
+    for resp in (create_resp, list_resp):
+        body = resp.text
+        # The literal field name must never appear; this catches both
+        # ``"hashed_key": "..."`` and ``hashed_key=...`` shapes.
+        assert "hashed_key" not in body, (
+            f"api_keys response leaked the hashed_key field: {body[:400]}"
+        )
+        assert "hashed_key" not in body.lower()
+
+
+# ---------------------------------------------------------------------------
+# E.4 — server recomputes audit.event_count on read
+
+
+def test_get_run_recomputes_audit_event_count(client, auth_headers):
+    """E.4: a hostile / buggy client can write an audit.event_count
+    that disagrees with len(audit.events). The GET path MUST recompute
+    so a downstream consumer can trust the count."""
+    payload = {
+        "schema_version": "1.0.0",
+        "run_id":          "run_audittest12345",
+        "project":         "default",
+        "trials":          [],
+        "audit": {
+            "actor_id":    "cli:test",
+            "actor_type":  "cli",
+            "event_count": 999,                # lie!
+            "events": [
+                {
+                    "event_id":   "ev_1",
+                    "kind":       "run.created",
+                    "run_id":     "run_audittest12345",
+                    "actor_id":   "cli:test",
+                    "actor_type": "cli",
+                    "started_at": "2026-01-01T00:00:00Z",
+                    "event_hash": "0" * 64,
+                },
+            ],
+        },
+    }
+    ingest = client.post("/v1/runs", json=payload, headers=auth_headers)
+    assert ingest.status_code in (200, 201), ingest.text
+
+    fetched = client.get("/v1/runs/run_audittest12345", headers=auth_headers)
+    assert fetched.status_code == 200
+    body = fetched.json()
+    audit = body.get("audit")
+    assert audit is not None, body
+    # The lie (999) is replaced by the real count (1).
+    assert audit["event_count"] == 1, audit
+
+
+# ---------------------------------------------------------------------------
+# E.5 — access-log middleware
+
+
+def test_access_log_middleware_emits_structured_lines(client, auth_headers, caplog):
+    """E.5: every HTTP response is logged as one structured JSON line
+    with method/path/status/duration, plus key_id when auth ran."""
+    import json
+    import logging
+
+    caplog.set_level(logging.INFO, logger="evalguard.api")
+    r = client.get("/v1/orgs", headers=auth_headers)
+    assert r.status_code == 200
+
+    matches = [rec for rec in caplog.records if rec.name == "evalguard.api"
+               and rec.message.startswith("{") and "http.request" in rec.message]
+    assert matches, (
+        f"no structured access-log line found; saw: "
+        f"{[r.message for r in caplog.records[-5:]]}"
+    )
+    last = json.loads(matches[-1].message)
+    assert last["evt"]    == "http.request"
+    assert last["method"] == "GET"
+    assert last["status"] == 200
+    assert isinstance(last["duration_ms"], int)
+    # ``key_id`` is omitted in open-mode tests but present in auth
+    # mode; either is acceptable (we just need a structured line).
+    assert "path" in last
