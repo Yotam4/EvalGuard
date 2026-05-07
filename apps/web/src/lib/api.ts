@@ -247,6 +247,52 @@ export const getRun = (runId: string) =>
   request<RunOut>(`/v1/runs/${encodeURIComponent(runId)}`);
 
 // ---------------------------------------------------------------------------
+// Drift — Welch's t-test across two runs (Phase 3b).
+// Mirrors ``DriftReport`` / ``DriftMetric`` in ``models.py``.
+
+export interface DriftMetric {
+  name: "latency_ms" | "cost_usd" | "passed";
+  n_current: number;
+  n_baseline: number;
+  mean_current: number;
+  mean_baseline: number;
+  delta_mean: number;
+  t_stat: number;
+  dof: number;
+  p_two_sided: number;
+  /** One-sided p-value for "current < baseline". Small ⇒ regression on metrics where lower is worse. */
+  p_less: number;
+  /** One-sided p-value for "current > baseline". Small ⇒ regression on cost / latency. */
+  p_greater: number;
+  significant_at_alpha: boolean;
+}
+
+export interface DriftSkip {
+  name: string;
+  reason: string;
+}
+
+export interface DriftReport {
+  current_run_id: string;
+  baseline_run_id: string;
+  alpha: number;
+  metrics: DriftMetric[];
+  skipped: DriftSkip[];
+}
+
+export const getRunDrift = (
+  runId: string,
+  baselineId: string,
+  opts: { alpha?: number } = {},
+) => {
+  const qs = new URLSearchParams({ vs: baselineId });
+  if (opts.alpha != null) qs.set("alpha", String(opts.alpha));
+  return request<DriftReport>(
+    `/v1/runs/${encodeURIComponent(runId)}/drift?${qs.toString()}`,
+  );
+};
+
+// ---------------------------------------------------------------------------
 // Orgs
 
 

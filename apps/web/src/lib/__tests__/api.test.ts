@@ -3,8 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setServerUrl, setToken } from "../auth";
 import {
   ApiError, NotConfiguredError,
-  createApiKey, createOrg, getRun, health, listAssets, listRuns,
-  revokeApiKey,
+  createApiKey, createOrg, getRun, getRunDrift,
+  health, listAssets, listRuns, revokeApiKey,
 } from "../api";
 
 /**
@@ -216,5 +216,50 @@ describe("api client", () => {
     await listAssets();
     const [url] = fetchMock.mock.calls[0];
     expect(url).toBe("https://api.example.com/v1/assets");
+  });
+
+  // ---------------------------------------------------------------------
+  // drift (Phase 3b)
+
+
+  it("getRunDrift composes the vs= query and URL-encodes both ids", async () => {
+    setServerUrl("https://api.example.com");
+    setToken("evk_x");
+    fetchMock.mockResolvedValueOnce({
+      ok: true, status: 200,
+      json: async () => ({
+        current_run_id:  "run_a/with slash",
+        baseline_run_id: "run_b",
+        alpha:    0.05,
+        metrics:  [],
+        skipped:  [],
+      }),
+    });
+    await getRunDrift("run_a/with slash", "run_b");
+    const [url] = fetchMock.mock.calls[0];
+    // Path segment must be percent-encoded (the slash would otherwise
+    // be read by the router as a path separator); the ``vs`` query
+    // value goes through URLSearchParams.
+    expect(url).toBe(
+      "https://api.example.com/v1/runs/run_a%2Fwith%20slash/drift?vs=run_b",
+    );
+  });
+
+
+  it("getRunDrift forwards alpha when supplied", async () => {
+    setServerUrl("https://api.example.com");
+    setToken("evk_x");
+    fetchMock.mockResolvedValueOnce({
+      ok: true, status: 200,
+      json: async () => ({
+        current_run_id: "run_a", baseline_run_id: "run_b",
+        alpha: 0.01, metrics: [], skipped: [],
+      }),
+    });
+    await getRunDrift("run_a", "run_b", { alpha: 0.01 });
+    const [url] = fetchMock.mock.calls[0];
+    expect(url).toBe(
+      "https://api.example.com/v1/runs/run_a/drift?vs=run_b&alpha=0.01",
+    );
   });
 });

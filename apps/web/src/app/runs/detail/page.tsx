@@ -1,14 +1,18 @@
 "use client";
 
-import { Suspense } from "react";
+import { Suspense, useState } from "react";
 import Link from "next/link";
-import { useSearchParams } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
 
 import { Card } from "@/components/Card";
 import { Badge, statusTone } from "@/components/Badge";
 import { ConnectionGate } from "@/components/ConnectionGate";
-import { getRun, type Gate, type RunOut, type Trial } from "@/lib/api";
+import { DriftBody } from "@/components/DriftBody";
+import {
+  getRun, getRunDrift,
+  type Gate, type RunOut, type Trial,
+} from "@/lib/api";
 
 /**
  * Detail page reads ``?id=run_xxx`` from the query string instead
@@ -55,6 +59,8 @@ function Inner() {
 
 
 function RunDetail({ runId }: { runId: string }) {
+  const params = useSearchParams();
+  const baselineId = params.get("baseline");
   const q = useQuery({
     queryKey: ["run", runId],
     queryFn: () => getRun(runId),
@@ -74,6 +80,7 @@ function RunDetail({ runId }: { runId: string }) {
     <div className="space-y-4">
       <Header run={run} />
       <SummaryGrid run={run} />
+      <DriftSection runId={runId} baselineId={baselineId} />
       {run.aggregate?.gates && run.aggregate.gates.length > 0 && (
         <Card title="Aggregate gates">
           <GatesTable gates={run.aggregate.gates} />
@@ -90,6 +97,94 @@ function RunDetail({ runId }: { runId: string }) {
     </div>
   );
 }
+
+
+/**
+ * Drift card — read-only when ``?baseline=run_xxx`` is set, otherwise
+ * shows an input that adds the param to the URL on submit. Pushing
+ * to the router (rather than fetching directly with local state) so
+ * the comparison is shareable / back-button-friendly.
+ */
+function DriftSection({
+  runId,
+  baselineId,
+}: {
+  runId: string;
+  baselineId: string | null;
+}) {
+  const router  = useRouter();
+  const [draft, setDraft] = useState<string>("");
+
+  function submit(e: React.FormEvent) {
+    e.preventDefault();
+    const id = draft.trim();
+    if (!id) return;
+    // ``replace`` (not push) so the user's history isn't littered
+    // with intermediate baselines as they iterate.
+    router.replace(`/runs/detail/?id=${encodeURIComponent(runId)}&baseline=${encodeURIComponent(id)}`);
+  }
+
+  return (
+    <Card title="Drift">
+      <form onSubmit={submit} className="flex flex-wrap items-center gap-2">
+        <label className="text-xs text-[var(--color-fg-muted)]" htmlFor="drift-baseline">
+          Compare with baseline run id
+        </label>
+        <input
+          id="drift-baseline"
+          name="baseline"
+          defaultValue={baselineId ?? ""}
+          onChange={(e) => setDraft(e.target.value)}
+          placeholder="run_xxxxxxxx"
+          className="flex-1 rounded border border-[var(--color-border)] bg-[var(--color-bg-card)] px-2 py-1 font-mono text-xs"
+        />
+        <button
+          type="submit"
+          className="rounded border border-[var(--color-border)] px-3 py-1 text-xs hover:bg-[var(--color-bg-row)]"
+        >
+          Compare
+        </button>
+        {baselineId && (
+          <Link
+            href={`/runs/detail/?id=${encodeURIComponent(runId)}`}
+            className="text-xs text-[var(--color-fg-muted)] hover:text-[var(--color-fg)]"
+          >
+            clear
+          </Link>
+        )}
+      </form>
+      {baselineId && <DriftReportView runId={runId} baselineId={baselineId} />}
+    </Card>
+  );
+}
+
+
+function DriftReportView({
+  runId,
+  baselineId,
+}: {
+  runId: string;
+  baselineId: string;
+}) {
+  const q = useQuery({
+    queryKey: ["drift", runId, baselineId],
+    queryFn: () => getRunDrift(runId, baselineId),
+    // Drift is a deterministic read; no need to refetch on focus.
+    refetchOnWindowFocus: false,
+  });
+  if (q.isPending)
+    return <p className="mt-3 text-sm text-[var(--color-fg-muted)]">Computing drift…</p>;
+  if (q.error)
+    return (
+      <p className="mt-3 text-sm text-[var(--color-fail)]">
+        {q.error instanceof Error ? q.error.message : String(q.error)}
+      </p>
+    );
+  if (!q.data) return null;
+  return <DriftBody report={q.data} />;
+}
+
+
 
 
 function Header({ run }: { run: RunOut }) {
