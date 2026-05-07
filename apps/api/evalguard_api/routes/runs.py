@@ -26,7 +26,10 @@ from sqlalchemy.engine import Connection
 from evalguard_api.auth import Principal, require_principal
 from evalguard_api.db import now_iso, upsert_project
 from evalguard_api.deps import get_conn
-from evalguard_api.models import RunIngest, RunList, RunOut, RunSummary
+from evalguard_api.models import (
+    DriftMetric, DriftReport, RunIngest, RunList, RunOut, RunSummary,
+)
+from evalguard_api.stats import welchs_t_test
 
 router = APIRouter()
 
@@ -204,6 +207,107 @@ def get_run(
         if isinstance(events, list):
             audit["event_count"] = len(events)
     return RunOut.model_validate(payload)
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/runs/{run_id}/drift?vs=<baseline_id>
+
+
+# Per-row metrics that drift compares. Order in this tuple drives
+# the metrics list in the response so the UI's per-metric table
+# is stable across calls.
+_DRIFT_METRICS: tuple[str, ...] = ("latency_ms", "cost_usd", "passed")
+
+
+@router.get(
+    "/v1/runs/{run_id}/drift",
+    response_model=DriftReport,
+    tags=["runs"],
+)
+def get_drift(
+    run_id: str,
+    vs:    str   = Query(..., description="Baseline run id to compare against."),
+    alpha: float = Query(0.05, gt=0, lt=1,
+                         description="Significance threshold for the per-metric verdict."),
+    conn:  Connection = Depends(get_conn),
+    principal: Principal = Depends(require_principal),
+) -> DriftReport:
+    """Compare two runs' per-row metric distributions.
+
+    For each of latency_ms / cost_usd / passed, run Welch's
+    two-sample t-test on the per-row values from each run.  Returns
+    one ``DriftMetric`` per metric with the t-stat, p-values, and a
+    single-bit ``significant_at_alpha`` flag.  Metrics that can't
+    be compared (e.g. one side has < 2 rows) end up under
+    ``skipped`` so the UI can render a complete report.
+
+    Cross-tenant isolation matches ``GET /v1/runs/{id}``: a member
+    asking about a run in another org gets 404 (no enumeration
+    leak), regardless of which side of the comparison the foreign
+    run is on.
+    """
+    if run_id == vs:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot compute drift between a run and itself.",
+        )
+
+    # Both runs must be visible to the caller. The same JOIN as
+    # ``get_run`` enforces "the run's project belongs to the
+    # caller's org, or the caller is admin"; missing-or-foreign
+    # collapses to a single 404 with no extra detail.
+    visible_ids = _runs_visible_to(conn, principal, [run_id, vs])
+    if run_id not in visible_ids:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Run {run_id!r} not found.",
+        )
+    if vs not in visible_ids:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Run {vs!r} not found.",
+        )
+
+    cur_rows  = _row_metric_samples(conn, run_id)
+    base_rows = _row_metric_samples(conn, vs)
+
+    metrics:  list[DriftMetric] = []
+    skipped:  list[dict] = []
+    for name in _DRIFT_METRICS:
+        cur_vals  = cur_rows.get(name, [])
+        base_vals = base_rows.get(name, [])
+        if len(cur_vals) < 2 or len(base_vals) < 2:
+            skipped.append({
+                "name":   name,
+                "reason": f"need ≥2 samples per side; got "
+                          f"current={len(cur_vals)}, baseline={len(base_vals)}",
+            })
+            continue
+        result = welchs_t_test(cur_vals, base_vals)
+        delta_mean = result.mean1 - result.mean2
+        # Significance == directional change AND p < alpha. The
+        # ``delta_mean != 0`` check is belt-and-suspenders for the
+        # zero-variance / identical-mean edge case the helper
+        # already returns p_two_sided=1.0 for.
+        significant = (result.p_two_sided < alpha) and (delta_mean != 0.0)
+        metrics.append(DriftMetric(
+            name=name,
+            n_current=result.n1, n_baseline=result.n2,
+            mean_current=result.mean1, mean_baseline=result.mean2,
+            delta_mean=delta_mean,
+            t_stat=result.t_stat, dof=result.dof,
+            p_two_sided=result.p_two_sided,
+            p_less=result.p_less, p_greater=result.p_greater,
+            significant_at_alpha=significant,
+        ))
+
+    return DriftReport(
+        current_run_id=run_id,
+        baseline_run_id=vs,
+        alpha=alpha,
+        metrics=metrics,
+        skipped=skipped,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -405,3 +509,64 @@ def _persist_run(
                 "events_json": json.dumps(audit["events"], default=str),
             },
         )
+
+
+# ---------------------------------------------------------------------------
+# Drift internals
+
+
+def _runs_visible_to(
+    conn: Connection,
+    principal: Principal,
+    run_ids: list[str],
+) -> set[str]:
+    """Return the subset of ``run_ids`` the caller is allowed to see.
+
+    Mirrors ``get_run``'s scoping in one round-trip so the drift
+    endpoint can flag missing-or-foreign with a 404 each — no extra
+    query per side.
+    """
+    if not run_ids:
+        return set()
+    # Generate ``(:r0, :r1, …)`` placeholders so each id is bound
+    # individually; never f-string raw user input into SQL.
+    keys   = [f"r{i}" for i in range(len(run_ids))]
+    placeholders = ", ".join(f":{k}" for k in keys)
+    params: dict = dict(zip(keys, run_ids))
+    base = f"""
+        SELECT runs.run_id, projects.org_id AS owning_org_id
+        FROM runs
+        JOIN projects ON projects.project_id = runs.project_id
+        WHERE runs.run_id IN ({placeholders})
+    """
+    rows = conn.execute(text(base), params).mappings().fetchall()
+    if principal.is_admin:
+        return {r["run_id"] for r in rows}
+    return {
+        r["run_id"] for r in rows
+        if r["owning_org_id"] == principal.org_id
+    }
+
+
+def _row_metric_samples(
+    conn: Connection,
+    run_id: str,
+) -> dict[str, list[float]]:
+    """Pull per-row metric vectors for ``run_id``.
+
+    One pass over ``run_rows`` collects the three metrics we expose
+    today (latency_ms / cost_usd / passed). Returned as float lists
+    so the Welch helper can take them verbatim.
+    """
+    rows = conn.execute(
+        text("""SELECT passed, cost_usd, latency_ms
+                FROM run_rows WHERE run_id = :run_id"""),
+        {"run_id": run_id},
+    ).mappings().fetchall()
+    return {
+        "latency_ms": [float(r["latency_ms"] or 0) for r in rows],
+        "cost_usd":   [float(r["cost_usd"]   or 0) for r in rows],
+        # ``passed`` is stored as 0/1; treat as a Bernoulli sample so
+        # the t-test gives a usable signal on pass-rate drift.
+        "passed":     [float(r["passed"]) for r in rows],
+    }

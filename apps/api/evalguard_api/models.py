@@ -363,3 +363,52 @@ class AssetSummary(_Strict):
 
 class AssetList(_Strict):
     assets: list[AssetSummary]
+
+
+# ---------------------------------------------------------------------------
+# Drift report (Phase 3b)
+#
+# Compares two runs' per-row metric distributions (latency_ms,
+# cost_usd, passed) via Welch's two-sample t-test. ``current`` is
+# the run the operator is investigating; ``baseline`` is what they're
+# comparing against. The endpoint returns one ``DriftMetric`` per
+# metric so a UI can render a row-per-metric verdict table.
+
+
+class DriftMetric(_Strict):
+    """One metric's drift verdict."""
+
+    name:                 str   = Field(description="latency_ms / cost_usd / passed.")
+    n_current:            int   = Field(ge=2, description="Sample size on the current side.")
+    n_baseline:           int   = Field(ge=2, description="Sample size on the baseline side.")
+    mean_current:         float
+    mean_baseline:        float
+    delta_mean:           float = Field(
+        description="``mean_current - mean_baseline``. Positive ⇒ current is higher.")
+    t_stat:               float
+    dof:                  float
+    p_two_sided:          float = Field(
+        description="P(observe |t| ≥ |t_stat| | no true difference). Smaller ⇒ stronger drift.")
+    p_less:               float = Field(
+        description="One-sided p-value for H1: current's mean < baseline's. Small ⇒ "
+                    "evidence current is lower. Useful on metrics where lower is worse "
+                    "(pass_rate).")
+    p_greater:            float = Field(
+        description="One-sided p-value for H1: current's mean > baseline's. Small ⇒ "
+                    "evidence current is higher. Useful on cost / latency where higher "
+                    "is worse.")
+    significant_at_alpha: bool  = Field(
+        description="``p_two_sided < alpha`` AND |delta_mean| > 0. The single-bit summary the UI uses.")
+
+
+class DriftReport(_Strict):
+    """Top-level drift response."""
+
+    current_run_id:  str
+    baseline_run_id: str
+    alpha:           float = Field(gt=0, lt=1)
+    metrics:         list[DriftMetric]
+    skipped:         list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Metrics that couldn't be tested (e.g., one side had < 2 rows). "
+                    "Each entry: {name, reason}.")
