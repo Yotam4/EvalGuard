@@ -95,7 +95,39 @@ def make_engine(settings: "Settings") -> Engine:
                 cur.close()
         return engine
     # Postgres / anything-SQLAlchemy-supports.
-    return create_engine(url, future=True)
+    engine = create_engine(url, future=True)
+    if engine.dialect.name == "postgresql":
+        # PgBouncer in transaction-pooling mode hands the same physical
+        # backend to a new client whenever the previous one's
+        # transaction commits. ``set_config(..., is_local=true)`` /
+        # ``SET LOCAL`` is bounded to a transaction *on a single
+        # connection*, but PgBouncer's session-state guarantees go out
+        # the window once the backend is pooled — the next checkout
+        # might land on a backend whose ``app.org_id`` was set by the
+        # previous tenant and never cleared. The window is small but
+        # the consequence is cross-tenant data exposure (RLS policies
+        # in 0002 evaluate against the leaked GUC).
+        #
+        # Belt-and-braces fix: on every fresh checkout from the
+        # SQLAlchemy pool, RESET both GUCs before the application
+        # gets the connection. ``checkout`` fires after PgBouncer has
+        # handed the backend over, so this runs in the right place.
+        # The cost is one extra round-trip per checkout.
+        @event.listens_for(engine, "checkout")
+        def _reset_rls_guc_on_checkout(dbapi_conn, _connection_record, _connection_proxy):
+            cur = dbapi_conn.cursor()
+            try:
+                cur.execute("RESET app.org_id")
+                cur.execute("RESET app.is_admin")
+            except Exception:
+                # If the GUCs were never set on this backend (e.g.
+                # first-ever use), RESET is a no-op on Postgres. If
+                # the connection is broken, surface that on the next
+                # query rather than swallowing it here.
+                pass
+            finally:
+                cur.close()
+    return engine
 
 
 def now_iso() -> str:
@@ -180,9 +212,16 @@ def apply_admin_rls_context(conn: Connection) -> None:
     """
     if conn.engine.dialect.name != "postgresql":
         return
-    # ``app.org_id`` still gets set (even though admin bypasses) so
-    # the policy expression doesn't dereference a NULL GUC.
-    conn.execute(text("SELECT set_config('app.org_id', '_system_', true)"))
+    # Use NULL (not a literal sentinel like ``'_system_'``) so a row
+    # whose ``org_id`` happens to equal that sentinel string can never
+    # match the policy's ``OR org_id = current_setting('app.org_id', true)``
+    # branch. The ``app.is_admin = '1'`` branch evaluates first and
+    # short-circuits, but defense-in-depth: if a future migration
+    # reorders the OR or drops the admin check, NULL never equals
+    # anything in SQL semantics.
+    #
+    # ``set_config`` accepts ``NULL`` via the standard SQL NULL cast.
+    conn.execute(text("SELECT set_config('app.org_id', NULL, true)"))
     conn.execute(text("SELECT set_config('app.is_admin', '1', true)"))
 
 

@@ -174,3 +174,77 @@ def test_postgres_rls_status_is_enabled(pg_client, auth_headers):
     assert expected <= rls_tables, (
         f"RLS not enabled on: {expected - rls_tables}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase-A round-3 regressions (Postgres-only).
+
+
+def test_orgs_has_rls_after_0003(pg_client: TestClient):
+    """A.2 — migration 0003 must have enabled RLS on the ``orgs``
+    table. Without 0003 a future debug endpoint or SQL injection that
+    reads ``orgs`` directly would leak the full org list across
+    tenants."""
+    from sqlalchemy import text
+    with pg_client.app.state.engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT relrowsecurity, relforcerowsecurity "
+            "FROM pg_class WHERE relname = 'orgs' AND relkind = 'r'"
+        )).first()
+    assert row is not None and row[0] is True, "RLS not enabled on orgs"
+    assert row[1] is True, "FORCE RLS not set on orgs (table-owner can bypass)"
+
+
+def test_orgs_rls_filters_non_admin(pg_client: TestClient, auth_headers):
+    """A.2 — a non-admin caller scoped to org A must not see org B
+    via the ``orgs`` table even via a raw SELECT (RLS-enforced)."""
+    from sqlalchemy import text
+    # Create two orgs as admin.
+    pg_client.post("/v1/orgs", json={"slug": "rls-a", "name": "A"}, headers=auth_headers)
+    pg_client.post("/v1/orgs", json={"slug": "rls-b", "name": "B"}, headers=auth_headers)
+    # Mint a member token for org-a.
+    r = pg_client.post(
+        "/v1/orgs/org_rls-a/api_keys",
+        json={"name": "m", "scopes": []},
+        headers=auth_headers,
+    )
+    member_token = r.json()["token"]
+
+    # Use the engine directly to issue a raw SELECT under the member's
+    # GUC (RLS path). The route layer would also filter, but the test
+    # is specifically about RLS as defense-in-depth.
+    with pg_client.app.state.engine.begin() as conn:
+        from evalguard_api.db import apply_rls_context
+        apply_rls_context(conn, org_id="org_rls-a", is_admin=False)
+        slugs = {r[0] for r in conn.execute(text("SELECT slug FROM orgs")).fetchall()}
+    assert slugs == {"rls-a"}, f"non-admin saw cross-tenant orgs: {slugs}"
+
+
+def test_pool_checkout_resets_app_org_id(pg_client: TestClient):
+    """A.1 — the ``checkout`` hook must RESET ``app.org_id`` so a
+    GUC set by a prior request can never leak to the next one. This
+    simulates the PgBouncer-bleed scenario: set the GUC on a
+    connection, return it to the pool, take a fresh checkout, and
+    verify the GUC is empty.
+
+    SQLAlchemy's ``engine.connect()`` returns a fresh checkout each
+    call within a single Engine, so it's a faithful proxy for
+    PgBouncer giving the same backend to a new client.
+    """
+    from sqlalchemy import text
+    engine = pg_client.app.state.engine
+    # Step 1: set the GUC on a connection and let the connection close.
+    with engine.begin() as conn:
+        conn.execute(text("SELECT set_config('app.org_id', 'leaked-org', false)"))
+        # ``is_local=false`` makes the GUC stick at session level,
+        # surviving the transaction commit. PgBouncer transaction
+        # pooling would expose this to the next client.
+    # Step 2: take a fresh checkout. The hook should have RESET it.
+    with engine.connect() as conn:
+        leaked = conn.execute(
+            text("SELECT current_setting('app.org_id', true)")
+        ).scalar()
+    assert leaked in (None, ""), (
+        f"GUC leak: app.org_id = {leaked!r} on a fresh checkout. "
+        "The pool ``checkout`` hook should have RESET it."
+    )

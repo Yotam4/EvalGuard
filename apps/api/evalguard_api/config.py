@@ -24,9 +24,26 @@ class Settings:
     # if the request doesn't carry override headers (Phase 2.5 wiring).
     default_org_slug: str = "default"
     default_project_slug: str = "default"
-    # CORS — comma-separated allowlist; ``*`` means open. Same default
-    # as the FastAPI docs page so local UI dev "just works".
-    cors_origins: tuple[str, ...] = ("*",)
+    # CORS — comma-separated allowlist. Default is **empty** (no
+    # cross-origin access) — production safety beats dev convenience.
+    # Local development sets ``EVALGUARD_CORS_ORIGINS=*`` explicitly;
+    # the startup check refuses to boot if both ``cors_origins=("*",)``
+    # AND ``is_open_mode`` are true (a wide-open prod waiting to
+    # happen). Same applies if open-mode is on with any CORS at all
+    # — open-mode demands explicit acknowledgement.
+    cors_origins: tuple[str, ...] = ()
+    # Trusted hostnames for ``TrustedHostMiddleware``. Defaults to
+    # accept any host in dev; production must set this. ``*`` is
+    # accepted but warned-against at startup.
+    trusted_hosts: tuple[str, ...] = ("*",)
+    # When true, install ``HTTPSRedirectMiddleware``. Defaults off so
+    # local dev on http://localhost works without flags.
+    require_https: bool = False
+    # Explicit opt-in for open mode (no API key). Defaults to false —
+    # missing ``EVALGUARD_API_KEY`` alone now refuses to boot, instead
+    # of silently exposing the API. Set ``EVALGUARD_OPEN_MODE=1`` to
+    # acknowledge.
+    open_mode_opt_in: bool = False
     # Bind
     bind_host: str = "127.0.0.1"
     bind_port: int = 8787
@@ -41,7 +58,9 @@ class Settings:
     def is_open_mode(self) -> bool:
         """True iff no API key is configured. Open mode is loud:
         startup logs warn, ``GET /v1/health`` advertises it. Suitable
-        for local dev only."""
+        for local dev only — production must set ``EVALGUARD_API_KEY``.
+        Even in dev, ``EVALGUARD_OPEN_MODE=1`` is now required to
+        explicitly acknowledge the no-auth posture."""
         return not self.api_key
 
     @property
@@ -64,16 +83,58 @@ def load_settings() -> Settings:
     """Read settings from the environment.
 
     Honours the ``EVALGUARD_*`` prefix on every key so a single env
-    block governs the whole deployment.
+    block governs the whole deployment. Defaults err toward production
+    safety: missing ``EVALGUARD_CORS_ORIGINS`` is *empty* (no cross-
+    origin), missing ``EVALGUARD_API_KEY`` is *not* enough on its own
+    to boot in open mode — the operator must also set
+    ``EVALGUARD_OPEN_MODE=1`` to acknowledge.
     """
+    cors_raw = os.environ.get("EVALGUARD_CORS_ORIGINS")
+    cors_origins = _split_csv(cors_raw) if cors_raw is not None else ()
     return Settings(
         database_url=os.environ.get("EVALGUARD_DATABASE_URL", Settings.database_url),
         api_key=os.environ.get("EVALGUARD_API_KEY", ""),
         default_org_slug=os.environ.get("EVALGUARD_DEFAULT_ORG", Settings.default_org_slug),
         default_project_slug=os.environ.get("EVALGUARD_DEFAULT_PROJECT", Settings.default_project_slug),
-        cors_origins=_split_csv(os.environ.get("EVALGUARD_CORS_ORIGINS", "*")) or ("*",),
+        cors_origins=cors_origins,
+        trusted_hosts=_split_csv(os.environ.get("EVALGUARD_TRUSTED_HOSTS", "*")) or ("*",),
+        require_https=os.environ.get("EVALGUARD_REQUIRE_HTTPS", "0") in {"1", "true", "TRUE"},
+        open_mode_opt_in=os.environ.get("EVALGUARD_OPEN_MODE", "0") in {"1", "true", "TRUE"},
         bind_host=os.environ.get("EVALGUARD_HOST", Settings.bind_host),
         bind_port=int(os.environ.get("EVALGUARD_PORT", Settings.bind_port)),
         max_request_bytes=int(os.environ.get("EVALGUARD_MAX_REQUEST_BYTES",
                                               Settings.max_request_bytes)),
     )
+
+
+class StartupRefusal(RuntimeError):
+    """Configuration is unsafe to start. The error message tells the
+    operator exactly which env var to set; tests assert on the prefix.
+    """
+
+
+def validate_for_startup(settings: Settings) -> None:
+    """Refuse-to-boot checks. Raises ``StartupRefusal`` if the
+    combination of settings would expose the server in a way the
+    operator likely didn't intend. Called from the FastAPI lifespan
+    so a misconfigured deployment fails fast and loud rather than
+    silently running open.
+    """
+    if settings.is_open_mode and not settings.open_mode_opt_in:
+        raise StartupRefusal(
+            "EVALGUARD_API_KEY is empty (open mode) but EVALGUARD_OPEN_MODE=1 "
+            "is not set. Open mode disables authentication entirely; set the "
+            "env var explicitly to acknowledge, or set EVALGUARD_API_KEY to "
+            "secure the server."
+        )
+    if settings.is_open_mode and "*" in settings.cors_origins:
+        raise StartupRefusal(
+            "Open mode (no API key) AND CORS=* would let any browser tab call "
+            "the API. Set EVALGUARD_CORS_ORIGINS to an explicit allowlist or "
+            "configure EVALGUARD_API_KEY."
+        )
+    if "*" in settings.cors_origins and not settings.is_open_mode:
+        # Token-bearing requests from arbitrary origins are still
+        # risky; we *warn* but allow because some users genuinely
+        # need it. The middleware install logs a follow-up.
+        pass

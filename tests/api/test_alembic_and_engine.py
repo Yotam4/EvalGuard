@@ -98,8 +98,8 @@ def test_alembic_upgrade_head_creates_all_tables(client):
     leave the schema fully populated. The ``client`` fixture wires
     the lifespan; we just check the result via SQLAlchemy inspect.
 
-    On SQLite, ``0002_rls_policies.py`` is a no-op so this also
-    proves the dialect-guard fires correctly."""
+    On SQLite, ``0002_rls_policies.py`` and ``0004_rls_orgs.py`` are
+    no-ops so this also proves the dialect-guard fires correctly."""
     engine = client.app.state.engine
     insp = inspect(engine)
     actual = set(insp.get_table_names())
@@ -120,7 +120,8 @@ def test_alembic_version_recorded(client):
     engine = client.app.state.engine
     with engine.connect() as conn:
         ver = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-    # Head bumps as we ship migrations. ``0003_runs_source`` adds the
-    # ingest-source column for Phase 3a (OTLP ingest); future
-    # migrations will keep moving this assertion forward.
-    assert ver == "0003_runs_source"
+    # Head bumps as we ship migrations. ``0004_rls_orgs`` chains the
+    # round-3 RLS-on-orgs migration after Phase 3a's
+    # ``0003_runs_source``; future migrations will keep moving this
+    # assertion forward.
+    assert ver == "0004_rls_orgs"
