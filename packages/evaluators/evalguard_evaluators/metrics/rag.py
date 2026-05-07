@@ -1,4 +1,4 @@
-"""Layer-2 RAG metrics — deterministic n-gram proxies for RAGAS.
+"""Layer-2 RAG metrics — deterministic lexical proxies for RAGAS.
 
 The four classic RAGAS axes (faithfulness, answer_relevancy,
 context_precision, context_recall) are normally computed with an LLM
@@ -7,12 +7,21 @@ plus an embedding model. EvalGuard's pyramid puts those in Layer 3
 proxies suitable for Layer 2: cheap, offline, no API keys required,
 green in CI without a network.
 
+To keep that distinction honest, the evaluator ids carry a ``lex.``
+prefix (``lex.faithfulness``, ``lex.answer_relevancy``, etc.) — the
+bare names are reserved for a future LLM-backed plugin so users can
+swap the implementation without renaming dashboards. Specifically,
+``ContextPrecisionLex`` is *unranked* precision (relevant/n with no
+order weighting), so its id is ``lex.context_precision_unranked``;
+the bare ``context_precision`` slot is reserved for a future MAP@k
+implementation.
+
 The proxies are token-overlap based (n-gram intersection over union)
 with light English-stopword filtering. They correlate well enough with
 the LLM-based metrics for regression-detection in CI; production
 deployments that need higher fidelity can register an LLM-backed
-plugin under the ``evalguard.evaluators`` entry-point group with the
-same evaluator id and override per-project.
+plugin under the ``evalguard.evaluators`` entry-point group and bind
+it to the bare names.
 
 Dataset row schema RAG metrics expect (read from ``ctx.extra``):
 
@@ -142,69 +151,132 @@ class _RagMetric:
 # 1. Faithfulness — output grounded in contexts
 
 
-class FaithfulnessMetric(_RagMetric):
-    """Fraction of output tokens covered by the union of contexts.
+class FaithfulnessLexMetric(_RagMetric):
+    """Fraction of output tokens covered by the union of contexts
+    (deterministic proxy — no claim splitting, no LLM).
 
     A high score means the model didn't hallucinate beyond what the
     retrieved contexts say. Low score = output contains claims absent
-    from the contexts (potential hallucination)."""
+    from the contexts (potential hallucination).
 
-    _default_id = "faithfulness"
-    _default_threshold = 0.5
+    Threshold default is 0.3 because lexical coverage drops fast under
+    paraphrase: a faithful but reworded answer can score in the 0.3-
+    0.5 band even when an LLM judge would call it perfectly grounded.
+    Tighten in YAML for stricter regression detection."""
+
+    _default_id = "lex.faithfulness"
+    _default_threshold = 0.3
 
     def _score(self, ctx: EvalContext) -> tuple[float, dict[str, Any]]:
         contexts = _resolve_contexts(ctx)
         if not contexts:
-            return 1.0, {"reason": "no contexts; vacuously faithful", "n_contexts": 0}
+            return 1.0, {"reason": "no contexts; vacuously faithful",
+                         "n_contexts": 0, "metric_kind": "lexical"}
         joined_contexts = " ".join(contexts)
         output_tokens = _tokens(ctx.output)
         if not output_tokens:
-            return 1.0, {"reason": "empty output", "n_contexts": len(contexts)}
+            return 1.0, {"reason": "empty output", "n_contexts": len(contexts),
+                         "metric_kind": "lexical"}
         value = _coverage(output_tokens, joined_contexts)
         return value, {
             "n_contexts":       len(contexts),
             "n_output_tokens":  len(output_tokens),
+            "metric_kind":      "lexical",
+            "limitation":       "token-overlap proxy; reworded faithful "
+                                "answers may score below 0.5",
         }
+
+
+# Backwards-compat alias so external code that imported
+# ``FaithfulnessMetric`` keeps working through one release. New code
+# should import the ``Lex`` name to match the evaluator id.
+FaithfulnessMetric = FaithfulnessLexMetric
 
 
 # ---------------------------------------------------------------------------
 # 2. Answer relevancy — output addresses the question
 
 
-class AnswerRelevancyMetric(_RagMetric):
-    """Fraction of question tokens reflected in the output.
+class AnswerRelevancyLexMetric(_RagMetric):
+    """Fraction of question tokens reflected in the output, AFTER
+    stripping verbatim question echo.
+
+    Question echo defeats naive coverage: ``output = question`` would
+    score 1.0 even though the model never answered. We subtract the
+    question's surface form from the output before scoring so an
+    echo-only response collapses to 0.
 
     A high score means the output engaged with the topic of the
     question; low means the model went off-topic."""
 
-    _default_id = "answer_relevancy"
+    _default_id = "lex.answer_relevancy"
     _default_threshold = 0.3
 
     def _score(self, ctx: EvalContext) -> tuple[float, dict[str, Any]]:
         question = _resolve_question(ctx)
         question_tokens = _tokens(question)
         if not question_tokens:
-            return 1.0, {"reason": "empty question; vacuously relevant"}
+            return 1.0, {"reason": "empty question; vacuously relevant",
+                         "metric_kind": "lexical"}
         if not ctx.output:
-            return 0.0, {"reason": "empty output"}
-        value = _coverage(question_tokens, ctx.output)
+            return 0.0, {"reason": "empty output", "metric_kind": "lexical"}
+
+        # Strip a verbatim question echo (case-insensitive, single
+        # contiguous occurrence is enough to defeat the cheapest hack
+        # — full-text echo) so a parrot answer scores 0 instead of 1.
+        stripped = _strip_question_echo(ctx.output, question)
+        question_token_set = set(question_tokens)
+        target_tokens = set(_tokens(stripped))
+        # Coverage = (#question_tokens reflected in non-echo body) / (#question_tokens)
+        if not question_token_set:
+            covered = 0
+        else:
+            covered = len(question_token_set & target_tokens)
+        value = covered / len(question_token_set) if question_token_set else 0.0
         return value, {
             "n_question_tokens": len(question_tokens),
+            "echo_stripped":     stripped != ctx.output,
+            "metric_kind":       "lexical",
         }
+
+
+AnswerRelevancyMetric = AnswerRelevancyLexMetric
+
+
+def _strip_question_echo(output: str, question: str) -> str:
+    """Remove a verbatim case-insensitive occurrence of ``question``
+    from ``output``. Best-effort — punctuation differences will defeat
+    it, which is fine: the goal is to penalize the trivial copy-paste
+    case, not to perform full plagiarism detection."""
+    if not output or not question:
+        return output or ""
+    needle = question.strip()
+    if not needle:
+        return output
+    idx = output.lower().find(needle.lower())
+    if idx < 0:
+        return output
+    return output[:idx] + output[idx + len(needle):]
 
 
 # ---------------------------------------------------------------------------
 # 3. Context precision — top-k contexts are relevant
 
 
-class ContextPrecisionMetric(_RagMetric):
+class ContextPrecisionLexUnrankedMetric(_RagMetric):
     """Fraction of provided contexts that share substantive vocabulary
     with the expected answer.
 
     A high score means the retriever's top-k weren't padded with
-    irrelevant passages. Score = (#relevant_contexts) / (#contexts)."""
+    irrelevant passages. Score = (#relevant_contexts) / (#contexts).
 
-    _default_id = "context_precision"
+    NOTE: This is **unranked** precision — every position contributes
+    equally. Real RAGAS context_precision is MAP@k, weighting top-1
+    higher than top-k. The id is ``lex.context_precision_unranked``
+    so the bare ``context_precision`` slot stays free for a future
+    ranked implementation."""
+
+    _default_id = "lex.context_precision_unranked"
     _default_threshold = 0.5
 
     def configure(self, cfg: dict[str, Any]) -> None:
@@ -237,14 +309,18 @@ class ContextPrecisionMetric(_RagMetric):
             "n_relevant":      relevant,
             "relevance_min":   self._relevance_min,
             "per_context":     per_context,
+            "metric_kind":     "lexical_unranked",
         }
+
+
+ContextPrecisionMetric = ContextPrecisionLexUnrankedMetric
 
 
 # ---------------------------------------------------------------------------
 # 4. Context recall — relevant info is present in retrieved contexts
 
 
-class ContextRecallMetric(_RagMetric):
+class ContextRecallLexMetric(_RagMetric):
     """Fraction of expected-answer tokens covered by the union of
     contexts.
 
@@ -252,7 +328,7 @@ class ContextRecallMetric(_RagMetric):
     answer to be reconstructable. Low score means even with a perfect
     generator the system would fail (retriever gap, not generator gap)."""
 
-    _default_id = "context_recall"
+    _default_id = "lex.context_recall"
     _default_threshold = 0.5
 
     def _score(self, ctx: EvalContext) -> tuple[float, dict[str, Any]]:
@@ -268,4 +344,8 @@ class ContextRecallMetric(_RagMetric):
         return value, {
             "n_contexts":         len(contexts),
             "n_expected_tokens":  len(ans_tokens),
+            "metric_kind":        "lexical",
         }
+
+
+ContextRecallMetric = ContextRecallLexMetric

@@ -307,23 +307,31 @@ class AuditHook:
 # Storing the hook on ``ev._audit_hook`` would let one task's hook leak
 # into another task's emit_provider_call. ``ContextVar`` is task-local in
 # asyncio, so each ``process_row`` coroutine gets its own view.
-_audit_hook_var: contextvars.ContextVar["AuditHook | None"] = contextvars.ContextVar(
-    "evalguard_audit_hook", default=None,
+#
+# The actual ContextVar lives in the evaluators package
+# (``evalguard_evaluators.audit_hook``) so the dependency points cli →
+# evaluators only — judges never need to import back into the CLI.
+# These wrappers preserve the original CLI-side names so the executor
+# and tests don't have to change.
+from evalguard_evaluators.audit_hook import (
+    current_audit_hook as _evaluator_current_audit_hook,
+    reset_audit_hook   as _evaluator_reset_audit_hook,
+    set_audit_hook     as _evaluator_set_audit_hook,
 )
 
 
 def current_audit_hook() -> "AuditHook | None":
     """Return the audit hook bound to the running evaluator, if any."""
-    return _audit_hook_var.get()
+    return _evaluator_current_audit_hook()
 
 
 def set_audit_hook(hook: "AuditHook | None") -> "contextvars.Token[AuditHook | None]":
     """Bind an audit hook to the current task; returns a reset token."""
-    return _audit_hook_var.set(hook)
+    return _evaluator_set_audit_hook(hook)
 
 
 def reset_audit_hook(token: "contextvars.Token[AuditHook | None]") -> None:
-    _audit_hook_var.reset(token)
+    _evaluator_reset_audit_hook(token)
 
 
 # ---------------------------------------------------------------------------

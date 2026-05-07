@@ -19,30 +19,24 @@ import time
 from pathlib import Path
 from typing import Any
 
+from evalguard_evaluators.audit_hook import current_audit_hook
 from evalguard_evaluators.base import EvalContext, Score
 from evalguard_evaluators.registry import load_provider
 
 
 class _AuditableJudge:
-    """Mixin: judges look up an audit hook via a task-local lookup.
+    """Mixin: judges look up an audit hook via a task-local lookup
+    that lives in the evaluators package itself — no import back into
+    the CLI is needed, so the layering (cli → evaluators only) holds.
 
-    The executor stores the hook on a ``contextvars.ContextVar`` before
-    each call so concurrent rows running on the *same* judge instance
+    The orchestrator (the CLI executor) sets the hook on a
+    ``contextvars.ContextVar`` before each call so concurrent rows
+    running on the *same* judge instance under ``asyncio.gather``
     don't trample each other (instance-attribute storage was racy).
-
-    Plugins are insulated from the lookup mechanism — they can either
-    read ``self._audit_hook`` (which delegates to the lookup) or import
-    ``current_audit_hook`` directly.
     """
 
     @property
     def _audit_hook(self) -> Any:
-        # Imported lazily to avoid a hard dep from evaluators → cli;
-        # the cli package owns the lookup, evaluators just read it.
-        try:
-            from evalguard_cli.local.audit import current_audit_hook
-        except ImportError:
-            return None
         return current_audit_hook()
 
 _DEFAULT_TEMPLATE = """You are a strict evaluator.
@@ -122,12 +116,16 @@ class PointwiseJudge(_AuditableJudge):
         result = await provider.complete(prompt, model=self._model, params=self._params)
         latency_ms = int((time.monotonic() - t0) * 1000)
 
+        # Pull tokens once; the audit event AND the Score.raw payload
+        # both need them so downstream cost-aggregation in the report
+        # has the same numbers the audit log shows.
+        tokens = _extract_tokens(result.raw)
+
         # Nested audit event for the judge's own LLM call. ``parent_span_id``
         # is the evaluator-event's span (set up by the executor before this
         # call), so a downstream UI can render the judge call as a child of
         # the evaluator.judge.invoked event in the trace tree.
         if self._audit_hook is not None:
-            tokens = _extract_tokens(result.raw)
             self._audit_hook.emit_provider_call(
                 provider=self._provider_name,
                 model=self._model,
@@ -144,12 +142,16 @@ class PointwiseJudge(_AuditableJudge):
         score, reason = _parse_score_json(result.output)
         passed = score >= self._threshold
         raw = {
-            "judge_model": f"{self._provider_name}:{self._model}",
-            "judge_cost_usd": result.cost_usd,
+            "judge_model":     f"{self._provider_name}:{self._model}",
+            "judge_cost_usd":  result.cost_usd,
             "judge_latency_ms": latency_ms,
-            "score": score,
-            "reason": reason,
-            "raw": result.raw,
+            # Surfaced so the run-level report's cost / token aggregator
+            # sees judge spend, not just provider spend. Was missing
+            # even though ``emit_provider_call`` already had access.
+            "judge_tokens":    tokens,
+            "score":           score,
+            "reason":          reason,
+            "raw":             result.raw,
         }
         return [Score(self.id, self.kind, self.layer, float(score), passed, raw)]
 
