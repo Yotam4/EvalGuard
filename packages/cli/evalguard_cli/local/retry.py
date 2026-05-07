@@ -38,11 +38,19 @@ from evalguard_evaluators import ProviderResult
 _DEFAULT_RETRY_PATTERNS: tuple[str, ...] = (
     r"\b429\b",
     r"\b50[0-3]\b",
+    # 408 Request Timeout, 425 Too Early, 449 Retry With (some proxies)
+    r"\b40[8]\b",
+    r"\b42[5]\b",
+    r"\b449\b",
     r"rate.?limit",
     r"timeout",
     r"timed.?out",
     r"connection.?(reset|refused|aborted|error)",
     r"temporarily.?unavailable",
+    # ``server.?overloaded`` already covered the explicit proxy phrasing;
+    # ``\boverloaded\b`` adds Anthropic's ``overloaded_error`` and
+    # similar bare wording from other vendor SDKs.
+    r"\boverloaded\b",
     r"server.?overloaded",
     r"service.?unavailable",
 )

@@ -31,28 +31,59 @@ export class NotConfiguredError extends Error {
   }
 }
 
+// Explicit allowlist of paths the UI should call WITHOUT a bearer
+// token. Using ``endsWith("/health")`` (the previous shape) would
+// also unauthenticate any future endpoint coincidentally ending in
+// "/health", e.g. ``/v1/runs/.../health-check`` — silent regression.
+// Keep this set in lockstep with the server's ``main.py`` allowlist.
+const PUBLIC_PATHS: ReadonlySet<string> = new Set(["/v1/health"]);
+
+// Default per-request timeout. A hung server (or bad network) without
+// this hangs the UI's mutation/spinner indefinitely. 30s is generous
+// for the listing/detail endpoints; long-running mutations should
+// pass an explicit ``signal`` from a route-level AbortController.
+const DEFAULT_TIMEOUT_MS = 30_000;
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const base = getServerUrl();
   const token = getToken();
   if (!base) throw new NotConfiguredError();
 
-  // ``/v1/health`` is unauthenticated by design (load-balancer
-  // friendly). For everything else we attach the bearer; the
-  // server replies 401 if it's missing or wrong, which the UI
-  // surfaces as "open Settings".
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     ...(init?.headers as Record<string, string> | undefined),
   };
-  if (token && !path.endsWith("/health")) {
+  if (token && !PUBLIC_PATHS.has(path.split("?")[0])) {
     headers["Authorization"] = `Bearer ${token}`;
   }
 
-  const res = await fetch(`${base.replace(/\/$/, "")}${path}`, {
-    ...init,
-    headers,
-    cache: "no-store",
-  });
+  // Compose caller-supplied AbortSignal with our default timeout so a
+  // route can still cancel manually, AND a stuck connection eventually
+  // unblocks the UI.
+  const timeoutCtl = new AbortController();
+  const timer = setTimeout(() => timeoutCtl.abort(), DEFAULT_TIMEOUT_MS);
+  const signal = init?.signal ?? timeoutCtl.signal;
+  if (init?.signal) {
+    init.signal.addEventListener("abort", () => timeoutCtl.abort(), { once: true });
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(`${base.replace(/\/$/, "")}${path}`, {
+      ...init,
+      headers,
+      signal,
+      cache: "no-store",
+    });
+  } catch (err) {
+    if (timeoutCtl.signal.aborted) {
+      throw new ApiError(0, `request timed out after ${DEFAULT_TIMEOUT_MS / 1000}s`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+
   if (!res.ok) {
     let detail = res.statusText;
     try {

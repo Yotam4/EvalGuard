@@ -181,6 +181,31 @@ describe("api client", () => {
     );
   });
 
+  // ---------------------------------------------------------------------
+  // timeout
+
+  it("aborts the request after the default 30s timeout when fetch hangs", async () => {
+    setServerUrl("https://api.example.com");
+    setToken("evk_x");
+    vi.useFakeTimers();
+    // Resolve only when the per-request AbortSignal aborts.
+    fetchMock.mockImplementation((_url: string, init: RequestInit) => {
+      return new Promise((_resolve, reject) => {
+        init.signal?.addEventListener("abort", () => {
+          reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+        });
+      });
+    });
+    const promise = listRuns().catch((e) => e);
+    // Drive past the 30s timeout window.
+    await vi.advanceTimersByTimeAsync(31_000);
+    const err = await promise;
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).status).toBe(0);
+    expect((err as ApiError).detail).toContain("timed out");
+    vi.useRealTimers();
+  });
+
   it("listAssets omits the query string when no params are passed", async () => {
     setServerUrl("https://api.example.com");
     setToken("evk_x");

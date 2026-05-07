@@ -94,8 +94,17 @@ def make_engine(settings: "Settings") -> Engine:
             finally:
                 cur.close()
         return engine
-    # Postgres / anything-SQLAlchemy-supports.
-    engine = create_engine(url, future=True)
+    # Postgres / anything-SQLAlchemy-supports. Pool sizing is conservative
+    # by default because SQLAlchemy's stock 5 + 10 × N workers quickly
+    # exhausts Postgres ``max_connections`` under any real concurrency.
+    engine = create_engine(
+        url,
+        future=True,
+        pool_size=settings.db_pool_size,
+        max_overflow=settings.db_max_overflow,
+        pool_pre_ping=settings.db_pool_pre_ping,
+        pool_recycle=settings.db_pool_recycle_s,
+    )
     if engine.dialect.name == "postgresql":
         # PgBouncer in transaction-pooling mode hands the same physical
         # backend to a new client whenever the previous one's
@@ -308,10 +317,19 @@ def token_prefix(token: str) -> str:
 # API-key persistence
 
 
+# Debounce window for ``last_used_at`` writes — the field is for
+# operator visibility ("which key is live?"), not metering, so a 5-
+# minute resolution is more than enough. The previous always-write
+# behaviour produced an UPDATE on every authed request and turned
+# ``api_keys`` into a HOT-update hotspot under load.
+_LAST_USED_DEBOUNCE_S: int = 300
+
+
 def find_key_by_hash(conn: Connection, hashed: str) -> dict | None:
     """Look up an active api_key by its hash. Returns None for unknown
     or revoked keys (revoked_at not null). Touches ``last_used_at`` on
-    hit so an operator can see which keys are live traffic."""
+    hit (debounced to 5 min) so an operator can see live keys without
+    every request triggering an UPDATE."""
     row = conn.execute(
         text("""SELECT key_id, org_id, prefix, name, scopes_csv,
                        created_at, revoked_at, last_used_at
@@ -321,11 +339,28 @@ def find_key_by_hash(conn: Connection, hashed: str) -> dict | None:
     ).mappings().fetchone()
     if row is None:
         return None
-    conn.execute(
-        text("UPDATE api_keys SET last_used_at=:t WHERE key_id=:k"),
-        {"t": now_iso(), "k": row["key_id"]},
-    )
+    if _should_touch_last_used(row.get("last_used_at")):
+        conn.execute(
+            text("UPDATE api_keys SET last_used_at=:t WHERE key_id=:k"),
+            {"t": now_iso(), "k": row["key_id"]},
+        )
     return dict(row)
+
+
+def _should_touch_last_used(last_used_at: str | None) -> bool:
+    """Return True iff the recorded ``last_used_at`` is older than the
+    debounce window (or unset). Parse failures fall back to True so
+    a malformed timestamp gets refreshed."""
+    if not last_used_at:
+        return True
+    try:
+        when = datetime.fromisoformat(last_used_at)
+    except ValueError:
+        return True
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    age_s = (datetime.now(timezone.utc) - when).total_seconds()
+    return age_s >= _LAST_USED_DEBOUNCE_S
 
 
 def key_hash_exists(conn: Connection, hashed: str) -> bool:

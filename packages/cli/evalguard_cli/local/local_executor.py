@@ -235,6 +235,32 @@ async def execute(
         sem = asyncio.Semaphore(concurrency)
         aborted = asyncio.Event()  # per-trial abort (fail_fast or cost cap)
 
+        # Per-trial provider-instance cache for per-row overrides. Without
+        # it, ``concurrency=8 × 1000 rows`` paid the
+        # ``importlib.metadata.entry_points`` walk inside ``load_provider``
+        # 1000 times. Keyed by (provider_name, frozen_cfg) so two rows
+        # with the same effective config share one provider instance.
+        provider_cache: dict[tuple[str, tuple[tuple[str, Any], ...]], Any] = {}
+
+        def _provider_key(name: str, cfg: dict[str, Any]) -> tuple[str, tuple[tuple[str, Any], ...]]:
+            # Sort keys so insertion order doesn't perturb the cache. Use
+            # ``repr`` for non-hashable values (nested dict/list) — slow
+            # path but only on cache miss.
+            try:
+                items = tuple(sorted(cfg.items()))
+                hash(items)
+            except TypeError:
+                items = tuple(sorted((k, repr(v)) for k, v in cfg.items()))
+            return (name, items)
+
+        def _get_or_load_provider(name: str, cfg: dict[str, Any]) -> Any:
+            key = _provider_key(name, cfg)
+            inst = provider_cache.get(key)
+            if inst is None:
+                inst = load_provider(name, cfg)
+                provider_cache[key] = inst
+            return inst
+
         async def process_row(idx: int, row: dict[str, Any]) -> tuple[float, bool, bool]:
             """Returns (cost, passed, attempted)."""
             nonlocal total_cost
@@ -278,11 +304,13 @@ async def execute(
                 row_retry_cfg = row.get("retry") if isinstance(row, dict) else None
                 eff_provider_cfg = {**provider_cfg, **row_params} if row_params else provider_cfg
                 if row_override and eff_provider_name != provider_name:
-                    eff_provider = load_provider(eff_provider_name, eff_provider_cfg)
+                    eff_provider = _get_or_load_provider(eff_provider_name, eff_provider_cfg)
                 elif row_params:
-                    # Same provider class, different params → instantiate a
-                    # fresh provider so the merged config is applied.
-                    eff_provider = load_provider(eff_provider_name, eff_provider_cfg)
+                    # Same provider class, different params → fetch
+                    # (or instantiate-and-cache) a provider with the
+                    # merged config. Repeated rows with identical
+                    # overrides share one instance.
+                    eff_provider = _get_or_load_provider(eff_provider_name, eff_provider_cfg)
                 else:
                     eff_provider = provider
                 effective_provider_name, effective_model = eff_provider_name, eff_model

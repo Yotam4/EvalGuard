@@ -53,6 +53,16 @@ class Settings:
     # audit events tops out around ~50 MB; the default leaves
     # headroom while still rejecting obvious abuse.
     max_request_bytes: int = 100 * 1024 * 1024  # 100 MB
+    # Database pool. SQLAlchemy defaults (5 + 10) multiplied across
+    # uvicorn workers blow Postgres ``max_connections`` quickly on
+    # busy deployments. The defaults here are conservative; operators
+    # who genuinely need more should bump
+    # ``EVALGUARD_DB_POOL_SIZE`` / ``EVALGUARD_DB_MAX_OVERFLOW``
+    # alongside the Postgres-side ``max_connections``.
+    db_pool_size: int = 10
+    db_max_overflow: int = 0
+    db_pool_pre_ping: bool = True
+    db_pool_recycle_s: int = 1800   # recycle connections every 30 min
 
     @property
     def is_open_mode(self) -> bool:
@@ -104,6 +114,14 @@ def load_settings() -> Settings:
         bind_port=int(os.environ.get("EVALGUARD_PORT", Settings.bind_port)),
         max_request_bytes=int(os.environ.get("EVALGUARD_MAX_REQUEST_BYTES",
                                               Settings.max_request_bytes)),
+        db_pool_size=int(os.environ.get("EVALGUARD_DB_POOL_SIZE",
+                                         Settings.db_pool_size)),
+        db_max_overflow=int(os.environ.get("EVALGUARD_DB_MAX_OVERFLOW",
+                                            Settings.db_max_overflow)),
+        db_pool_pre_ping=os.environ.get("EVALGUARD_DB_POOL_PRE_PING", "1")
+                            in {"1", "true", "TRUE"},
+        db_pool_recycle_s=int(os.environ.get("EVALGUARD_DB_POOL_RECYCLE_S",
+                                              Settings.db_pool_recycle_s)),
     )
 
 
