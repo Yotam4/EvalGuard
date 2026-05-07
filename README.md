@@ -299,13 +299,23 @@ separate from the MIT-licensed CLI.
   `evalguard.run.schema.json` shapes so a contract drift surfaces as
   a type error. Bearer + server URL persist in `localStorage`; one
   static bundle deploys against staging or prod with no rebuild.
+- **Phase 2.6b (UI tests + management surface)** — Vitest 3 + React
+  Testing Library wired in (`happy-dom` runtime; 27 unit tests
+  across `auth.ts`, the `api.ts` fetch wrapper, `Badge` /
+  `statusTone`, and `ConnectionGate`). Three operator-facing
+  pages: **Orgs** (list + admin-gated create), **Projects** (list +
+  create in caller's org; admin can target other orgs via `?org_id=`),
+  **Keys** (list + create with one-time token reveal + Copy button +
+  two-click `ConfirmButton` revoke). Nav surfaces all five
+  management routes. The TypeScript contract types extend with
+  `Project`, `ApiKeySummary`, `ApiKeyCreated`.
 
 ## Coming next
 
 | Phase | Deliverable |
 |---|---|
 | 1.5 | Published `evalguard/action@v1`; baseline registry polish |
-| 2.6b | Datasets / Prompts / Judges UI pages; Org / Project / API-key management UI; Vitest + Playwright tests; real-time updates |
+| 2.6c | Datasets / Prompts / Judges browse pages (needs server-side asset-aggregation endpoints); Playwright e2e; real-time updates (polling / SSE) |
 | 3 | OTLP / `gen_ai.*` ingest; online sampler; drift detection |
 | 4 | Argilla-style human review queue; κ tracking; promote-to-golden flow |
 | 5 | Enterprise tier (SSO / SCIM / audit / dedicated) under ELv2 in `apps/api/ee/` |

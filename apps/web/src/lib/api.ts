@@ -214,8 +214,8 @@ export const getRun = (runId: string) =>
   request<RunOut>(`/v1/runs/${encodeURIComponent(runId)}`);
 
 // ---------------------------------------------------------------------------
-// Orgs / Projects — listed in 2.6a so the Settings page can show
-// the caller's tenant context.
+// Orgs
+
 
 export interface Org {
   org_id: string;
@@ -224,5 +224,75 @@ export interface Org {
   created_at: string;
 }
 
-export const listOrgs = () =>
-  request<{ orgs: Org[] }>(`/v1/orgs`);
+export const listOrgs = () => request<{ orgs: Org[] }>(`/v1/orgs`);
+
+export const createOrg = (body: { slug: string; name: string }) =>
+  request<Org>(`/v1/orgs`, { method: "POST", body: JSON.stringify(body) });
+
+// ---------------------------------------------------------------------------
+// Projects
+
+
+export interface Project {
+  project_id: string;
+  org_id: string;
+  slug: string;
+  name: string;
+  created_at: string;
+}
+
+export const listProjects = (opts: { org_id?: string } = {}) => {
+  const qs = opts.org_id
+    ? `?org_id=${encodeURIComponent(opts.org_id)}`
+    : "";
+  return request<{ projects: Project[] }>(`/v1/projects${qs}`);
+};
+
+export const createProject = (body: { slug: string; name?: string; org_id?: string }) => {
+  const { org_id, ...rest } = body;
+  const qs = org_id ? `?org_id=${encodeURIComponent(org_id)}` : "";
+  return request<Project>(`/v1/projects${qs}`, {
+    method: "POST",
+    body: JSON.stringify(rest),
+  });
+};
+
+// ---------------------------------------------------------------------------
+// API keys
+
+
+export interface ApiKeySummary {
+  key_id: string;
+  org_id: string;
+  prefix: string;
+  name: string;
+  scopes: string[];
+  created_at: string;
+  revoked_at: string | null;
+  last_used_at: string | null;
+}
+
+export interface ApiKeyCreated {
+  key: ApiKeySummary;
+  /** Plaintext bearer — returned exactly once. The server never reveals it again. */
+  token: string;
+}
+
+export const listApiKeys = (orgId: string) =>
+  request<{ keys: ApiKeySummary[] }>(
+    `/v1/orgs/${encodeURIComponent(orgId)}/api_keys`,
+  );
+
+export const createApiKey = (
+  orgId: string,
+  body: { name: string; scopes?: string[] },
+) =>
+  request<ApiKeyCreated>(
+    `/v1/orgs/${encodeURIComponent(orgId)}/api_keys`,
+    { method: "POST", body: JSON.stringify({ scopes: [], ...body }) },
+  );
+
+export const revokeApiKey = (keyId: string) =>
+  request<void>(`/v1/api_keys/${encodeURIComponent(keyId)}`, {
+    method: "DELETE",
+  });

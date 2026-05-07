@@ -20,11 +20,31 @@ project plan; Apache-2.0 licensed (same family as `apps/api/`).
   any static host (S3, GitHub Pages, the FastAPI server's static
   mount, or the included nginx Dockerfile)
 
-## What's NOT in scope yet (deferred to 2.6b)
+## Phase 2.6b additions
 
-- Datasets / Prompts / Judges pages — need new server endpoints first
-- Org / Project / API-key management UI
-- Tests (Vitest unit + Playwright e2e)
+- **Vitest 3 + React Testing Library** (`happy-dom` runtime). 27
+  unit tests across `auth.ts`, the `api.ts` fetch wrapper, `Badge` /
+  `statusTone`, and `ConnectionGate`. Run via `npm test` (one-shot)
+  or `npm run test:watch`.
+- **Orgs page** (`/orgs/`) — list every visible org (members see
+  their own; admins see all) and create new orgs (admin scope
+  required server-side; UI shows a clear error if a member
+  submits).
+- **Projects page** (`/projects/`) — list projects in caller's org
+  + create form. Admin callers can pass an explicit `org_id` to
+  target a different tenant (mirrors the server's `?org_id=`
+  parameter).
+- **Keys page** (`/keys/`) — per-org API-key management. New keys
+  show the plaintext token in a one-time banner with a Copy
+  button (the server never returns it again). Revocation is
+  two-click via `ConfirmButton`.
+- Nav now surfaces Runs / Projects / Keys / Orgs / Settings.
+
+## What's NOT in scope yet (deferred to 2.6c)
+
+- Datasets / Prompts / Judges browse pages — needs server-side
+  asset-aggregation endpoints first
+- Playwright e2e (Vitest covers the unit / component layer)
 - Real-time updates (polling / SSE)
 - Login flow beyond bearer-paste (OAuth / SSO is enterprise-tier)
 
