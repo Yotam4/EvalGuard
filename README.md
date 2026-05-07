@@ -289,13 +289,23 @@ separate from the MIT-licensed CLI.
   migrations on startup. The integration suite at
   `tests/api/test_postgres.py` is gated by `EVALGUARD_TEST_POSTGRES_URL`
   so SQLite-only contributors don't need a running pg.
+- **Phase 2.6a (Next.js UI vertical slice)** — `apps/web/` Next.js 16
+  + React 19 + Tailwind 4 SPA at the same JSON contract `view --json`
+  produces. Static export (`output: 'export'`) — no Node runtime in
+  prod; nginx Dockerfile included. Pages: **Settings** (server URL +
+  bearer + `GET /v1/health` probe), **Runs** list (with project
+  filter), **Run detail** (trials, gates, assets, per-trial gate
+  table). `src/lib/api.ts` carries TypeScript mirrors of the
+  `evalguard.run.schema.json` shapes so a contract drift surfaces as
+  a type error. Bearer + server URL persist in `localStorage`; one
+  static bundle deploys against staging or prod with no rebuild.
 
 ## Coming next
 
 | Phase | Deliverable |
 |---|---|
 | 1.5 | Published `evalguard/action@v1`; baseline registry polish |
-| 2.6 | Next.js UI: Runs / Datasets / Prompts / Judges / Settings — consumes the same JSON contract `view --json` produces |
+| 2.6b | Datasets / Prompts / Judges UI pages; Org / Project / API-key management UI; Vitest + Playwright tests; real-time updates |
 | 3 | OTLP / `gen_ai.*` ingest; online sampler; drift detection |
 | 4 | Argilla-style human review queue; κ tracking; promote-to-golden flow |
 | 5 | Enterprise tier (SSO / SCIM / audit / dedicated) under ELv2 in `apps/api/ee/` |
@@ -402,7 +412,9 @@ $ evalguard audit export run_abc -f otel-json | otel-collector ingest
 ```
 apps/
   api/                FastAPI server (Apache-2.0): /v1/runs ingest + read
-                      (planned: web, worker)
+  web/                Next.js 16 SPA (Apache-2.0): Runs + Settings pages,
+                      static export, deploys behind nginx or any static host
+                      (planned: worker)
 packages/
   cli/                evalguard CLI + local executor
   evaluators/         heuristics, metrics, judges, providers

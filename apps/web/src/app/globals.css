@@ -1,0 +1,27 @@
+@import "tailwindcss";
+
+/* Tailwind 4 reads tokens directly from CSS via @theme. The
+   minimal palette below sticks to the neutrals + a single accent;
+   evaluators / gates render their own status colors via Badge. */
+
+@theme {
+  --color-bg:        #0b0f17;
+  --color-bg-card:   #131927;
+  --color-bg-row:    #182033;
+  --color-fg:        #e7ecf3;
+  --color-fg-muted:  #8a93a3;
+  --color-border:    #232b3d;
+  --color-accent:    #66d9b3;
+
+  --color-pass:      #4ade80;
+  --color-warn:      #fbbf24;
+  --color-fail:      #f87171;
+}
+
+html, body {
+  background: var(--color-bg);
+  color: var(--color-fg);
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+a { color: inherit; }
