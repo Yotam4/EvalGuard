@@ -48,6 +48,7 @@ curl -s -H "Authorization: Bearer $EVALGUARD_API_KEY" \
 | `POST` | `/v1/runs`           | Member. Ingest under caller's org. 201 + `Location`; 409 on duplicate `run_id`. |
 | `GET`  | `/v1/runs`           | Member. Scoped to caller's org. Query: `project=<slug>&limit=20`. |
 | `GET`  | `/v1/runs/{run_id}`  | Member. 404 on cross-org access (no info leak). |
+| `GET`  | `/v1/assets`         | Member. Cross-run aggregation by `(kind, asset_id)`. Query: `kind=prompt\|dataset\|judge\|heuristic\|metric\|schema\|rubric&project=<slug>&limit=100`. |
 | `GET`  | `/openapi.json`      | OpenAPI 3 spec (auto-generated). |
 | `GET`  | `/docs`              | Swagger UI. |
 

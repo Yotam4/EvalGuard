@@ -309,13 +309,24 @@ separate from the MIT-licensed CLI.
   two-click `ConfirmButton` revoke). Nav surfaces all five
   management routes. The TypeScript contract types extend with
   `Project`, `ApiKeySummary`, `ApiKeyCreated`.
+- **Phase 2.6c (asset browse + polling refresh)** — new server
+  endpoint `GET /v1/assets?kind=X&project=Y` aggregates per-run
+  `assets[]` rows by `(project, kind, asset_id)` with
+  `version_count` / `run_count` / `last_seen` / `last_run_id` /
+  `last_version_id`. Scope respects org boundaries (member sees
+  own; admin sees all). New `/assets/` web page with kind tabs
+  (Datasets / Prompts / Judges / Heuristics / Metrics / Schemas
+  / Rubrics) consuming it; rows link to the project's runs and
+  to the most-recent run that produced each version. Runs list
+  now polls every 10s via React Query's `refetchInterval` so
+  freshly-pushed runs surface without a manual refresh.
 
 ## Coming next
 
 | Phase | Deliverable |
 |---|---|
 | 1.5 | Published `evalguard/action@v1`; baseline registry polish |
-| 2.6c | Datasets / Prompts / Judges browse pages (needs server-side asset-aggregation endpoints); Playwright e2e; real-time updates (polling / SSE) |
+| 2.6d | Asset detail page (versions over time + runs that used each); Playwright e2e |
 | 3 | OTLP / `gen_ai.*` ingest; online sampler; drift detection |
 | 4 | Argilla-style human review queue; κ tracking; promote-to-golden flow |
 | 5 | Enterprise tier (SSO / SCIM / audit / dedicated) under ELv2 in `apps/api/ee/` |

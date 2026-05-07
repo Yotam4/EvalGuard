@@ -313,3 +313,37 @@ class ProjectList(_Strict):
 
 class ApiKeyList(_Strict):
     keys: list[ApiKeySummary]
+
+
+# ---------------------------------------------------------------------------
+# Asset aggregation
+#
+# Runs carry ``assets[]`` rows in their JSON (one per loaded prompt /
+# dataset / judge / etc).  Operators want a cross-run view: "show me
+# every dataset used in this project, with version counts." This
+# endpoint flattens the per-run rows into one record per
+# ``(kind, asset_id)`` tuple.
+
+
+class AssetSummary(_Strict):
+    """One row of the aggregated assets listing."""
+
+    kind:           str
+    asset_id:       str
+    project_id:     str
+    project_name:   str
+    version_count:  int = Field(ge=0,
+        description="Distinct ``version_id`` values seen across runs.")
+    run_count:      int = Field(ge=0,
+        description="Distinct ``run_id`` values that referenced this asset.")
+    last_seen:      str = Field(
+        description="ISO timestamp of the most recent ingest of any version "
+                    "of this asset (drawn from runs.ingested_at).")
+    last_run_id:    str = Field(
+        description="``run_id`` whose ingest produced ``last_seen``.")
+    last_version_id: str = Field(
+        description="``version_id`` carried on that most-recent ingest.")
+
+
+class AssetList(_Strict):
+    assets: list[AssetSummary]

@@ -40,13 +40,25 @@ project plan; Apache-2.0 licensed (same family as `apps/api/`).
   two-click via `ConfirmButton`.
 - Nav now surfaces Runs / Projects / Keys / Orgs / Settings.
 
-## What's NOT in scope yet (deferred to 2.6c)
+## Phase 2.6c additions
 
-- Datasets / Prompts / Judges browse pages — needs server-side
-  asset-aggregation endpoints first
-- Playwright e2e (Vitest covers the unit / component layer)
-- Real-time updates (polling / SSE)
-- Login flow beyond bearer-paste (OAuth / SSO is enterprise-tier)
+- **`/assets/` page** — single browse page across all asset kinds
+  (Datasets / Prompts / Judges / Heuristics / Metrics / Schemas /
+  Rubrics) backed by the new `GET /v1/assets` endpoint. Kind tabs
+  + project filter; rows show version count, run count, the most
+  recent ingest, and a deep-link to the run that produced it.
+- **Polling refresh** on `/runs/` via React Query's
+  `refetchInterval: 10_000` so freshly-pushed runs surface
+  without a manual refresh.
+- **Nav** now exposes Runs / Assets / Projects / Keys / Orgs /
+  Settings.
+
+## What's NOT in scope yet (deferred to 2.6d)
+
+- Asset detail page — versions over time for one
+  `(kind, asset_id)` pair, and the runs that used each version.
+- Playwright e2e (Vitest covers the unit / component layer).
+- Login flow beyond bearer-paste (OAuth / SSO is enterprise-tier).
 
 ## Quickstart — local dev
 

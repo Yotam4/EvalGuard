@@ -32,6 +32,7 @@ from evalguard_api.db import (
     hash_token, key_hash_exists, make_engine,
 )
 from evalguard_api.routes.api_keys import router as api_keys_router
+from evalguard_api.routes.assets import router as assets_router
 from evalguard_api.routes.health import router as health_router
 from evalguard_api.routes.orgs import router as orgs_router
 from evalguard_api.routes.projects import router as projects_router
@@ -197,6 +198,7 @@ def build_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(projects_router)
     app.include_router(api_keys_router)
     app.include_router(runs_router)
+    app.include_router(assets_router)
     return app
 
 

@@ -23,6 +23,11 @@ function RunsList() {
   const q = useQuery({
     queryKey: ["runs", project],
     queryFn: () => listRuns({ project: project || undefined, limit: 50 }),
+    // Light polling so freshly-pushed runs appear without a manual
+    // refresh. 10 s is generous — the underlying GET is cheap and
+    // the server's QueryPool serves it from its hot path. React
+    // Query dedupes the request with anything already in-flight.
+    refetchInterval: 10_000,
   });
 
   return (

@@ -3,7 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setServerUrl, setToken } from "../auth";
 import {
   ApiError, NotConfiguredError,
-  createApiKey, createOrg, getRun, health, listRuns, revokeApiKey,
+  createApiKey, createOrg, getRun, health, listAssets, listRuns,
+  revokeApiKey,
 } from "../api";
 
 /**
@@ -160,5 +161,35 @@ describe("api client", () => {
     const body = JSON.parse((init.body as string));
     expect(body.scopes).toEqual([]);
     expect(body.name).toBe("ci");
+  });
+
+  // ---------------------------------------------------------------------
+  // listAssets — query-string assembly
+
+
+  it("listAssets composes kind + project + limit query params", async () => {
+    setServerUrl("https://api.example.com");
+    setToken("evk_x");
+    fetchMock.mockResolvedValueOnce({
+      ok: true, status: 200,
+      json: async () => ({ assets: [] }),
+    });
+    await listAssets({ kind: "judge", project: "demo", limit: 25 });
+    const [url] = fetchMock.mock.calls[0];
+    expect(url).toBe(
+      "https://api.example.com/v1/assets?kind=judge&project=demo&limit=25",
+    );
+  });
+
+  it("listAssets omits the query string when no params are passed", async () => {
+    setServerUrl("https://api.example.com");
+    setToken("evk_x");
+    fetchMock.mockResolvedValueOnce({
+      ok: true, status: 200,
+      json: async () => ({ assets: [] }),
+    });
+    await listAssets();
+    const [url] = fetchMock.mock.calls[0];
+    expect(url).toBe("https://api.example.com/v1/assets");
   });
 });

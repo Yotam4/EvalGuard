@@ -296,3 +296,37 @@ export const revokeApiKey = (keyId: string) =>
   request<void>(`/v1/api_keys/${encodeURIComponent(keyId)}`, {
     method: "DELETE",
   });
+
+
+// ---------------------------------------------------------------------------
+// Assets — aggregated cross-run view (Phase 2.6c)
+
+
+export type AssetKind =
+  | "prompt" | "dataset" | "schema" | "rubric"
+  | "judge"  | "heuristic" | "metric";
+
+
+export interface AssetSummary {
+  kind:            AssetKind;
+  asset_id:        string;
+  project_id:      string;
+  project_name:    string;
+  version_count:   number;
+  run_count:       number;
+  last_seen:       string;
+  last_run_id:     string;
+  last_version_id: string;
+}
+
+
+export const listAssets = (
+  opts: { kind?: AssetKind; project?: string; limit?: number } = {},
+) => {
+  const qs = new URLSearchParams();
+  if (opts.kind)    qs.set("kind",    opts.kind);
+  if (opts.project) qs.set("project", opts.project);
+  if (opts.limit)   qs.set("limit",   String(opts.limit));
+  const suffix = qs.toString() ? `?${qs.toString()}` : "";
+  return request<{ assets: AssetSummary[] }>(`/v1/assets${suffix}`);
+};
