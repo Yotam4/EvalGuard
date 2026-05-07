@@ -1,7 +1,7 @@
-"""Layer-2 RAG metric proxies (faithfulness / answer_relevancy /
-context_precision / context_recall).
+"""Layer-2 RAG metric proxies (lex.faithfulness / lex.answer_relevancy /
+lex.context_precision_unranked / lex.context_recall).
 
-The implementations are deterministic n-gram proxies. These tests pin
+The implementations are deterministic lexical proxies. These tests pin
 the qualitative behaviour: a faithful answer scores high, a
 hallucinated one scores low, etc. They are NOT calibrated against
 ground-truth RAGAS — proxies are wedge-of-the-truth, not the truth.
@@ -13,10 +13,10 @@ import asyncio
 
 from evalguard_evaluators.base import EvalContext
 from evalguard_evaluators.metrics.rag import (
-    AnswerRelevancyMetric,
-    ContextPrecisionMetric,
-    ContextRecallMetric,
-    FaithfulnessMetric,
+    AnswerRelevancyLexMetric,
+    ContextPrecisionLexUnrankedMetric,
+    ContextRecallLexMetric,
+    FaithfulnessLexMetric,
 )
 
 
@@ -43,7 +43,7 @@ def _run(metric, ctx: EvalContext) -> float:
 
 
 def test_faithfulness_high_when_output_grounded_in_contexts():
-    m = FaithfulnessMetric(); m.configure({})
+    m = FaithfulnessLexMetric(); m.configure({})
     ctx = _ctx(
         output="Paris is the capital of France.",
         contexts=["The capital of France is Paris."],
@@ -52,7 +52,7 @@ def test_faithfulness_high_when_output_grounded_in_contexts():
 
 
 def test_faithfulness_low_when_output_introduces_unsupported_claims():
-    m = FaithfulnessMetric(); m.configure({})
+    m = FaithfulnessLexMetric(); m.configure({})
     ctx = _ctx(
         output="Wikipedia mentions zebras crossings frequently downtown.",
         contexts=["Paris is the capital of France."],
@@ -61,7 +61,7 @@ def test_faithfulness_low_when_output_introduces_unsupported_claims():
 
 
 def test_faithfulness_vacuous_when_no_contexts():
-    m = FaithfulnessMetric(); m.configure({})
+    m = FaithfulnessLexMetric(); m.configure({})
     ctx = _ctx(output="anything", contexts=[])
     # No contexts → vacuously faithful (proxy can't disprove faithfulness).
     assert _run(m, ctx) == 1.0
@@ -72,7 +72,7 @@ def test_faithfulness_vacuous_when_no_contexts():
 
 
 def test_answer_relevancy_high_when_output_addresses_question():
-    m = AnswerRelevancyMetric(); m.configure({})
+    m = AnswerRelevancyLexMetric(); m.configure({})
     ctx = _ctx(
         output="The capital of France is Paris, which sits on the Seine.",
         question="What is the capital of France?",
@@ -81,7 +81,7 @@ def test_answer_relevancy_high_when_output_addresses_question():
 
 
 def test_answer_relevancy_low_when_off_topic():
-    m = AnswerRelevancyMetric(); m.configure({})
+    m = AnswerRelevancyLexMetric(); m.configure({})
     ctx = _ctx(
         output="Bananas grow on trees in tropical climates.",
         question="What is the capital of France?",
@@ -90,9 +90,35 @@ def test_answer_relevancy_low_when_off_topic():
 
 
 def test_answer_relevancy_zero_when_empty_output():
-    m = AnswerRelevancyMetric(); m.configure({})
+    m = AnswerRelevancyLexMetric(); m.configure({})
     ctx = _ctx(output="", question="What is the capital of France?")
     assert _run(m, ctx) == 0.0
+
+
+def test_answer_relevancy_does_not_reward_question_echo():
+    """A model that just parrots the question back must NOT score 1.0.
+
+    Before the fix, ``output = question`` produced a perfect coverage
+    score because every question token literally appeared in the
+    output. The metric now strips a verbatim question echo before
+    scoring so the parrot collapses toward 0."""
+    m = AnswerRelevancyLexMetric(); m.configure({})
+    question = "What is the capital of France?"
+    ctx = _ctx(output=question, question=question)
+    assert _run(m, ctx) == 0.0
+
+
+def test_answer_relevancy_real_answer_after_echo_still_scores():
+    """When the output echoes the question AND adds a real answer,
+    only the non-echo portion should drive the score — but a relevant
+    answer with topic overlap should still pass."""
+    m = AnswerRelevancyLexMetric(); m.configure({})
+    question = "What is the capital of France?"
+    output = f"{question} The capital of France is Paris."
+    ctx = _ctx(output=output, question=question)
+    # Non-echo body: "The capital of France is Paris." → still has
+    # ``capital``, ``france`` overlap with the question.
+    assert _run(m, ctx) >= 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +126,7 @@ def test_answer_relevancy_zero_when_empty_output():
 
 
 def test_context_precision_one_when_all_contexts_relevant():
-    m = ContextPrecisionMetric(); m.configure({})
+    m = ContextPrecisionLexUnrankedMetric(); m.configure({})
     ctx = _ctx(
         output="ignored",
         expected_answer="Paris is the capital of France",
@@ -113,7 +139,7 @@ def test_context_precision_one_when_all_contexts_relevant():
 
 
 def test_context_precision_low_when_padded_with_irrelevant():
-    m = ContextPrecisionMetric(); m.configure({})
+    m = ContextPrecisionLexUnrankedMetric(); m.configure({})
     ctx = _ctx(
         output="ignored",
         expected_answer="Paris is the capital of France",
@@ -133,7 +159,7 @@ def test_context_precision_low_when_padded_with_irrelevant():
 
 
 def test_context_recall_high_when_answer_recoverable_from_contexts():
-    m = ContextRecallMetric(); m.configure({})
+    m = ContextRecallLexMetric(); m.configure({})
     ctx = _ctx(
         output="ignored",
         expected_answer="Paris capital France",
@@ -143,7 +169,7 @@ def test_context_recall_high_when_answer_recoverable_from_contexts():
 
 
 def test_context_recall_zero_when_no_contexts():
-    m = ContextRecallMetric(); m.configure({})
+    m = ContextRecallLexMetric(); m.configure({})
     ctx = _ctx(
         output="ignored",
         expected_answer="Paris capital France",
@@ -153,7 +179,7 @@ def test_context_recall_zero_when_no_contexts():
 
 
 def test_context_recall_low_when_answer_not_in_contexts():
-    m = ContextRecallMetric(); m.configure({})
+    m = ContextRecallLexMetric(); m.configure({})
     ctx = _ctx(
         output="ignored",
         expected_answer="Paris capital France",
@@ -167,7 +193,7 @@ def test_context_recall_low_when_answer_not_in_contexts():
 
 
 def test_threshold_drives_passed_field():
-    m = FaithfulnessMetric(); m.configure({"threshold": 0.99})
+    m = FaithfulnessLexMetric(); m.configure({"threshold": 0.99})
     ctx = _ctx(
         output="grounded paraphrase here",
         contexts=["the same grounded paraphrase here"],
@@ -182,7 +208,7 @@ def test_threshold_drives_passed_field():
 def test_metrics_resolve_from_ctx_input_and_expected_when_extra_missing():
     """Backward-compatibility: rows that use ``input`` / ``expected``
     instead of ``question`` / ``expected_answer`` still work."""
-    m = AnswerRelevancyMetric(); m.configure({})
+    m = AnswerRelevancyLexMetric(); m.configure({})
     ctx = EvalContext(
         row_id="r",
         input="What is the capital of France?",  # falls back here

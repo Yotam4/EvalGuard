@@ -24,9 +24,12 @@ from alembic import command as alembic_command
 from alembic.config import Config as AlembicConfig
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy import text
+from starlette.middleware.httpsredirect import HTTPSRedirectMiddleware
 
-from evalguard_api.config import Settings, load_settings
+from evalguard_api.config import Settings, load_settings, validate_for_startup
 from evalguard_api.db import (
     apply_admin_rls_context, create_api_key, ensure_default_tenancy,
     hash_token, key_hash_exists, make_engine,
@@ -63,23 +66,24 @@ def _alembic_config(database_url: str) -> AlembicConfig:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings: Settings = app.state.settings
+
+    # Refuse-to-boot: catches the dangerous combinations explicitly
+    # (open mode without opt-in, open mode with CORS=*) before any
+    # network listener binds.
+    validate_for_startup(settings)
+
     if settings.is_open_mode:
         logger.warning(
-            "EvalGuard API starting in OPEN mode — no API key configured. "
-            "Do NOT expose this server beyond local dev."
+            "EvalGuard API starting in OPEN mode (EVALGUARD_OPEN_MODE=1) — "
+            "no API key configured. Do NOT expose this server beyond "
+            "local dev."
         )
-    elif "*" in settings.cors_origins:
-        # Auth is on but CORS is wide open — a browser at any origin
-        # can land a tab at the API with the user's bearer token in
-        # localStorage and have free reign. This is the default
-        # because dev convenience matters more than the warning, but
-        # production deployments should set EVALGUARD_CORS_ORIGINS
-        # to an explicit allowlist.
+    if "*" in settings.cors_origins and not settings.is_open_mode:
         logger.warning(
-            "EvalGuard API CORS is wide open ('*'). "
-            "Set EVALGUARD_CORS_ORIGINS to a comma-separated allowlist "
-            "(e.g. 'https://app.example.com') before exposing the "
-            "server to a browser-reachable network."
+            "EvalGuard API CORS is wide open ('*') with auth enabled. "
+            "Browser tabs at any origin can call the API with a stolen "
+            "bearer token. Set EVALGUARD_CORS_ORIGINS to a comma-separated "
+            "allowlist for any browser-reachable deployment."
         )
 
     # 1. Build the engine. The same engine is used by every route
@@ -87,19 +91,55 @@ async def lifespan(app: FastAPI):
     engine = make_engine(settings)
     app.state.engine = engine
 
-    # 2. Apply all pending Alembic migrations. Idempotent —
+    # 2. BYPASSRLS guard — refuse to boot if the runtime DB role can
+    #    bypass row-level security. RLS is the *only* defense-in-depth
+    #    layer beyond the application-layer auth; a runtime role that
+    #    silently sees every row defeats the entire 0002/0003 layer.
+    #    Migrations should run as a separate ``evalguard_migrator``
+    #    role that has BYPASSRLS; the runtime role must not.
+    if engine.dialect.name == "postgresql":
+        with engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT bypassrls FROM pg_roles WHERE rolname = current_user"
+            )).first()
+            if row and row[0]:
+                raise RuntimeError(
+                    "EvalGuard refuses to start: the runtime DB role "
+                    f"({conn.execute(text('SELECT current_user')).scalar()}) "
+                    "has BYPASSRLS. RLS in migrations 0002/0003 is the "
+                    "only DB-layer tenancy enforcement; a BYPASSRLS role "
+                    "silently disables it. Run the API as a non-superuser "
+                    "role; let migrations run as a separate role."
+                )
+
+    # 3. Apply all pending Alembic migrations. Idempotent —
     #    ``alembic_version`` tracks the applied revision; re-startups
     #    are no-ops once head has been reached.
     alembic_command.upgrade(_alembic_config(settings.database_url), "head")
 
-    # 3. Default org / project + admin-key bootstrap.
+    # 4. Default org / project + admin-key bootstrap.
     #
-    # The lifespan transaction needs to bypass RLS — it's writing to
-    # ``orgs`` / ``projects`` / ``api_keys`` BEFORE any user request,
-    # so there's no caller-org to scope to. Admin context lets the
-    # writes through; per-request transactions in ``deps.get_conn``
-    # supersede it with the actual principal.
+    # On Postgres, wrap the whole bootstrap in a session-level advisory
+    # lock so two concurrently-launched workers (gunicorn pre-fork,
+    # k8s rolling restart) don't both pass ``key_hash_exists`` and
+    # then crash on the UNIQUE constraint when the second one inserts.
+    # The lock auto-releases when the connection is closed, so even if
+    # the lifespan crashes mid-bootstrap, the next startup acquires
+    # cleanly.
+    #
+    # The lifespan transaction also needs to bypass RLS — it's writing
+    # to ``orgs`` / ``projects`` / ``api_keys`` BEFORE any user
+    # request, so there's no caller-org to scope to. Admin context
+    # lets the writes through; per-request transactions in
+    # ``deps.get_conn`` supersede it with the actual principal.
+    _BOOTSTRAP_LOCK = 0x45_56_61_6C_47_72_64_31  # ASCII 'EvalGrd1'
+
     with engine.begin() as conn:
+        if engine.dialect.name == "postgresql":
+            conn.execute(
+                text("SELECT pg_advisory_xact_lock(:k)"),
+                {"k": _BOOTSTRAP_LOCK},
+            )
         apply_admin_rls_context(conn)
         org_id, _ = ensure_default_tenancy(
             conn,
@@ -154,6 +194,18 @@ def build_app(settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.settings = settings
+    # ``HTTPSRedirectMiddleware`` must run before any other middleware
+    # that touches the URL — install first. ``TrustedHostMiddleware``
+    # next so spoofed Host headers are rejected before CORS pre-flight
+    # logic looks at the Origin. Both are env-gated so local dev on
+    # http://localhost still works without flags.
+    if settings.require_https:
+        app.add_middleware(HTTPSRedirectMiddleware)
+    if settings.trusted_hosts and settings.trusted_hosts != ("*",):
+        app.add_middleware(
+            TrustedHostMiddleware,
+            allowed_hosts=list(settings.trusted_hosts),
+        )
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(settings.cors_origins),
@@ -168,6 +220,56 @@ def build_app(settings: Settings | None = None) -> FastAPI:
     # uploads without a length header bypass this check, but every
     # plausible client (httpx, curl, requests, urllib) sends a
     # length on POST bodies.
+    # Structured access log: one JSON line per response. Required
+    # for SOC 2 / ISO 27001 — the audit trail needs to know which
+    # api_key called which route with what outcome and how long it
+    # took. ``key_id`` is populated by ``require_principal`` setting
+    # ``request.state.principal`` (when auth ran); for unauthenticated
+    # paths (``/v1/health``) the field is omitted.
+    @app.middleware("http")
+    async def _access_log(request: Request, call_next):
+        import json as _json
+        import time as _time
+        t0 = _time.monotonic()
+        # Read these BEFORE call_next — once the response is returned
+        # the request scope may have been consumed.
+        method = request.method
+        # Use the matched route's path template (``/v1/runs/{run_id}``)
+        # rather than the literal URL so logs aggregate cleanly. Fall
+        # back to the raw path if the router hasn't matched yet.
+        try:
+            response = await call_next(request)
+        except Exception:
+            elapsed_ms = int((_time.monotonic() - t0) * 1000)
+            principal = getattr(request.state, "principal", None)
+            entry = {
+                "evt":         "http.request",
+                "method":      method,
+                "path":        request.url.path,
+                "status":      500,
+                "duration_ms": elapsed_ms,
+                "key_id":      getattr(principal, "key_id", None),
+                "org_id":      getattr(principal, "org_id", None),
+                "exception":   True,
+            }
+            logger.info(_json.dumps({k: v for k, v in entry.items() if v is not None}))
+            raise
+        elapsed_ms = int((_time.monotonic() - t0) * 1000)
+        principal = getattr(request.state, "principal", None)
+        route = request.scope.get("route")
+        path_template = getattr(route, "path", None) or request.url.path
+        entry = {
+            "evt":         "http.request",
+            "method":      method,
+            "path":        path_template,
+            "status":      response.status_code,
+            "duration_ms": elapsed_ms,
+            "key_id":      getattr(principal, "key_id", None),
+            "org_id":      getattr(principal, "org_id", None),
+        }
+        logger.info(_json.dumps({k: v for k, v in entry.items() if v is not None}))
+        return response
+
     @app.middleware("http")
     async def _enforce_max_body(request: Request, call_next):
         cl = request.headers.get("content-length")

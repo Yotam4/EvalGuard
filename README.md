@@ -126,8 +126,8 @@ heuristics:                            # Layer 1 — cheap deterministic
   - { type: not_contains, value: "As an AI" }
 
 metrics:                               # Layer 2 — RAG / semantic-similarity
-  - { id: faithfulness,      type: faithfulness,      threshold: 0.5 }
-  - { id: context_recall,    type: context_recall,    threshold: 0.5 }
+  - { id: lex.faithfulness,   type: lex.faithfulness,   threshold: 0.3 }
+  - { id: lex.context_recall, type: lex.context_recall, threshold: 0.5 }
 
 judges:                                # Layer 3 — LLM-as-judge
   - id: helpfulness
@@ -165,7 +165,7 @@ layers:                                # one configurable gate per pyramid step
   # ``evaluator: <id>`` to scope the comparison.
   metrics:
     severity: warn
-    evaluator: faithfulness
+    evaluator: lex.faithfulness
     threshold:
       type: ttest
       alpha: 0.05
@@ -250,8 +250,10 @@ separate from the MIT-licensed CLI.
 - **Phase 1c** — `evalguard push` no-op fallback for the future server,
   schema-drift canaries for `actor_type` / `severity` / `gate_status`.
 - **Tier B (broaden eval surface)** — `rag` template + Layer-2 RAGAS-proxy
-  metrics (`faithfulness`, `answer_relevancy`, `context_precision`,
-  `context_recall`); `text_to_sql` template + three SQL heuristics
+  metrics (`lex.faithfulness`, `lex.answer_relevancy`,
+  `lex.context_precision_unranked`, `lex.context_recall` — lexical proxies;
+  the bare names are reserved for a future LLM-backed plugin); `text_to_sql`
+  template + three SQL heuristics
   (`sql_parses` via sqlglot, `dry_run_on_shadow_db` and
   `result_set_equivalence` via stdlib SQLite); top-level `systems:` block
   inlined into evaluator specs at YAML-load time so `version_id` covers

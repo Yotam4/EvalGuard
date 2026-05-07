@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 /**
  * Two-click guard for destructive actions. The first click shows
@@ -23,6 +23,18 @@ export function ConfirmButton({
   pending?: boolean;
 }) {
   const [armed, setArmed] = useState(false);
+  // Track the auto-disarm timer so an unmount during the 4s window
+  // doesn't leak a setState-on-unmounted-component warning.
+  const disarmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (disarmTimer.current) {
+        clearTimeout(disarmTimer.current);
+        disarmTimer.current = null;
+      }
+    };
+  }, []);
 
   if (pending) {
     return (
@@ -43,13 +55,27 @@ export function ConfirmButton({
         if (armed) {
           onConfirm();
           setArmed(false);
+          if (disarmTimer.current) {
+            clearTimeout(disarmTimer.current);
+            disarmTimer.current = null;
+          }
         } else {
           setArmed(true);
           // Auto-disarm after 4s so a stray click doesn't sit hot.
-          setTimeout(() => setArmed(false), 4000);
+          if (disarmTimer.current) clearTimeout(disarmTimer.current);
+          disarmTimer.current = setTimeout(() => {
+            setArmed(false);
+            disarmTimer.current = null;
+          }, 4000);
         }
       }}
-      onBlur={() => setArmed(false)}
+      onBlur={() => {
+        setArmed(false);
+        if (disarmTimer.current) {
+          clearTimeout(disarmTimer.current);
+          disarmTimer.current = null;
+        }
+      }}
       className={
         "rounded border px-2 py-1 text-xs transition " +
         (armed

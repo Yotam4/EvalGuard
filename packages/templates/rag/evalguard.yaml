@@ -6,9 +6,15 @@ template: rag
 # RAG runs typically benchmark one generator against the same
 # retriever-supplied contexts. Add multiple providers to compare models on
 # the same golden set. Every config value is forwarded to the SDK.
+#
+# The default smoke uses the ``mock`` provider with ``mode: fixed``;
+# the per-row ``params.output`` in the dataset supplies a canned RAG
+# answer so the deterministic metrics produce meaningful scores
+# without an API key. Swap to a real provider below to evaluate
+# against your model.
 providers:
   - id: mock:rag-strong
-    config: { mode: echo }
+    config: { mode: fixed }
   # - id: openai:gpt-4o-mini
   #   config:
   #     api_key: ${OPENAI_API_KEY}
@@ -35,24 +41,28 @@ heuristics:
   - type: not_contains
     value: "I don't know"        # remove this if "abstain" is a valid answer
 
-# ── Layer 2 — RAG metrics (deterministic n-gram proxies for RAGAS) ──────────
-# These are token-overlap proxies, not LLM-backed. They run in <10ms / row,
-# require no API key, and correlate well enough with LLM-based RAGAS for CI
-# regression-detection. For higher fidelity, register an LLM-backed plugin
-# under the ``evalguard.evaluators`` entry-point with the same id.
+# ── Layer 2 — RAG metrics (deterministic lexical proxies for RAGAS) ─────────
+# These are token-overlap proxies, NOT LLM-backed. The ``lex.`` prefix is
+# load-bearing — it signals to consumers that scores are lexical and frees
+# the bare names (``faithfulness``, ``answer_relevancy``, …) for a future
+# LLM-backed plugin you can register under ``evalguard.evaluators``.
+#
+# The proxies run in <10ms / row, require no API key, and correlate well
+# enough with LLM-based RAGAS for CI regression-detection. They are NOT
+# calibrated for absolute thresholds — tune ``threshold`` per project.
 metrics:
-  - id: faithfulness
-    type: faithfulness
-    threshold: 0.5
-  - id: answer_relevancy
-    type: answer_relevancy
+  - id: lex.faithfulness
+    type: lex.faithfulness
+    threshold: 0.3                # lexical coverage drops fast under paraphrase
+  - id: lex.answer_relevancy
+    type: lex.answer_relevancy
     threshold: 0.3
-  - id: context_precision
-    type: context_precision
+  - id: lex.context_precision_unranked
+    type: lex.context_precision_unranked
     threshold: 0.4
     relevance_min: 0.10           # a context "counts" if ≥10% of expected_answer tokens appear in it
-  - id: context_recall
-    type: context_recall
+  - id: lex.context_recall
+    type: lex.context_recall
     threshold: 0.5
 
 # ── Layer 3 — offline LLM-as-judge (optional) ───────────────────────────────

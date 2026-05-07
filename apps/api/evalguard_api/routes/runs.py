@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
@@ -38,6 +38,7 @@ router = APIRouter()
 @router.post("/v1/runs", status_code=status.HTTP_201_CREATED, tags=["runs"])
 def ingest_run(
     body: RunIngest,
+    request: Request,
     conn: Connection = Depends(get_conn),
     principal: Principal = Depends(require_principal),
 ) -> JSONResponse:
@@ -48,16 +49,36 @@ def ingest_run(
         conn, org_id=principal.org_id, project_name=body.project,
     )
 
-    # Conflict on duplicate run_id. Runs are immutable artefacts;
-    # explicit replacement would need its own endpoint.
+    # Idempotency: a CI re-run that pushes the same run_id should not
+    # 409 — return the existing resource as 200 OK so the caller sees
+    # success and moves on. The CLI sends ``Idempotency-Key: <run_id>``
+    # so the contract is explicit. Without the header, fall back to
+    # the previous strict 409 behaviour (a duplicate by accident is
+    # likely a bug we want surfaced loudly).
+    idem_key = request.headers.get("idempotency-key")
     existing = conn.execute(
-        text("SELECT 1 FROM runs WHERE run_id=:run_id"),
+        text("SELECT run_id FROM runs WHERE run_id=:run_id"),
         {"run_id": body.run_id},
     ).fetchone()
     if existing:
+        if idem_key == body.run_id:
+            return JSONResponse(
+                status_code=status.HTTP_200_OK,
+                content={
+                    "run_id":     body.run_id,
+                    "url":        f"/v1/runs/{body.run_id}",
+                    "project_id": project_id,
+                    "idempotent_replay": True,
+                },
+                headers={"Location": f"/v1/runs/{body.run_id}"},
+            )
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"Run {body.run_id!r} already exists.",
+            detail=(
+                f"Run {body.run_id!r} already exists. Send "
+                f"``Idempotency-Key: {body.run_id}`` if this is a "
+                f"deliberate retry."
+            ),
         )
 
     # Persist with ``exclude_unset=True`` so optional fields the
@@ -172,6 +193,16 @@ def get_run(
         "ingested_by": row["ingested_by"],
         "project_id":  row["project_id"],
     }
+    # E.4 — recompute ``audit.event_count`` from ``len(events)`` on
+    # read instead of trusting whatever the client wrote at ingest.
+    # The chain hash is the actual tamper-evidence; the count is for
+    # operator quick-look. Recomputing here means a malicious client
+    # that lied about the count can't surface that lie via GET.
+    audit = payload.get("audit")
+    if isinstance(audit, dict):
+        events = audit.get("events")
+        if isinstance(events, list):
+            audit["event_count"] = len(events)
     return RunOut.model_validate(payload)
 
 
@@ -234,18 +265,22 @@ def _persist_run(
         },
     )
 
-    for asset in payload.get("assets") or []:
+    assets_param = [
+        {
+            "run_id":     run_id,
+            "project_id": project_id,
+            "kind":       asset["kind"],
+            "asset_id":   asset["asset_id"],
+            "version_id": asset["version_id"],
+            "source":     asset.get("source"),
+        }
+        for asset in (payload.get("assets") or [])
+    ]
+    if assets_param:
         conn.execute(
             text("""INSERT INTO assets(run_id, project_id, kind, asset_id, version_id, source)
                     VALUES (:run_id, :project_id, :kind, :asset_id, :version_id, :source)"""),
-            {
-                "run_id":     run_id,
-                "project_id": project_id,
-                "kind":       asset["kind"],
-                "asset_id":   asset["asset_id"],
-                "version_id": asset["version_id"],
-                "source":     asset.get("source"),
-            },
+            assets_param,
         )
 
     for trial in payload.get("trials") or []:
@@ -281,7 +316,27 @@ def _persist_run(
                 "finished_at":       trial.get("finished_at"),
             },
         )
+        # Bulk-insert rows + per-trial gates via ``executemany`` so a
+        # 50k-row run is one round-trip per insert family rather than
+        # 50k. SQLAlchemy's ``execute(stmt, [dict, dict, ...])`` form
+        # is the canonical idiom; on Postgres it's collapsed into a
+        # multi-VALUES INSERT, on SQLite into a tight C-loop. Per-row
+        # SQL latency is the dominant cost on bulk import.
+        rows_param: list[dict] = []
         for r in trial.get("rows") or []:
+            rows_param.append({
+                "run_id":     run_id,
+                "trial_id":   trial["trial_id"],
+                "project_id": project_id,
+                "row_id":     r["row_id"],
+                "passed":     1 if r.get("passed") else 0,
+                "n_scores":   int(r.get("n_scores") or 0),
+                "cost_usd":   float(r.get("cost_usd") or 0.0),
+                "latency_ms": int(r.get("latency_ms") or 0),
+                "cache_hit":  1 if r.get("cache_hit") else 0,
+                "tags_json":  json.dumps(r.get("tags") or []),
+            })
+        if rows_param:
             conn.execute(
                 text("""INSERT INTO run_rows(
                           run_id, trial_id, project_id, row_id,
@@ -289,20 +344,23 @@ def _persist_run(
                         VALUES (
                           :run_id, :trial_id, :project_id, :row_id,
                           :passed, :n_scores, :cost_usd, :latency_ms, :cache_hit, :tags_json)"""),
-                {
-                    "run_id":     run_id,
-                    "trial_id":   trial["trial_id"],
-                    "project_id": project_id,
-                    "row_id":     r["row_id"],
-                    "passed":     1 if r.get("passed") else 0,
-                    "n_scores":   int(r.get("n_scores") or 0),
-                    "cost_usd":   float(r.get("cost_usd") or 0.0),
-                    "latency_ms": int(r.get("latency_ms") or 0),
-                    "cache_hit":  1 if r.get("cache_hit") else 0,
-                    "tags_json":  json.dumps(r.get("tags") or []),
-                },
+                rows_param,
             )
+
+        gates_param: list[dict] = []
         for g in trial.get("gates") or []:
+            gates_param.append({
+                "run_id":       run_id,
+                "trial_id":     trial["trial_id"],
+                "project_id":   project_id,
+                "gate_name":    g["gate_name"],
+                "blocking":     1 if g.get("blocking") else 0,
+                "passed":       1 if g["passed"] else 0,
+                "severity":     g.get("severity"),
+                "layer":        g.get("layer"),
+                "details_json": json.dumps(g.get("details") or []),
+            })
+        if gates_param:
             conn.execute(
                 text("""INSERT INTO gate_results(
                           run_id, trial_id, project_id,
@@ -310,17 +368,7 @@ def _persist_run(
                         VALUES (
                           :run_id, :trial_id, :project_id,
                           :gate_name, :blocking, :passed, :severity, :layer, :details_json)"""),
-                {
-                    "run_id":       run_id,
-                    "trial_id":     trial["trial_id"],
-                    "project_id":   project_id,
-                    "gate_name":    g["gate_name"],
-                    "blocking":     1 if g.get("blocking") else 0,
-                    "passed":       1 if g["passed"] else 0,
-                    "severity":     g.get("severity"),
-                    "layer":        g.get("layer"),
-                    "details_json": json.dumps(g.get("details") or []),
-                },
+                gates_param,
             )
 
     aggregate = payload.get("aggregate") or {}

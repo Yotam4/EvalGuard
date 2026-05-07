@@ -98,7 +98,9 @@ def require_principal(
         # Default org is provisioned in the lifespan, so the org_id is
         # guaranteed to exist.  We construct the slug-based id without
         # a DB roundtrip; ``ensure_default_tenancy`` mints the same id.
-        return _open_mode_principal(default_org_id=f"org_{settings.default_org_slug}")
+        principal = _open_mode_principal(default_org_id=f"org_{settings.default_org_slug}")
+        request.state.principal = principal
+        return principal
 
     if not authorization:
         _challenge("Missing Authorization header.")
@@ -124,7 +126,7 @@ def require_principal(
     if key_row is None:
         _challenge("Invalid or revoked API key.")
 
-    return Principal(
+    principal = Principal(
         key_id=key_row["key_id"],
         org_id=key_row["org_id"],
         # Strip on read AND filter empties — symmetric with the
@@ -134,6 +136,10 @@ def require_principal(
         scopes=tuple(s.strip() for s in key_row["scopes_csv"].split(",") if s.strip()),
         is_open_mode=False,
     )
+    # Stash on the request so the access-log middleware can include
+    # ``key_id`` / ``org_id`` in its structured output.
+    request.state.principal = principal
+    return principal
 
 
 def _challenge(detail: str) -> None:

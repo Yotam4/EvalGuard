@@ -29,23 +29,41 @@ _PRICING: dict[str, tuple[float, float]] = {
 class OpenAIProvider:
     id = "openai"
 
+    # 60s is generous for an eval-row LLM call but well under the
+    # OpenAI SDK's default ~10 minutes — a hung connection would
+    # otherwise block a row long enough that retry can't recover.
+    DEFAULT_TIMEOUT_S: float = 60.0
+
     def __init__(self) -> None:
         self._api_key: str | None = None
         self._base_url: str | None = None
         self._default_params: dict[str, Any] = {}
+        self._timeout_s: float = self.DEFAULT_TIMEOUT_S
         self._client: Any = None  # AsyncOpenAI, lazy-init in _get_client()
 
     def configure(self, cfg: dict[str, Any]) -> None:
         self._api_key = cfg.get("api_key") or os.environ.get("OPENAI_API_KEY")
         self._base_url = cfg.get("base_url")
+        self._timeout_s = float(cfg.get("timeout_s", self.DEFAULT_TIMEOUT_S))
         # ``retry`` is an evalguard-operational key the executor
         # normally strips before reaching here; filter it again as
         # defense-in-depth so a direct caller (or a future code path)
         # never accidentally forwards it as a SDK kwarg, which the
         # OpenAI client would reject.
+        #
+        # ``model`` is filtered too — when a user puts ``model:
+        # gpt-4o-mini`` in the provider config block (the natural
+        # spot for it), it would otherwise be merged into
+        # ``_default_params`` and passed twice to
+        # ``chat.completions.create``, raising
+        # ``TypeError: got multiple values for keyword argument 'model'``.
+        # The model arrives via the ``provider:model`` id at call time;
+        # the config-block copy is informational only.
+        # ``timeout_s`` is consumed above; strip it so the SDK never
+        # sees an unknown kwarg.
         self._default_params = {
             k: v for k, v in cfg.items()
-            if k not in {"api_key", "base_url", "retry"}
+            if k not in {"api_key", "base_url", "retry", "model", "timeout_s"}
         }
         self._client = None  # invalidate on reconfigure
 
@@ -73,9 +91,14 @@ class OpenAIProvider:
         client = self._get_client()
         merged = {**self._default_params, **(params or {})}
         start = time.monotonic()
+        # Per-call ``timeout`` overrides the SDK's default; the OpenAI
+        # client raises on timeout with a message that the default
+        # ``RetryPolicy`` already pattern-matches, so a hung connection
+        # surfaces as a normal retryable error.
         resp = await client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
+            timeout=self._timeout_s,
             **merged,
         )
         elapsed = int((time.monotonic() - start) * 1000)

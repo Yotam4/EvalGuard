@@ -494,7 +494,8 @@ class SqliteStore:
                 f"""SELECT layer,
                           AVG(value)  AS mean,
                           AVG(passed) AS pass_rate,
-                          COUNT(*)    AS n
+                          COUNT(*)    AS n,
+                          SUM(CASE WHEN passed=0 THEN 1 ELSE 0 END) AS fail_count
                    FROM scores WHERE run_id=? {scope_clause} GROUP BY layer""",
                 (run_id, *scope_args),
             ):
@@ -524,6 +525,13 @@ class SqliteStore:
                     "row_pass_rate": (row_pass / rows_in_layer) if rows_in_layer else 0.0,
                     "rows_evaluated": rows_in_layer,
                     "n": int(r["n"]),
+                    # ``fail_count`` is in *score-row* units (same as
+                    # by_evaluator.fail_count), so the gate's
+                    # ``count_failures`` aggregation can read either
+                    # rollup with the same units. The previous code
+                    # computed this from ``n - n*pass_rate`` at gate
+                    # time; centralizing here so the unit is obvious.
+                    "fail_count": int(r["fail_count"] or 0),
                     "evaluators": evaluators,
                 }
 
@@ -561,6 +569,21 @@ class SqliteStore:
             for tag, agg in by_tag.items():
                 agg["pass_rate"] = (agg["passed"] / agg["n"]) if agg["n"] else 0.0
 
+            # Per-evaluator score samples — the raw values that feed
+            # statistical-threshold gates (Welch's t-test). Inlined
+            # into this connection block (was a second ``_conn()``,
+            # which doubled connect/commit/close cost on every
+            # ``compute_metrics`` call — non-trivial on large runs).
+            samples: dict[str, list[float]] = {}
+            for r in c.execute(
+                f"""SELECT evaluator_id, value
+                    FROM scores
+                    WHERE run_id=? {scope_clause}
+                    ORDER BY evaluator_id, trial_id, row_id, id""",
+                (run_id, *scope_args),
+            ):
+                samples.setdefault(r["evaluator_id"], []).append(float(r["value"] or 0.0))
+
         # Flat keys for back-compat with the global-gate rule shape
         flat: dict[str, Any] = {
             "row_count": float(n_rows),
@@ -574,21 +597,6 @@ class SqliteStore:
             flat[f"layer{layer}.pass_rate"] = agg["pass_rate"]
             flat[f"layer{layer}.row_pass_rate"] = agg["row_pass_rate"]
             flat[f"layer{layer}.mean"] = agg["mean"]
-
-        # Per-evaluator score samples — the raw values that feed
-        # statistical-threshold gates (Welch's t-test). Cheap to fetch
-        # (a single SELECT, ordered for reproducibility) and cheap to
-        # serialize into a baseline file (~8 bytes × n_rows × n_evaluators).
-        samples: dict[str, list[float]] = {}
-        with self._conn() as c2:
-            for r in c2.execute(
-                f"""SELECT evaluator_id, value
-                    FROM scores
-                    WHERE run_id=? {scope_clause}
-                    ORDER BY evaluator_id, trial_id, row_id, id""",
-                (run_id, *scope_args),
-            ):
-                samples.setdefault(r["evaluator_id"], []).append(float(r["value"] or 0.0))
 
         flat["by_evaluator"] = by_evaluator
         flat["by_layer"] = by_layer

@@ -235,6 +235,32 @@ async def execute(
         sem = asyncio.Semaphore(concurrency)
         aborted = asyncio.Event()  # per-trial abort (fail_fast or cost cap)
 
+        # Per-trial provider-instance cache for per-row overrides. Without
+        # it, ``concurrency=8 × 1000 rows`` paid the
+        # ``importlib.metadata.entry_points`` walk inside ``load_provider``
+        # 1000 times. Keyed by (provider_name, frozen_cfg) so two rows
+        # with the same effective config share one provider instance.
+        provider_cache: dict[tuple[str, tuple[tuple[str, Any], ...]], Any] = {}
+
+        def _provider_key(name: str, cfg: dict[str, Any]) -> tuple[str, tuple[tuple[str, Any], ...]]:
+            # Sort keys so insertion order doesn't perturb the cache. Use
+            # ``repr`` for non-hashable values (nested dict/list) — slow
+            # path but only on cache miss.
+            try:
+                items = tuple(sorted(cfg.items()))
+                hash(items)
+            except TypeError:
+                items = tuple(sorted((k, repr(v)) for k, v in cfg.items()))
+            return (name, items)
+
+        def _get_or_load_provider(name: str, cfg: dict[str, Any]) -> Any:
+            key = _provider_key(name, cfg)
+            inst = provider_cache.get(key)
+            if inst is None:
+                inst = load_provider(name, cfg)
+                provider_cache[key] = inst
+            return inst
+
         async def process_row(idx: int, row: dict[str, Any]) -> tuple[float, bool, bool]:
             """Returns (cost, passed, attempted)."""
             nonlocal total_cost
@@ -272,13 +298,19 @@ async def execute(
                 # config. ``row.retry`` (operational) is read separately
                 # below so it never leaks into ``provider.complete``.
                 row_params = row.get("params") or {}
+                # Hoist ``row_retry_cfg`` out of the cache-miss branch
+                # so audit payloads that reference ``row_override``
+                # work even when the row was served from cache.
+                row_retry_cfg = row.get("retry") if isinstance(row, dict) else None
                 eff_provider_cfg = {**provider_cfg, **row_params} if row_params else provider_cfg
                 if row_override and eff_provider_name != provider_name:
-                    eff_provider = load_provider(eff_provider_name, eff_provider_cfg)
+                    eff_provider = _get_or_load_provider(eff_provider_name, eff_provider_cfg)
                 elif row_params:
-                    # Same provider class, different params → instantiate a
-                    # fresh provider so the merged config is applied.
-                    eff_provider = load_provider(eff_provider_name, eff_provider_cfg)
+                    # Same provider class, different params → fetch
+                    # (or instantiate-and-cache) a provider with the
+                    # merged config. Repeated rows with identical
+                    # overrides share one instance.
+                    eff_provider = _get_or_load_provider(eff_provider_name, eff_provider_cfg)
                 else:
                     eff_provider = provider
                 effective_provider_name, effective_model = eff_provider_name, eff_model
@@ -297,13 +329,9 @@ async def execute(
                     cache_hit = True
                 else:
                     # Per-trial retry policy with optional per-row override
-                    # via top-level ``row.retry``. (``params`` is reserved
-                    # for SDK-bound config, so retry — operational —
-                    # belongs at the row top-level next to ``provider``.)
-                    # ``on_retry`` emits a ``provider.retry`` audit event
-                    # per attempt so an operator can see the back-pressure
-                    # live.
-                    row_retry_cfg = row.get("retry") if isinstance(row, dict) else None
+                    # via top-level ``row.retry``. ``row_retry_cfg`` is
+                    # already hoisted above so the cache-hit path can
+                    # also include it in audit payloads.
                     eff_policy = (
                         RetryPolicy.from_config(row_retry_cfg) if row_retry_cfg
                         else trial_retry_policy
@@ -331,8 +359,31 @@ async def execute(
                             coro_factory=lambda: eff_provider.complete(prompt, model=eff_model),
                             policy=eff_policy,
                             on_retry=_on_retry,
+                            # Pass the trial-abort event so a 429
+                            # storm aborts as soon as another row's
+                            # post-call cost increment trips the cap,
+                            # rather than burning the full retry
+                            # budget under back-pressure.
+                            cancel=aborted,
                         )
                     except ProviderFailed as fail:
+                        # Attribute partial cost the provider billed
+                        # across attempts to the run total — never
+                        # silently lose it. The pre-flight check on
+                        # the next row will see the updated total.
+                        if fail.total_cost_usd:
+                            async with cost_lock:
+                                total_cost += fail.total_cost_usd
+                                if cost_cap is not None and total_cost >= cost_cap:
+                                    aborted.set()
+                                    cost_capped.set()
+                        # If this failure was a retry-loop cancel
+                        # (cost cap fired elsewhere mid-backoff), we
+                        # skip the row cleanly — no provider.failed
+                        # event, no row insert. The cap-emitting row
+                        # handled the bookkeeping.
+                        if fail.cancelled:
+                            return fail.total_cost_usd, False, False
                         # Final failure: emit ``provider.failed``, mark the
                         # row as evaluator-failed (no scores), and return
                         # without raising so the rest of the trial proceeds.

@@ -94,8 +94,49 @@ def make_engine(settings: "Settings") -> Engine:
             finally:
                 cur.close()
         return engine
-    # Postgres / anything-SQLAlchemy-supports.
-    return create_engine(url, future=True)
+    # Postgres / anything-SQLAlchemy-supports. Pool sizing is conservative
+    # by default because SQLAlchemy's stock 5 + 10 × N workers quickly
+    # exhausts Postgres ``max_connections`` under any real concurrency.
+    engine = create_engine(
+        url,
+        future=True,
+        pool_size=settings.db_pool_size,
+        max_overflow=settings.db_max_overflow,
+        pool_pre_ping=settings.db_pool_pre_ping,
+        pool_recycle=settings.db_pool_recycle_s,
+    )
+    if engine.dialect.name == "postgresql":
+        # PgBouncer in transaction-pooling mode hands the same physical
+        # backend to a new client whenever the previous one's
+        # transaction commits. ``set_config(..., is_local=true)`` /
+        # ``SET LOCAL`` is bounded to a transaction *on a single
+        # connection*, but PgBouncer's session-state guarantees go out
+        # the window once the backend is pooled — the next checkout
+        # might land on a backend whose ``app.org_id`` was set by the
+        # previous tenant and never cleared. The window is small but
+        # the consequence is cross-tenant data exposure (RLS policies
+        # in 0002 evaluate against the leaked GUC).
+        #
+        # Belt-and-braces fix: on every fresh checkout from the
+        # SQLAlchemy pool, RESET both GUCs before the application
+        # gets the connection. ``checkout`` fires after PgBouncer has
+        # handed the backend over, so this runs in the right place.
+        # The cost is one extra round-trip per checkout.
+        @event.listens_for(engine, "checkout")
+        def _reset_rls_guc_on_checkout(dbapi_conn, _connection_record, _connection_proxy):
+            cur = dbapi_conn.cursor()
+            try:
+                cur.execute("RESET app.org_id")
+                cur.execute("RESET app.is_admin")
+            except Exception:
+                # If the GUCs were never set on this backend (e.g.
+                # first-ever use), RESET is a no-op on Postgres. If
+                # the connection is broken, surface that on the next
+                # query rather than swallowing it here.
+                pass
+            finally:
+                cur.close()
+    return engine
 
 
 def now_iso() -> str:
@@ -180,9 +221,16 @@ def apply_admin_rls_context(conn: Connection) -> None:
     """
     if conn.engine.dialect.name != "postgresql":
         return
-    # ``app.org_id`` still gets set (even though admin bypasses) so
-    # the policy expression doesn't dereference a NULL GUC.
-    conn.execute(text("SELECT set_config('app.org_id', '_system_', true)"))
+    # Use NULL (not a literal sentinel like ``'_system_'``) so a row
+    # whose ``org_id`` happens to equal that sentinel string can never
+    # match the policy's ``OR org_id = current_setting('app.org_id', true)``
+    # branch. The ``app.is_admin = '1'`` branch evaluates first and
+    # short-circuits, but defense-in-depth: if a future migration
+    # reorders the OR or drops the admin check, NULL never equals
+    # anything in SQL semantics.
+    #
+    # ``set_config`` accepts ``NULL`` via the standard SQL NULL cast.
+    conn.execute(text("SELECT set_config('app.org_id', NULL, true)"))
     conn.execute(text("SELECT set_config('app.is_admin', '1', true)"))
 
 
@@ -269,10 +317,19 @@ def token_prefix(token: str) -> str:
 # API-key persistence
 
 
+# Debounce window for ``last_used_at`` writes — the field is for
+# operator visibility ("which key is live?"), not metering, so a 5-
+# minute resolution is more than enough. The previous always-write
+# behaviour produced an UPDATE on every authed request and turned
+# ``api_keys`` into a HOT-update hotspot under load.
+_LAST_USED_DEBOUNCE_S: int = 300
+
+
 def find_key_by_hash(conn: Connection, hashed: str) -> dict | None:
     """Look up an active api_key by its hash. Returns None for unknown
     or revoked keys (revoked_at not null). Touches ``last_used_at`` on
-    hit so an operator can see which keys are live traffic."""
+    hit (debounced to 5 min) so an operator can see live keys without
+    every request triggering an UPDATE."""
     row = conn.execute(
         text("""SELECT key_id, org_id, prefix, name, scopes_csv,
                        created_at, revoked_at, last_used_at
@@ -282,11 +339,28 @@ def find_key_by_hash(conn: Connection, hashed: str) -> dict | None:
     ).mappings().fetchone()
     if row is None:
         return None
-    conn.execute(
-        text("UPDATE api_keys SET last_used_at=:t WHERE key_id=:k"),
-        {"t": now_iso(), "k": row["key_id"]},
-    )
+    if _should_touch_last_used(row.get("last_used_at")):
+        conn.execute(
+            text("UPDATE api_keys SET last_used_at=:t WHERE key_id=:k"),
+            {"t": now_iso(), "k": row["key_id"]},
+        )
     return dict(row)
+
+
+def _should_touch_last_used(last_used_at: str | None) -> bool:
+    """Return True iff the recorded ``last_used_at`` is older than the
+    debounce window (or unset). Parse failures fall back to True so
+    a malformed timestamp gets refreshed."""
+    if not last_used_at:
+        return True
+    try:
+        when = datetime.fromisoformat(last_used_at)
+    except ValueError:
+        return True
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    age_s = (datetime.now(timezone.utc) - when).total_seconds()
+    return age_s >= _LAST_USED_DEBOUNCE_S
 
 
 def key_hash_exists(conn: Connection, hashed: str) -> bool:

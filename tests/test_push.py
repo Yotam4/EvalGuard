@@ -148,3 +148,122 @@ def test_push_to_stub_server_forwards_payload_and_token(tmp_path: Path):
     schema = json.loads(_RUN_SCHEMA_PATH.read_text())
     jsonschema.validate(body, schema)
     assert body["project"] == "t"
+
+
+# ---------------------------------------------------------------------------
+# B.3 round-3 regressions
+
+
+def test_push_sends_idempotency_and_schema_version_headers(tmp_path: Path):
+    """Re-pushing the same run must dedupe server-side. The CLI sends
+    ``Idempotency-Key: <run_id>`` AND ``X-EvalGuard-Schema-Version`` so
+    the server can 409 on either drift."""
+    _seed_run(tmp_path)
+    received: dict[str, object] = {}
+
+    class _Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_a, **_kw): pass
+
+        def do_POST(self):
+            length = int(self.headers.get("content-length", "0"))
+            self.rfile.read(length)
+            # Headers are lower-cased by stdlib's BaseHTTPRequestHandler.
+            received["idempotency"] = self.headers.get("idempotency-key")
+            received["schema_version"] = self.headers.get("x-evalguard-schema-version")
+            self.send_response(201)
+            self.send_header("content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"ok": true}')
+
+    httpd = HTTPServer(("127.0.0.1", 0), _Handler)
+    port = httpd.server_address[1]
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        result = _push(
+            "--last",
+            "--server", f"http://127.0.0.1:{port}",
+            cwd=tmp_path,
+        )
+    finally:
+        httpd.shutdown()
+        t.join(timeout=2)
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert received.get("idempotency", "").startswith("run_")
+    # Schema version must be a semver-ish string (1.0.0, 1.1.0, ...)
+    sv = received.get("schema_version") or ""
+    assert sv and sv.count(".") == 2
+
+
+def test_push_rejects_ambiguous_prefix(tmp_path: Path):
+    """A 4-char prefix that matches multiple runs in the local store
+    must error rather than silently picking one. Previous behaviour
+    was a silent ``next(...)`` foot-gun."""
+    # Seed two distinct runs so the prefix matches both.
+    db, run_a = _seed_run(tmp_path)
+    # Re-run the executor a second time so the DB has 2+ runs.
+    cfg = load_config(tmp_path / "evalguard.yaml")
+    store = SqliteStore(db)
+    store.init_schema()
+    record_b = asyncio.run(execute(cfg, store=store, quiet=True))
+    run_b = record_b.run_id
+    # Find a common prefix between the two run_ids; if none exists
+    # (different first hex char by random chance), assert with an
+    # explicit short prefix that matches both.
+    common = "run_"   # all evalguard run_ids start with this
+    assert run_a.startswith(common) and run_b.startswith(common)
+
+    result = _push(
+        common,
+        "--server", "http://127.0.0.1:9",   # unreachable, never used
+        cwd=tmp_path,
+    )
+    assert result.returncode == 1
+    out = (result.stdout or "") + (result.stderr or "")
+    assert "ambiguous" in out.lower()
+
+
+def test_push_retries_on_transient_5xx(tmp_path: Path):
+    """503 from the LB must not abort the push immediately — the CLI
+    rides out a single transient blip with a small retry budget."""
+    _seed_run(tmp_path)
+    state = {"calls": 0}
+
+    class _Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_a, **_kw): pass
+
+        def do_POST(self):
+            length = int(self.headers.get("content-length", "0"))
+            self.rfile.read(length)
+            state["calls"] += 1
+            if state["calls"] < 2:
+                self.send_response(503)
+                self.send_header("content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"error": "service unavailable"}')
+            else:
+                self.send_response(201)
+                self.send_header("content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"ok": true}')
+
+    httpd = HTTPServer(("127.0.0.1", 0), _Handler)
+    port = httpd.server_address[1]
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        # Override the base delay so the test runs fast (push module
+        # reads it as a module-level constant; we monkeypatch via env
+        # is overkill — just accept a small real wait).
+        result = _push(
+            "--last",
+            "--server", f"http://127.0.0.1:{port}",
+            cwd=tmp_path,
+        )
+    finally:
+        httpd.shutdown()
+        t.join(timeout=2)
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert state["calls"] >= 2, "expected the CLI to retry the 503"

@@ -266,3 +266,132 @@ def test_end_to_end_dry_run_via_executor(tmp_path: Path):
     bad_passed  = all(s["passed"] for s in bad["scores"])
     assert good_passed
     assert not bad_passed
+
+
+# ---------------------------------------------------------------------------
+# B.5 round-3 regressions
+
+
+def test_dry_run_rolls_back_destructive_sql(tmp_path):
+    """A candidate that writes / drops state must NOT persist on a
+    file-backed shadow DB. The fix wraps execution in
+    ``BEGIN``/``ROLLBACK``."""
+    import asyncio
+    import sqlite3
+    from evalguard_evaluators.base import EvalContext
+    from evalguard_evaluators.heuristics.dry_run_on_shadow_db import (
+        DryRunOnShadowDbHeuristic,
+    )
+
+    shadow = tmp_path / "shadow.db"
+    # Pre-seed the shadow DB with one row.
+    seed = sqlite3.connect(shadow)
+    seed.executescript(
+        "CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT NOT NULL);"
+        "INSERT INTO customers VALUES (1, 'alice');"
+    )
+    seed.commit()
+    seed.close()
+
+    h = DryRunOnShadowDbHeuristic()
+    h.configure({
+        "id": "dry",
+        "_system": {
+            "name": "shadow",
+            "kind": "sqlite",
+            "url":  f"sqlite:///{shadow}",
+        },
+    })
+
+    # First "candidate" tries to drop the table. The heuristic must
+    # roll it back so subsequent rows still see the table.
+    ctx_destructive = EvalContext(
+        row_id="r1", input="x", expected=None,
+        output="DROP TABLE customers;",
+        provider="mock", model="m",
+    )
+    scores = asyncio.run(h.evaluate(ctx_destructive))
+    assert scores[0].passed is True, "DROP should parse + execute on shadow"
+
+    # Re-open the file and verify the table still exists with row 1.
+    after = sqlite3.connect(shadow)
+    rows = after.execute("SELECT * FROM customers").fetchall()
+    after.close()
+    assert rows == [(1, "alice")], (
+        "Destructive candidate persisted across rows — rollback failed"
+    )
+
+
+def test_result_set_equivalence_coerces_int_vs_float(tmp_path):
+    """``COUNT(*)`` returns int from SQLite; the golden set's
+    ``expected_result: [[2.0]]`` (Python float) must compare equal
+    after numeric coercion in ``_normalize_rows``."""
+    import asyncio
+    from evalguard_evaluators.base import EvalContext
+    from evalguard_evaluators.heuristics.result_set_equivalence import (
+        ResultSetEquivalenceHeuristic,
+    )
+    h = ResultSetEquivalenceHeuristic()
+    h.configure({
+        "id": "rse",
+        "_system": {
+            "name": "shadow", "kind": "sqlite", "url": ":memory:",
+            "schema": (
+                "CREATE TABLE t(x INT); "
+                "INSERT INTO t VALUES (1), (2);"
+            ),
+        },
+    })
+    ctx = EvalContext(
+        row_id="r1",
+        input="how many rows",
+        expected=None,
+        output="SELECT COUNT(*) FROM t;",
+        provider="mock", model="m",
+        extra={"expected_result": [[2.0]]},   # float, but SQLite returns int
+    )
+    scores = asyncio.run(h.evaluate(ctx))
+    assert scores[0].passed is True, scores[0].raw
+
+
+def test_result_set_equivalence_skip_emits_nan_value(tmp_path):
+    """A row with no expected_result / expected_sql must emit
+    ``value=NaN`` (skip semantics) instead of inflating the layer
+    pass-rate as ``value=1.0``."""
+    import asyncio
+    import math
+    from evalguard_evaluators.base import EvalContext
+    from evalguard_evaluators.heuristics.result_set_equivalence import (
+        ResultSetEquivalenceHeuristic,
+    )
+    h = ResultSetEquivalenceHeuristic()
+    h.configure({
+        "id": "rse",
+        "_system": {"name": "shadow", "kind": "sqlite", "url": ":memory:"},
+    })
+    ctx = EvalContext(
+        row_id="r1", input="q", expected=None, output="SELECT 1;",
+        provider="mock", model="m",
+        extra={},   # no expected_result / expected_sql
+    )
+    scores = asyncio.run(h.evaluate(ctx))
+    assert math.isnan(scores[0].value)
+    assert scores[0].passed is True   # not faulted
+    assert scores[0].raw.get("skipped") is True
+
+
+def test_dry_run_misconfigured_kind_raises_at_configure_time():
+    """Kind check moved to ``configure()`` (was per-row). Misconfigured
+    YAML must fail at config-load, not after N rows of confusing
+    runtime errors."""
+    import pytest
+    from evalguard_evaluators.heuristics.dry_run_on_shadow_db import (
+        DryRunOnShadowDbHeuristic,
+    )
+    h = DryRunOnShadowDbHeuristic()
+    with pytest.raises(ValueError) as exc:
+        h.configure({
+            "id": "dry",
+            "_system": {"name": "shadow", "kind": "duckdb", "url": ":memory:"},
+        })
+    assert "kind=sqlite" in str(exc.value)

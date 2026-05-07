@@ -1,6 +1,14 @@
 """Bearer-token auth: every authenticated endpoint enforces the
-configured key, with constant-time compare and a sane WWW-Authenticate
-header on 401."""
+configured key.
+
+NB: the docstring previously claimed "constant-time compare"; the
+runtime path is a Postgres-indexed equality lookup on the SHA-256 of
+the bearer token, which is constant-ish (no early-return branch on
+prefix mismatch) but not a literal ``secrets.compare_digest`` call.
+With 128 bits of token entropy and a hashed-at-rest column, that's
+acceptable. See ``apps/api/evalguard_api/db.py`` for the lookup; the
+``WWW-Authenticate`` header is asserted below.
+"""
 
 from __future__ import annotations
 

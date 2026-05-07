@@ -58,6 +58,18 @@ GATE_STATUSES: tuple[str, ...] = ("passed", "failed", "warned", "none")
 # Drift-tested against ``evalguard.schema.json``.
 THRESHOLD_TYPES: tuple[str, ...] = ("absolute", "relative", "ttest")
 
+# Aggregations actually implemented by ``_resolve_aggregation``. The
+# JSON schema's ``aggregation`` enum is a superset (advertises ``p50``
+# / ``p95`` for forward compat); a drift test pins the gap so users
+# get a clear "not implemented" error rather than silent fail-closed.
+SUPPORTED_AGGREGATIONS: tuple[str, ...] = (
+    "pass_rate",
+    "row_pass_rate",
+    "mean",
+    "count_failures",
+    "pass_rate_by_tag",
+)
+
 
 @dataclass
 class GateResult:
@@ -178,10 +190,23 @@ def _evaluate_layers(
                 by_evaluator=by_evaluator, by_layer=by_layer, by_tag=by_tag,
             )
             if actual is None and ("min" in threshold or "max" in threshold):
+                # Disambiguate the two fail-closed modes so YAML typos
+                # (unknown evaluator id) don't get blamed on the
+                # aggregation enum and vice versa.
+                if agg not in SUPPORTED_AGGREGATIONS:
+                    err = (f"unsupported aggregation {agg!r}: not implemented "
+                           f"(supported: {', '.join(SUPPORTED_AGGREGATIONS)})")
+                elif evaluator_id and evaluator_id not in by_evaluator:
+                    err = (f"unknown evaluator {evaluator_id!r}: not seen in "
+                           f"this run's metrics — check spelling against "
+                           f"the evaluators block")
+                else:
+                    err = (f"aggregation {agg!r} unavailable: layer "
+                           f"{layer_name!r} has no scores yet")
                 details.append({
                     "metric": label, "op": "available", "target": 1.0,
                     "actual": float("nan"), "passed": False,
-                    "error": f"unsupported or unavailable aggregation: {agg}",
+                    "error": err,
                 })
                 passed = False
             elif actual is not None:
@@ -250,7 +275,15 @@ def _evaluate_layers(
                             ((baseline or {}).get("samples", {}) or {}).get(evaluator_id, [])
                             if baseline is not None else []
                         )
-                        min_n = int(threshold.get("min_n", 2))
+                        # Default ``min_n`` is 10 (was 2). Welch's
+                        # t-test with df ≈ 1 has so little statistical
+                        # power that any "regression" verdict is
+                        # essentially noise — n=10 is the conventional
+                        # floor for a nominal 80% power at α=0.05 on
+                        # a moderate effect size (Cohen's d ≈ 0.8).
+                        # Schema enforces ``minimum: 2`` so users can
+                        # still override down for tests / niche cases.
+                        min_n = int(threshold.get("min_n", 10))
                         if len(cur_samples) < min_n or len(base_samples) < min_n:
                             details.append({
                                 "metric": f"{evaluator_id}.ttest",
@@ -391,9 +424,12 @@ def _resolve_aggregation(
         rates = [float(b.get("pass_rate", 0.0)) for b in by_tag.values()]
         return (sum(rates) / len(rates)) if rates else 0.0, label
     if agg == "count_failures":
-        return float(layer_data.get("n", 0)) - float(layer_data.get("n", 0)) * float(
-            layer_data.get("pass_rate", 0.0)
-        ), label
+        # Use the canonical ``fail_count`` from the by_layer rollup
+        # (computed as ``SUM(passed=0)`` over score rows). Previously
+        # we derived it as ``n - n*pass_rate``, which is the same
+        # number in floats but in different units from the per-
+        # evaluator branch above — pick one source of truth.
+        return float(layer_data.get("fail_count", 0)), label
     return None, label
 
 

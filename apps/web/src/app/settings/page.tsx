@@ -55,6 +55,7 @@ export default function SettingsPage() {
             value={url}
             onChange={setUrl}
           />
+          <MixedContentWarning url={url} />
           <Field
             label="API token"
             placeholder="evk_…"
@@ -117,6 +118,33 @@ export default function SettingsPage() {
         </ul>
       </Card>
     </div>
+  );
+}
+
+
+function MixedContentWarning({ url }: { url: string }) {
+  // Browsers block ``http://`` requests from a page served over
+  // ``https://`` (mixed-content). The fetch fails silently — no
+  // network activity, just an opaque ``TypeError`` in the console.
+  // Surface it before the user hits Save.
+  if (typeof window === "undefined") return null;
+  const trimmed = url.trim();
+  if (!trimmed) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return null;
+  }
+  const pageIsHttps = window.location.protocol === "https:";
+  if (!pageIsHttps) return null;
+  if (parsed.protocol !== "http:") return null;
+  return (
+    <p className="text-xs text-[var(--color-warn)]">
+      ⚠ This page is served over HTTPS but the URL above is HTTP.
+      Browsers block mixed-content requests — the connection test will
+      fail silently. Use an HTTPS server URL or open this UI over HTTP.
+    </p>
   );
 }
 

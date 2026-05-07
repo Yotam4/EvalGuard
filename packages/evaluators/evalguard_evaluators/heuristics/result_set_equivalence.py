@@ -46,17 +46,44 @@ def _strip_fence(text: str) -> str:
     return m.group(1) if m else text
 
 
+def _coerce_cell(value: Any) -> Any:
+    """Normalize a single cell so semantically-equal values across
+    backends compare equal:
+
+    - ``2.0`` (float, sqlite SUM) ↔ ``2`` (int, JSON literal): both
+      become int when the float is whole.
+    - ``Decimal('2.5')`` (Postgres NUMERIC) ↔ ``2.5`` (JSON float):
+      Decimal coerced to float.
+    - ``datetime`` / ``date`` left alone — caller compares them
+      as-is; if a future need arises we'll canonicalize to ISO.
+    """
+    # Avoid importing decimal at module load — most rows don't carry it.
+    try:
+        from decimal import Decimal
+        if isinstance(value, Decimal):
+            f = float(value)
+            return int(f) if f.is_integer() else f
+    except Exception:  # noqa: BLE001 — coercion is best-effort
+        pass
+    if isinstance(value, float):
+        if value.is_integer():
+            return int(value)
+    return value
+
+
 def _normalize_rows(rows: list[Any]) -> list[tuple]:
     """Coerce rows into tuples so they compare cleanly across shapes
-    (sqlite3.Row, list, tuple, dict)."""
+    (sqlite3.Row, list, tuple, dict) AND across types (int/float/
+    Decimal — see ``_coerce_cell``)."""
     out: list[tuple] = []
     for r in rows:
         if isinstance(r, dict):
-            out.append(tuple(r[k] for k in sorted(r)))
+            cells = tuple(_coerce_cell(r[k]) for k in sorted(r))
         elif isinstance(r, (list, tuple)):
-            out.append(tuple(r))
+            cells = tuple(_coerce_cell(c) for c in r)
         else:
-            out.append((r,))
+            cells = (_coerce_cell(r),)
+        out.append(cells)
     return out
 
 
@@ -81,14 +108,15 @@ class ResultSetEquivalenceHeuristic:
             raise ValueError(
                 f"{self.id}: missing 'system: <name>' or top-level systems[<name>]"
             )
+        # Fail-fast on misconfigured kind (was per-row).
+        kind = (sys_cfg.get("kind") or "").lower()
+        if kind != "sqlite":
+            raise ValueError(
+                f"{self.id}: built-in shadow DB only supports kind=sqlite, got {kind!r}."
+            )
         self._system = sys_cfg
 
     async def evaluate(self, ctx: EvalContext) -> list[Score]:
-        kind = (self._system.get("kind") or "").lower()
-        if kind != "sqlite":
-            raise RuntimeError(
-                f"{self.id}: built-in shadow DB only supports kind=sqlite, got {kind!r}."
-            )
         candidate = _strip_fence(ctx.output) if self._strip_fences else (ctx.output or "")
         candidate = candidate.strip().rstrip(";")
         if not candidate:
@@ -102,8 +130,17 @@ class ResultSetEquivalenceHeuristic:
 
         if expected_result is None and not expected_sql:
             # Skip non-blockingly: golden set didn't pin a comparison.
-            return [Score(self.id, self.kind, self.layer, 1.0, True,
-                          {"reason": "no expected_result or expected_sql; skipped"})]
+            # Emit ``value=NaN`` (and ``passed=True``) so a gate
+            # aggregation that's NaN-aware (``mean``, ``pass_rate``)
+            # excludes this row from the denominator instead of
+            # silently inflating the pass rate. Gates that simply
+            # count passed entries still treat it as a pass — which
+            # is the right semantics for "this row didn't pin a
+            # comparison so don't fault the candidate."
+            return [Score(self.id, self.kind, self.layer,
+                          float("nan"), True,
+                          {"reason": "no expected_result or expected_sql; skipped",
+                           "skipped": True})]
 
         path = _sqlite_path_from_url(self._system.get("url") or ":memory:")
         try:

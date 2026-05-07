@@ -418,3 +418,81 @@ def test_per_provider_retry_overrides_run_default(tmp_path: Path):
     assert kinds.count("provider.retry") == 4  # 4 fails, then succeed on 5th
     assert kinds.count("provider.called") == 1
     assert kinds.count("provider.failed") == 0
+
+
+def test_retry_loop_aborts_on_cancel_event(monkeypatch):
+    """B.1: cost-cap fires from another concurrent row mid-backoff;
+    the retry loop must NOT keep waiting and burning the budget.
+
+    The fix: ``call_with_retry`` accepts a ``cancel: asyncio.Event``
+    and short-circuits the next attempt + slices the backoff sleep
+    so cancellation propagates within ~100 ms of the event being set.
+    """
+    import asyncio
+    from evalguard_cli.local.retry import (
+        ProviderFailed, RetryPolicy, call_with_retry,
+    )
+
+    cancel = asyncio.Event()
+    attempts_made = {"n": 0}
+
+    class _RaisesAlways:
+        async def complete(self):
+            attempts_made["n"] += 1
+            # First attempt raises a retryable, second triggers the
+            # cancel event mid-backoff and we expect to never make
+            # the third attempt.
+            if attempts_made["n"] == 2:
+                # Simulate another coroutine flipping the cap.
+                cancel.set()
+            raise RuntimeError("429 rate limit (mock)")
+
+    async def _drive():
+        provider = _RaisesAlways()
+        return await call_with_retry(
+            coro_factory=provider.complete,
+            policy=RetryPolicy(max_retries=10, base_delay_ms=200, jitter=0),
+            cancel=cancel,
+        )
+
+    with pytest.raises(ProviderFailed) as exc_info:
+        asyncio.run(_drive())
+
+    # Cancellation should have prevented attempt 3 (and all the rest).
+    assert attempts_made["n"] == 2
+    assert exc_info.value.cancelled is True
+    # Cancelled failures don't accrue cost (the mock didn't bill).
+    assert exc_info.value.total_cost_usd == 0.0
+
+
+def test_retry_loop_credits_cost_on_failed_attempts():
+    """B.1: providers that bill on failure (rare but real for some
+    OpenAI partial-generation cases) attach ``cost_usd`` to the
+    raised exception. ``ProviderFailed.total_cost_usd`` aggregates
+    so the executor can credit it to the run total instead of
+    silently under-counting."""
+    import asyncio
+    from evalguard_cli.local.retry import (
+        ProviderFailed, RetryPolicy, call_with_retry,
+    )
+
+    class _BillsOnFailure:
+        async def complete(self):
+            err = RuntimeError("503 service unavailable")
+            err.cost_usd = 0.07
+            raise err
+
+    async def _drive():
+        return await call_with_retry(
+            coro_factory=_BillsOnFailure().complete,
+            policy=RetryPolicy(max_retries=2, base_delay_ms=0, jitter=0),
+        )
+
+    with pytest.raises(ProviderFailed) as exc_info:
+        asyncio.run(_drive())
+    fail = exc_info.value
+    assert len(fail.attempts) == 3
+    # 3 attempts × $0.07 each = $0.21
+    assert fail.total_cost_usd == pytest.approx(0.21)
+    # Per-attempt cost is also recorded.
+    assert all(a["cost_usd"] == pytest.approx(0.07) for a in fail.attempts)

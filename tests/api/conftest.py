@@ -33,10 +33,18 @@ def settings(tmp_path: Path) -> Settings:
 
 @pytest.fixture
 def open_settings(tmp_path: Path) -> Settings:
-    """Settings with no API key — open mode (dev-only)."""
+    """Settings with no API key — open mode (dev-only).
+
+    ``open_mode_opt_in=True`` acknowledges the no-auth posture; the
+    runtime now refuses to boot when open-mode is on without this
+    flag (round-3 fix). ``cors_origins`` is set to a non-``*`` value
+    so the open-mode + CORS=* combined refusal doesn't fire either.
+    """
     return Settings(
         database_url=f"sqlite:///{tmp_path}/server.db",
         api_key="",
+        open_mode_opt_in=True,
+        cors_origins=("https://test.local",),
     )
 
 
