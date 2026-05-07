@@ -235,8 +235,8 @@
               "description": "``type: ttest`` directionality. Default ``less`` (regression-detection: fail when current is significantly lower than baseline)."
             },
             "min_n": {
-              "type": "integer", "minimum": 2,
-              "description": "``type: ttest`` minimum sample size on each side. Below this, the gate skips non-blockingly."
+              "type": "integer", "minimum": 2, "default": 10,
+              "description": "``type: ttest`` minimum sample size on each side. Below this, the gate skips non-blockingly. Default is 10 — Welch's t-test with df≈1 has too little power to be useful for regression detection. The schema accepts as low as 2 so test fixtures can opt down explicitly; production gates should keep the default or raise it."
             },
             "per_tag_overrides": { "type": "object", "additionalProperties": { "type": "number" } }
           }

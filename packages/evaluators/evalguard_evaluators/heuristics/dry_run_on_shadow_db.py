@@ -72,15 +72,17 @@ class DryRunOnShadowDbHeuristic:
             raise ValueError(
                 f"{self.id}: missing 'system: <name>' or top-level systems[<name>]"
             )
-        self._system = sys_cfg
-
-    async def evaluate(self, ctx: EvalContext) -> list[Score]:
-        kind = (self._system.get("kind") or "").lower()
+        # Fail-fast on misconfigured kind (was per-row before — buggy
+        # configs failed N times instead of once at config-load).
+        kind = (sys_cfg.get("kind") or "").lower()
         if kind != "sqlite":
-            raise RuntimeError(
+            raise ValueError(
                 f"{self.id}: built-in shadow DB only supports kind=sqlite, "
                 f"got {kind!r}. Add a plugin to extend."
             )
+        self._system = sys_cfg
+
+    async def evaluate(self, ctx: EvalContext) -> list[Score]:
         sql = _strip_fence(ctx.output) if self._strip_fences else (ctx.output or "")
         sql = sql.strip().rstrip(";")
         if not sql:
@@ -95,11 +97,27 @@ class DryRunOnShadowDbHeuristic:
                           {"reason": "shadow_db_setup_failed",
                            "error":  str(e)[:240]})]
         try:
-            cur = conn.execute(sql)
-            cur.fetchall()
+            # Wrap candidate execution in an explicit transaction we
+            # roll back unconditionally — otherwise a destructive
+            # candidate (DROP / DELETE / UPDATE / ALTER / INSERT)
+            # persists across rows on a file-backed shadow, breaking
+            # every subsequent row's expected schema. Per-row test
+            # isolation is the contract; the YAML's
+            # ``not_contains: "DROP TABLE"`` guard was a fig leaf
+            # (didn't catch DELETE / TRUNCATE / ALTER / etc.).
+            #
+            # ``isolation_level=None`` is set in ``_connect_and_seed``
+            # so we manage the transaction explicitly here.
+            conn.execute("BEGIN")
+            try:
+                cur = conn.execute(sql)
+                cur.fetchall()
+            finally:
+                conn.execute("ROLLBACK")
             return [Score(self.id, self.kind, self.layer, 1.0, True,
                           {"system_kind": "sqlite",
-                           "system_name": self._system.get("name")})]
+                           "system_name": self._system.get("name"),
+                           "rolled_back": True})]
         except sqlite3.Error as e:
             return [Score(self.id, self.kind, self.layer, 0.0, False,
                           {"reason":      "execution_error",
@@ -126,7 +144,11 @@ def _connect_and_seed(path: str, schema_blob: str | None) -> sqlite3.Connection:
         # Make sure the parent dir exists for fresh shadow files.
         from pathlib import Path
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, timeout=30.0)
+    # ``isolation_level=None`` switches sqlite3 into "manual" mode so
+    # the heuristic can issue ``BEGIN``/``ROLLBACK`` explicitly. The
+    # default mode auto-opens transactions on the first DML, which
+    # would clash with our explicit BEGIN.
+    conn = sqlite3.connect(path, timeout=30.0, isolation_level=None)
     if path != ":memory:":
         # WAL allows concurrent readers without write-lock contention,
         # which matters when a user / CI pipeline inspects the file
@@ -135,6 +157,7 @@ def _connect_and_seed(path: str, schema_blob: str | None) -> sqlite3.Connection:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
     if schema_blob:
+        # Seed inside its own transaction so the per-row BEGIN/ROLLBACK
+        # contract above is never tangled with the bootstrap.
         conn.executescript(schema_blob)
-        conn.commit()
     return conn

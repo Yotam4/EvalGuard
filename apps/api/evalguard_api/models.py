@@ -78,7 +78,10 @@ class Row(BaseModel):
     input:      Any = None
     expected:   Any = None
     output:     str | None = None
-    scores:     list[Score] = Field(default_factory=list)
+    # Cap nested-list cardinality to bound worst-case nested
+    # deserialization. Real runs rarely exceed ~20 evaluators per row;
+    # 100 is generous headroom.
+    scores:     list[Score] = Field(default_factory=list, max_length=100)
 
 
 class Gate(_Strict):
@@ -113,8 +116,14 @@ class Trial(_Strict):
     started_at:        str | None = None
     finished_at:       str | None = None
     metrics:           dict[str, Any] = Field(default_factory=dict)
-    gates:             list[Gate] = Field(default_factory=list)
-    rows:              list[Row] = Field(default_factory=list)
+    # Hard upper bounds on nested-list cardinality so a 100 MB body
+    # full of millions of nested objects can't OOM a worker after
+    # passing the Content-Length cap. Defaults are an order of
+    # magnitude above the largest realistic legitimate run; operators
+    # who genuinely need bigger should bump in a follow-up that also
+    # raises ``EVALGUARD_MAX_REQUEST_BYTES``.
+    gates:             list[Gate] = Field(default_factory=list, max_length=100)
+    rows:              list[Row]  = Field(default_factory=list, max_length=50_000)
 
 
 # ---------------------------------------------------------------------------
@@ -192,8 +201,11 @@ class RunIngest(_Strict):
     row_pass_count: int   = Field(default=0, ge=0)
     row_fail_count: int   = Field(default=0, ge=0)
     cost_usd:       float = Field(default=0.0, ge=0)
-    assets:         list[Asset] = Field(default_factory=list)
-    trials:         list[Trial] = Field(default_factory=list)
+    # Cardinality caps mirror the per-Trial caps so the deepest nested
+    # multiplication (rows × trials × gates) is bounded by request
+    # construction even before SQLAlchemy gets involved.
+    assets:         list[Asset] = Field(default_factory=list, max_length=10_000)
+    trials:         list[Trial] = Field(default_factory=list, max_length=50)
     comparison:     Comparison | None = None
     aggregate:      Aggregate | None = None
     audit:          Audit | None = None

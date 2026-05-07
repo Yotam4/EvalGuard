@@ -50,13 +50,35 @@ _DEFAULT_RETRY_PATTERNS: tuple[str, ...] = (
 
 class ProviderFailed(Exception):
     """Raised when the retry budget is exhausted (or the error was
-    non-retryable). Carries the original cause and the per-attempt
-    summary so the executor can mark the row failed and continue."""
+    non-retryable). Carries the original cause, the per-attempt
+    summary, and the total billed cost across all attempts so the
+    executor can credit it to the run total instead of silently
+    under-counting (real providers like OpenAI bill some 429-after-
+    partial-generation cases — a provider that wants to surface that
+    can set ``e.cost_usd`` on the raised exception).
+    """
 
-    def __init__(self, *, attempts: list[dict[str, Any]], cause: BaseException) -> None:
+    def __init__(
+        self,
+        *,
+        attempts: list[dict[str, Any]],
+        cause: BaseException,
+        total_cost_usd: float = 0.0,
+        cancelled: bool = False,
+    ) -> None:
         super().__init__(f"provider failed after {len(attempts)} attempt(s): {cause}")
         self.attempts = attempts
         self.cause = cause
+        # Sum of ``attempts[*]['cost_usd']`` — surfaced so the executor
+        # can add it to ``total_cost`` even though the call ultimately
+        # failed.
+        self.total_cost_usd = total_cost_usd
+        # ``True`` when the retry loop aborted because the cancel
+        # event fired (cost cap reached, fail_fast triggered, etc.).
+        # The executor treats cancelled differently from genuine
+        # failure: don't mark the row as ``provider.failed``, just
+        # skip it cleanly.
+        self.cancelled = cancelled
 
 
 @dataclass
@@ -120,6 +142,7 @@ async def call_with_retry(
     policy: RetryPolicy,
     on_retry: Callable[[int, BaseException, int], None] | None = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    cancel: asyncio.Event | None = None,
 ) -> ProviderResult:
     """Invoke ``coro_factory()`` with retries.
 
@@ -131,34 +154,91 @@ async def call_with_retry(
     retry (not before the first attempt, not after the last failure).
     The executor uses this hook to emit ``provider.retry`` events.
 
-    Final failure raises ``ProviderFailed`` with per-attempt summary.
+    ``cancel`` is an optional ``asyncio.Event``. When set (e.g. by the
+    cost-cap pre-flight on another concurrent row, or by ``fail_fast``)
+    the retry loop aborts BEFORE the next sleep / attempt, raising
+    ``ProviderFailed(cancelled=True, ...)`` so the executor can skip
+    the row cleanly without burning more retry budget. Without this
+    hook, a 429 storm at ``max_retries: 5`` could keep spending after
+    the cap fires elsewhere.
+
+    Final failure raises ``ProviderFailed`` with per-attempt summary
+    and the total billed cost (sum of ``attempts[*]['cost_usd']``,
+    populated when a provider raises an exception with a ``cost_usd``
+    attribute attached).
     """
     attempts: list[dict[str, Any]] = []
     last_exc: BaseException | None = None
 
     for attempt in range(policy.max_retries + 1):
+        # Re-check cancel BEFORE each attempt — a concurrent row may
+        # have fired the cap during the previous backoff sleep.
+        if cancel is not None and cancel.is_set():
+            return _raise_cancelled(attempts, last_exc)
         t0 = time.monotonic()
         try:
             return await coro_factory()
         except Exception as e:  # noqa: BLE001 — provider error surface is wide
             elapsed_ms = int((time.monotonic() - t0) * 1000)
+            # Providers that bill on failure (rare but possible) can
+            # attach ``cost_usd`` to the exception. Default 0.
+            attempt_cost = float(getattr(e, "cost_usd", 0.0) or 0.0)
             attempts.append({
                 "attempt":     attempt,
                 "duration_ms": elapsed_ms,
                 "error":       str(e)[:240],
                 "error_type":  type(e).__name__,
                 "retryable":   policy.is_retryable(e),
+                "cost_usd":    attempt_cost,
             })
             last_exc = e
             retryable = policy.is_retryable(e)
             is_last = attempt >= policy.max_retries
             if (not retryable) or is_last:
-                raise ProviderFailed(attempts=attempts, cause=e) from e
+                raise ProviderFailed(
+                    attempts=attempts,
+                    cause=e,
+                    total_cost_usd=sum(a["cost_usd"] for a in attempts),
+                ) from e
             delay_ms = policy.delay_ms(attempt)
             if on_retry is not None:
                 on_retry(attempt + 1, e, delay_ms)
+            # Sleep in small slices so the cancel event short-circuits
+            # the backoff promptly (a 30 s ``max_delay_ms`` would
+            # otherwise let the run keep running for half a minute
+            # past cost-cap).
             if delay_ms > 0:
-                await sleep(delay_ms / 1000.0)
+                if cancel is not None:
+                    waited = 0
+                    slice_ms = 100
+                    while waited < delay_ms:
+                        if cancel.is_set():
+                            return _raise_cancelled(attempts, last_exc)
+                        step = min(slice_ms, delay_ms - waited)
+                        await sleep(step / 1000.0)
+                        waited += step
+                else:
+                    await sleep(delay_ms / 1000.0)
 
     # Unreachable: the loop either returns or raises ProviderFailed.
-    raise ProviderFailed(attempts=attempts, cause=last_exc or RuntimeError("no attempts"))
+    raise ProviderFailed(
+        attempts=attempts,
+        cause=last_exc or RuntimeError("no attempts"),
+        total_cost_usd=sum(a.get("cost_usd", 0.0) for a in attempts),
+    )
+
+
+def _raise_cancelled(
+    attempts: list[dict[str, Any]],
+    last_exc: BaseException | None,
+) -> ProviderResult:
+    """Raise a ``ProviderFailed(cancelled=True, ...)``. Pulled into
+    a helper so the inner loop reads cleanly. Returns ``ProviderResult``
+    in the type signature but always raises — the return type matches
+    the caller's expectation."""
+    raise ProviderFailed(
+        attempts=attempts,
+        cause=last_exc or RuntimeError("call cancelled before first attempt"),
+        total_cost_usd=sum(a.get("cost_usd", 0.0) for a in attempts),
+        cancelled=True,
+    )

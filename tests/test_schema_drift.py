@@ -17,7 +17,13 @@ import json
 from pathlib import Path
 
 from evalguard_cli.local.actor import ACTOR_TYPES
-from evalguard_cli.local.gate import GATE_STATUSES, SEVERITIES, THRESHOLD_TYPES
+from evalguard_cli.local.gate import (
+    GATE_STATUSES,
+    SEVERITIES,
+    SUPPORTED_AGGREGATIONS,
+    THRESHOLD_TYPES,
+)
+from evalguard_cli.local.retry import _DEFAULT_RETRY_PATTERNS, RetryPolicy
 
 
 _SCHEMAS = Path(__file__).resolve().parents[1] / "packages" / "schemas"
@@ -109,3 +115,61 @@ def test_threshold_type_input_schema_matches_code():
         f"input-schema threshold.type {sorted(enum)} != "
         f"THRESHOLD_TYPES {sorted(THRESHOLD_TYPES)}"
     )
+
+
+# ---------------------------------------------------------------------------
+# aggregation
+#
+# The schema's enum is intentionally a *superset* of what the runtime
+# implements (forward-compat slot for ``p50`` / ``p95`` percentile
+# rollups). The drift test pins the gap so the not-implemented set
+# stays explicit; if the runtime adds ``p50`` later it must drop out
+# of ``advertised_only``. Conversely, if the runtime ever supports
+# something the schema doesn't advertise, the gate engine would
+# accept a YAML that fails JSON-schema validation — also a bug.
+
+
+def test_aggregation_input_schema_superset_of_supported():
+    advertised = set(_INPUT_SCHEMA["$defs"]["layerGate"]
+                                  ["properties"]["aggregation"]["enum"])
+    supported  = set(SUPPORTED_AGGREGATIONS)
+    runtime_only = supported - advertised
+    advertised_only = advertised - supported
+    assert not runtime_only, (
+        f"runtime supports aggregations the schema does not advertise: "
+        f"{sorted(runtime_only)}. Either add to the schema enum or "
+        f"drop from SUPPORTED_AGGREGATIONS."
+    )
+    # ``p50`` / ``p95`` are deliberately advertised-only today. If new
+    # not-yet-implemented values show up, fail loudly so we stay
+    # honest about the gap.
+    expected_advertised_only = {"p50", "p95"}
+    assert advertised_only == expected_advertised_only, (
+        f"schema advertises aggregations the runtime does not "
+        f"implement: {sorted(advertised_only)}; expected exactly "
+        f"{sorted(expected_advertised_only)}. If you implemented "
+        f"one, add it to ``SUPPORTED_AGGREGATIONS``."
+    )
+
+
+# ---------------------------------------------------------------------------
+# retry block defaults
+
+
+def test_retry_input_schema_defaults_match_RetryPolicy():
+    """Schema-advertised defaults under ``retry:`` must match
+    ``RetryPolicy`` field defaults. Drift here means a user reading
+    the JSON schema sees one value while the runtime applies another
+    when the key is omitted from YAML."""
+    schema_props = _INPUT_SCHEMA["properties"]["retry"]["properties"]
+    pol = RetryPolicy()
+    assert schema_props["max_retries"]["default"]   == pol.max_retries
+    assert schema_props["base_delay_ms"]["default"] == pol.base_delay_ms
+    assert schema_props["max_delay_ms"]["default"]  == pol.max_delay_ms
+    assert schema_props["jitter"]["default"]        == pol.jitter
+    # ``retry_on`` has no schema default (the description points at
+    # ``_DEFAULT_RETRY_PATTERNS``); just sanity-check the runtime
+    # default is non-empty so future refactors can't silently empty
+    # the list.
+    assert tuple(_DEFAULT_RETRY_PATTERNS) == pol.retry_on
+    assert pol.retry_on, "default retry_on must not be empty"
