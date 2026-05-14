@@ -167,3 +167,161 @@ def test_assets_invalid_limit_returns_422(client, auth_headers):
     assert r.status_code == 422
     r2 = client.get("/v1/assets?limit=99999", headers=auth_headers)
     assert r2.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/assets/{kind}/{asset_id}/versions  (Phase 2.6d)
+#
+# Detail view for one asset: every ``(version_id, run_id)`` tuple
+# inside one project.  The list endpoint above already covers the
+# aggregated case; here we test the per-asset drill-down.
+
+
+def _project_id_from_listing(client, auth_headers) -> str:
+    """Helper: the list endpoint is the first place where the
+    server-side ``project_id`` becomes visible to the test, so use
+    it as the source of truth for the value the new endpoint expects.
+    """
+    r = client.get("/v1/assets", headers=auth_headers)
+    assert r.status_code == 200
+    first = r.json()["assets"][0]
+    return first["project_id"]
+
+
+def test_versions_returns_one_record_per_run_for_an_asset(client, auth_headers, tmp_path):
+    payload = _run_with_assets(tmp_path)
+    client.post("/v1/runs", json=payload, headers=auth_headers)
+    pid = _project_id_from_listing(client, auth_headers)
+
+    r = client.get(
+        f"/v1/assets/judge/q/versions?project_id={pid}",
+        headers=auth_headers,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["kind"]       == "judge"
+    assert body["asset_id"]   == "q"
+    assert body["project_id"] == pid
+    # One run → one record.
+    assert len(body["versions"]) == 1
+    v = body["versions"][0]
+    assert v["run_id"] == payload["run_id"]
+    # ``project_name`` is denormalised from the runs row, matching the
+    # listing's shape.
+    assert v["project_name"] == "p"
+    assert v["source"] == "cli"
+    assert v["version_id"]
+
+
+def test_versions_orders_newest_run_first(client, auth_headers, tmp_path):
+    """Two runs in the same project that both load the same judge
+    asset should produce two version records, sorted by
+    ``runs.ingested_at`` descending."""
+    first  = _run_with_assets(tmp_path / "a", project="ord", judge_score=4.5)
+    second = _run_with_assets(tmp_path / "b", project="ord", judge_score=4.6)
+    client.post("/v1/runs", json=first,  headers=auth_headers)
+    client.post("/v1/runs", json=second, headers=auth_headers)
+    pid = _project_id_from_listing(client, auth_headers)
+
+    r = client.get(
+        f"/v1/assets/judge/q/versions?project_id={pid}",
+        headers=auth_headers,
+    )
+    assert r.status_code == 200
+    versions = r.json()["versions"]
+    assert len(versions) == 2
+    # ingested_at sorts the SAME order regardless of insertion order;
+    # most recent first.  We can't pin to second.run_id directly
+    # because both inserts happen within a millisecond, so we just
+    # confirm the timestamps are monotonically non-increasing.
+    ts = [v["ingested_at"] for v in versions]
+    assert ts == sorted(ts, reverse=True)
+
+
+def test_versions_unknown_kind_returns_400(client, auth_headers):
+    r = client.get(
+        "/v1/assets/nonsense/q/versions?project_id=proj_abc",
+        headers=auth_headers,
+    )
+    # 400 not 404 — ``kind`` is a contract violation, not a missing
+    # row.  Same as the list endpoint.
+    assert r.status_code == 400
+    assert "Unknown asset kind" in r.json()["detail"]
+
+
+def test_versions_missing_project_id_query_param_is_422(client, auth_headers):
+    r = client.get("/v1/assets/judge/q/versions", headers=auth_headers)
+    assert r.status_code == 422   # FastAPI marks the required query as missing
+
+
+def test_versions_unknown_project_returns_404(client, auth_headers, tmp_path):
+    payload = _run_with_assets(tmp_path)
+    client.post("/v1/runs", json=payload, headers=auth_headers)
+    r = client.get(
+        "/v1/assets/judge/q/versions?project_id=proj_doesnotexist",
+        headers=auth_headers,
+    )
+    assert r.status_code == 404
+
+
+def test_versions_asset_with_no_ingests_in_project_returns_404(
+    client, auth_headers, tmp_path,
+):
+    """The project exists but this asset_id has never been ingested
+    in it — 404 with a helpful detail that mentions both the asset
+    and the project."""
+    payload = _run_with_assets(tmp_path)
+    client.post("/v1/runs", json=payload, headers=auth_headers)
+    pid = _project_id_from_listing(client, auth_headers)
+    r = client.get(
+        f"/v1/assets/judge/q-not-loaded/versions?project_id={pid}",
+        headers=auth_headers,
+    )
+    assert r.status_code == 404
+    detail = r.json()["detail"]
+    assert "q-not-loaded" in detail
+    assert pid in detail
+
+
+def test_versions_cross_org_returns_404_for_member(
+    client, auth_headers, make_org, make_member_token, tmp_path,
+):
+    """A member of org_default asking about an asset under a project
+    in org_acme must get 404 (no enumeration leak), even when they
+    know the project_id."""
+    make_org("acme")
+    member_default = make_member_token("org_default", name="d")
+    member_acme    = make_member_token("org_acme",    name="a")
+    p_acme = _run_with_assets(tmp_path / "a", project="acme-proj")
+    client.post(
+        "/v1/runs", json=p_acme,
+        headers={"Authorization": f"Bearer {member_acme}"},
+    )
+    # Discover the acme project_id via the admin listing — a real
+    # attacker wouldn't have this, but the test simulates the worst
+    # case.
+    r = client.get("/v1/assets", headers=auth_headers)
+    pid_acme = next(
+        a["project_id"] for a in r.json()["assets"]
+        if a["project_name"] == "acme-proj"
+    )
+
+    # default-org member tries to drill into acme's prompt.
+    r2 = client.get(
+        f"/v1/assets/judge/q/versions?project_id={pid_acme}",
+        headers={"Authorization": f"Bearer {member_default}"},
+    )
+    assert r2.status_code == 404
+    # Admin can drill in.
+    r3 = client.get(
+        f"/v1/assets/judge/q/versions?project_id={pid_acme}",
+        headers=auth_headers,
+    )
+    assert r3.status_code == 200
+
+
+def test_versions_requires_auth(client):
+    r = client.get(
+        "/v1/assets/judge/q/versions?project_id=proj_x",
+    )
+    assert r.status_code == 401
