@@ -141,7 +141,16 @@ function AssetsTable({
               key={`${a.project_id}-${a.kind}-${a.asset_id}`}
               className="border-b border-[var(--color-border)] hover:bg-[var(--color-bg-row)]"
             >
-              <td className="px-3 py-2 font-mono text-xs">{a.asset_id}</td>
+              <td className="px-3 py-2 font-mono text-xs">
+                <Link
+                  href={`/assets/detail/?kind=${encodeURIComponent(a.kind)}`
+                       + `&asset_id=${encodeURIComponent(a.asset_id)}`
+                       + `&project_id=${encodeURIComponent(a.project_id)}`}
+                  className="text-[var(--color-accent)] hover:underline"
+                >
+                  {a.asset_id}
+                </Link>
+              </td>
               <td className="px-3 py-2">
                 <Link
                   href={`/runs/?project=${encodeURIComponent(a.project_name)}`}

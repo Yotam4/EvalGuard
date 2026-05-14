@@ -467,3 +467,36 @@ export const listAssets = (
   const suffix = qs.toString() ? `?${qs.toString()}` : "";
   return request<{ assets: AssetSummary[] }>(`/v1/assets${suffix}`);
 };
+
+
+// Phase 2.6d — drill-down for one asset.
+export interface AssetVersionRecord {
+  version_id:   string;
+  run_id:       string;
+  project_name: string;
+  ingested_at:  string;
+  source:       "cli" | "otlp";
+}
+
+export interface AssetVersionsResponse {
+  kind:         AssetKind;
+  asset_id:     string;
+  project_id:   string;
+  project_name: string;
+  versions:     AssetVersionRecord[];
+}
+
+export const listAssetVersions = (
+  kind: AssetKind, assetId: string, projectId: string,
+  opts: { limit?: number } = {},
+) => {
+  const qs = new URLSearchParams({ project_id: projectId });
+  if (opts.limit) qs.set("limit", String(opts.limit));
+  // Path segments must be percent-encoded — an asset_id with a
+  // ``/`` would otherwise look like a sub-resource to the router.
+  return request<AssetVersionsResponse>(
+    `/v1/assets/${encodeURIComponent(kind)}`
+    + `/${encodeURIComponent(assetId)}`
+    + `/versions?${qs.toString()}`,
+  );
+};
