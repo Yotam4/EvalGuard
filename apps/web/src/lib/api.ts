@@ -293,6 +293,64 @@ export const getRunDrift = (
 };
 
 // ---------------------------------------------------------------------------
+// Reviews — Phase 4 human review queue.
+// Mirrors ``ReviewIngest`` / ``ReviewOut`` / ``ReviewQueueItem`` in
+// ``apps/api/evalguard_api/models.py``.
+
+export type ReviewVerdict = "agree" | "override_pass" | "override_fail" | "skip";
+
+export interface ReviewQueueItem {
+  run_id: string;
+  row_id: string;
+  trial_id: string;
+  project_id: string;
+  passed: boolean;
+  cost_usd: number;
+  latency_ms: number;
+  tags: string[];
+  failing_gates: string[];
+}
+
+export interface ReviewQueueResponse {
+  items: ReviewQueueItem[];
+  run_id: string | null;
+}
+
+export interface Review {
+  id: number;
+  run_id: string;
+  row_id: string;
+  project_id: string;
+  reviewer_key_id: string;
+  verdict: ReviewVerdict;
+  note: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export const getReviewQueue = (runId: string, opts: { limit?: number } = {}) => {
+  const qs = new URLSearchParams({ run_id: runId });
+  if (opts.limit != null) qs.set("limit", String(opts.limit));
+  return request<ReviewQueueResponse>(`/v1/reviews/queue?${qs.toString()}`);
+};
+
+export const submitReview = (body: {
+  run_id: string;
+  row_id: string;
+  verdict: ReviewVerdict;
+  note?: string;
+}) =>
+  request<Review>(`/v1/reviews`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+
+export const listRunReviews = (runId: string) =>
+  request<{ reviews: Review[] }>(
+    `/v1/runs/${encodeURIComponent(runId)}/reviews`,
+  );
+
+// ---------------------------------------------------------------------------
 // Orgs
 
 
