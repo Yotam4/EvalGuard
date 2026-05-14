@@ -4,31 +4,35 @@
   "private": true,
   "description": "EvalGuard UI — consumes the same JSON contract `evalguard view --json` produces.",
   "scripts": {
-    "dev":        "next dev",
-    "build":      "next build",
-    "start":      "next start",
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
     "type-check": "tsc --noEmit",
-    "test":       "vitest run",
-    "test:watch": "vitest"
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "e2e": "playwright test",
+    "e2e:install": "playwright install chromium --with-deps"
   },
   "dependencies": {
-    "next":              "^16.0.0",
-    "react":             "^19.0.0",
-    "react-dom":         "^19.0.0",
-    "@tanstack/react-query": "^5.62.0"
+    "@tanstack/react-query": "^5.62.0",
+    "next": "^16.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
   },
   "devDependencies": {
-    "@tailwindcss/postcss":      "^4.0.0",
-    "@testing-library/react":    "^16.1.0",
-    "@testing-library/dom":      "^10.4.0",
+    "@playwright/test": "^1.60.0",
+    "@tailwindcss/postcss": "^4.0.0",
+    "@testing-library/dom": "^10.4.0",
     "@testing-library/jest-dom": "^6.6.0",
-    "@types/node":               "^20.0.0",
-    "@types/react":              "^19.0.0",
-    "@types/react-dom":          "^19.0.0",
-    "@vitejs/plugin-react":      "^5.0.0",
-    "happy-dom":                 "^15.11.0",
-    "tailwindcss":               "^4.0.0",
-    "typescript":                "^5.0.0",
-    "vitest":                    "^3.0.0"
+    "@testing-library/react": "^16.1.0",
+    "@types/node": "^20.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "happy-dom": "^15.11.0",
+    "serve": "^14.2.6",
+    "tailwindcss": "^4.0.0",
+    "typescript": "^5.0.0",
+    "vitest": "^3.0.0"
   }
 }

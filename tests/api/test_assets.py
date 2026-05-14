@@ -325,3 +325,32 @@ def test_versions_requires_auth(client):
         "/v1/assets/judge/q/versions?project_id=proj_x",
     )
     assert r.status_code == 401
+
+
+def test_versions_respects_limit_parameter(client, auth_headers, tmp_path):
+    """``?limit=1`` after a multi-run ingest must return exactly one
+    record, sorted newest-first.  Pins the LIMIT in the ORDER BY
+    chain so a future refactor doesn't accidentally drop it."""
+    a = _run_with_assets(tmp_path / "a", project="lim", judge_score=4.5)
+    b = _run_with_assets(tmp_path / "b", project="lim", judge_score=4.6)
+    client.post("/v1/runs", json=a, headers=auth_headers)
+    client.post("/v1/runs", json=b, headers=auth_headers)
+    pid = _project_id_from_listing(client, auth_headers)
+    r = client.get(
+        f"/v1/assets/judge/q/versions?project_id={pid}&limit=1",
+        headers=auth_headers,
+    )
+    assert r.status_code == 200
+    assert len(r.json()["versions"]) == 1
+
+
+def test_versions_rejects_invalid_limit(client, auth_headers, tmp_path):
+    payload = _run_with_assets(tmp_path)
+    client.post("/v1/runs", json=payload, headers=auth_headers)
+    pid = _project_id_from_listing(client, auth_headers)
+    for bad in (0, 1001, -5):
+        r = client.get(
+            f"/v1/assets/judge/q/versions?project_id={pid}&limit={bad}",
+            headers=auth_headers,
+        )
+        assert r.status_code == 422, (bad, r.text)
