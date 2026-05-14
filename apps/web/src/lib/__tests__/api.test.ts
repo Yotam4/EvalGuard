@@ -4,7 +4,7 @@ import { setServerUrl, setToken } from "../auth";
 import {
   ApiError, NotConfiguredError,
   createApiKey, createOrg, getRun, getReviewQueue, getRunDrift,
-  health, listAssets, listRunReviews, listRuns,
+  health, listAssets, listAssetVersions, listRunReviews, listRuns,
   revokeApiKey, submitReview,
 } from "../api";
 
@@ -325,6 +325,55 @@ describe("api client", () => {
     const [url] = fetchMock.mock.calls[0];
     expect(url).toBe(
       "https://api.example.com/v1/runs/run%20with%20spaces/reviews",
+    );
+  });
+
+
+  // ---------------------------------------------------------------------
+  // asset versions (Phase 2.6d)
+
+
+  it("listAssetVersions encodes path segments AND puts project_id in the query string", async () => {
+    // The server's URL is
+    // ``/v1/assets/{kind}/{asset_id}/versions?project_id=…``; pin
+    // both that the kind + asset_id are percent-encoded path
+    // segments (a slash inside ``asset_id`` would otherwise be
+    // read as a sub-resource) AND that ``project_id`` doesn't slip
+    // into the path instead.
+    setServerUrl("https://api.example.com");
+    setToken("evk_x");
+    fetchMock.mockResolvedValueOnce({
+      ok: true, status: 200,
+      json: async () => ({
+        kind: "judge", asset_id: "q/strict",
+        project_id: "proj_a", project_name: "demo",
+        versions: [],
+      }),
+    });
+    await listAssetVersions("judge", "q/strict", "proj_a", { limit: 50 });
+    const [url] = fetchMock.mock.calls[0];
+    expect(url).toBe(
+      "https://api.example.com/v1/assets/judge/q%2Fstrict/versions"
+      + "?project_id=proj_a&limit=50",
+    );
+  });
+
+
+  it("listAssetVersions omits the limit when not supplied", async () => {
+    setServerUrl("https://api.example.com");
+    setToken("evk_x");
+    fetchMock.mockResolvedValueOnce({
+      ok: true, status: 200,
+      json: async () => ({
+        kind: "dataset", asset_id: "g",
+        project_id: "proj_a", project_name: "demo",
+        versions: [],
+      }),
+    });
+    await listAssetVersions("dataset", "g", "proj_a");
+    const [url] = fetchMock.mock.calls[0];
+    expect(url).toBe(
+      "https://api.example.com/v1/assets/dataset/g/versions?project_id=proj_a",
     );
   });
 });
