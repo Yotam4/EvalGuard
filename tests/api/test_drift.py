@@ -359,6 +359,23 @@ def _flatten_welch(result) -> tuple[float, ...]:
     )
 
 
+def _welch_equal(a: tuple, b: tuple) -> bool:
+    """Tuple equality that treats NaN == NaN. Plain ``==`` on a
+    tuple containing NaN always returns False — but two
+    implementations that BOTH surface NaN in the degenerate
+    zero-variance + unequal-means branch are still in parity.
+    """
+    import math
+    if len(a) != len(b):
+        return False
+    for x, y in zip(a, b):
+        if isinstance(x, float) and isinstance(y, float) and math.isnan(x) and math.isnan(y):
+            continue
+        if x != y:
+            return False
+    return True
+
+
 @pytest.mark.parametrize(
     "sample1, sample2",
     [
@@ -371,6 +388,17 @@ def _flatten_welch(result) -> tuple[float, ...]:
         # Boolean-ish (matches the ``passed`` metric distribution).
         ([1.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0],
          [0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0]),
+        # Degenerate: zero variance on both sides, IDENTICAL means.
+        # Both implementations report a vacuous "no difference"
+        # (p_two_sided=1, p_less=p_greater=0.5).
+        ([2.0, 2.0, 2.0], [2.0, 2.0, 2.0]),
+        # Degenerate: zero variance on both sides, DIFFERENT means.
+        # Mathematically t = ∞; both implementations must surface
+        # NaN p-values so the gate's ``isnan`` guard skips non-
+        # blockingly. Before the round-5 fix, the server returned
+        # deterministic 1.0/0.0 here while the CLI returned NaN —
+        # a silent parity break.
+        ([1.0, 1.0, 1.0], [2.0, 2.0, 2.0]),
     ],
 )
 def test_welch_parity_with_cli_implementation(sample1, sample2):
@@ -385,4 +413,4 @@ def test_welch_parity_with_cli_implementation(sample1, sample2):
 
     server_out = server_welch(sample1, sample2)
     cli_out    = cli_welch(sample1, sample2)
-    assert _flatten_welch(server_out) == _flatten_welch(cli_out)
+    assert _welch_equal(_flatten_welch(server_out), _flatten_welch(cli_out))

@@ -56,13 +56,26 @@ def welchs_t_test(sample1: list[float], sample2: list[float]) -> WelchResult:
     se_sq = var1 / n1 + var2 / n2
 
     if se_sq == 0:
-        # Identical, zero-variance samples — no statistical signal.
-        # Avoid div-by-zero; report "no detectable difference".
+        # Identical, zero-variance samples — no statistical signal at all.
+        # Two regimes:
+        #   - mean1 == mean2: distributions are literally identical;
+        #     report a vacuous "no difference" (p_two = 1.0).
+        #   - mean1 != mean2: SE is zero but means disagree — that's a
+        #     mathematically degenerate t (∞). Returning a deterministic
+        #     ``p_less = 1.0`` here would diverge from the CLI's stats
+        #     module AND from scipy, both of which surface NaN in this
+        #     branch so the consuming gate's ``isnan`` guard can skip
+        #     non-blockingly.  Parity with the CLI is pinned by
+        #     ``test_welch_parity_with_cli_implementation``.
         t = 0.0
         dof = float(n1 + n2 - 2)
-        p_two = 1.0
-        p_less = 0.5 if mean1 == mean2 else (1.0 if mean1 < mean2 else 0.0)
-        p_greater = 1.0 - p_less
+        if mean1 == mean2:
+            p_two = 1.0
+            p_less = p_greater = 0.5
+        else:
+            p_two = float("nan")
+            p_less = float("nan")
+            p_greater = float("nan")
         return WelchResult(t, dof, p_two, p_less, p_greater,
                            n1, n2, mean1, mean2, var1, var2)
 

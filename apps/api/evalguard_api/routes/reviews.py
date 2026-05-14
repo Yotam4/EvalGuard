@@ -22,6 +22,26 @@ least one gate_results entry for it failed AND the caller hasn't
 already reviewed it. Future policies (judge confidence bands, manual
 ``needs_review`` tags) extend the WHERE clause without changing the
 endpoint shape.
+
+**Audit surface (round-5 deliberate trade-off).** Review actions
+are intentionally NOT appended to the run's ``events_json``
+hash-chain — events_json is per-run-ingest and adding a separate
+per-action chain would force a much bigger schema change. Instead,
+review actions are auditable via two complementary surfaces:
+
+1. The structured access-log middleware in ``main.py`` (Phase E.5)
+   emits one JSON line per request including ``key_id`` /
+   ``org_id`` / route / status / duration for every authed call,
+   including ``POST /v1/reviews``.
+2. The ``row_reviews`` row itself is the durable record: it carries
+   ``reviewer_key_id``, ``verdict``, ``note``, ``created_at``,
+   ``updated_at``. An auditor reconstructs who said what when from
+   the table alone.
+
+Together these are enough for "who reviewed which row with what
+verdict at what time", which is the audit need. A pinning test
+in ``tests/api/test_review_round_5.py`` asserts both surfaces stay
+present so the trade-off can't silently regress.
 """
 
 from __future__ import annotations
