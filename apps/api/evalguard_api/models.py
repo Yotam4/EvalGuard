@@ -383,6 +383,36 @@ class AssetList(_Strict):
     assets: list[AssetSummary]
 
 
+class AssetVersionRecord(_Strict):
+    """One ``(version_id, run_id)`` pair for an asset.
+
+    The same ``version_id`` can appear in many runs (when an asset is
+    reused unchanged across days of CI); we return one record per
+    ingest rather than deduping so the UI can show "which run was the
+    first to introduce this version" without a follow-up query.
+    """
+
+    version_id:   str
+    run_id:       str
+    project_name: str
+    ingested_at:  str = Field(
+        description="ISO timestamp from ``runs.ingested_at`` — when the asset "
+                    "was first seen via this run, not the version's authoring date.")
+    source:       str = Field(
+        default="cli",
+        description="Phase 3a — ``cli`` or ``otlp``. Mirrors the runs.source column.")
+
+
+class AssetVersionsResponse(_Strict):
+    """Response to ``GET /v1/assets/{kind}/{asset_id}/versions``."""
+
+    kind:         str
+    asset_id:     str
+    project_id:   str
+    project_name: str
+    versions:     list[AssetVersionRecord]
+
+
 # ---------------------------------------------------------------------------
 # Drift report (Phase 3b)
 #
