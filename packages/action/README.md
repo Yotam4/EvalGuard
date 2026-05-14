@@ -1,8 +1,23 @@
 # `evalguard/action@v1`
 
-A GitHub Action that runs EvalGuard on every PR and posts a sticky
-markdown comment with per-trial verdicts, gate results, and
+A GitHub Action that runs EvalGuard in CI, pushes the run to a
+hosted server, and gates the workflow on the verdict. Optionally
+posts a sticky PR comment with per-trial verdicts, gate results, and
 Δ-vs-baseline metrics.
+
+## TL;DR — three flows
+
+| Flow | Use when | Inputs |
+|---|---|---|
+| **Run + gate, no server** | Local CI, no hosted backend yet | `config` only |
+| **Run + push + gate** | You have a Phase-2 server | + `server`, `token` |
+| **Run + PR comment + baseline diff** | You want PR-level UX | + `baseline`, `save_baseline` |
+
+All three combine — push to a server *and* comment on the PR is fine.
+
+The minimal "run + push + gate" example lives at
+[`examples/server-push.yml`](examples/server-push.yml).  The richer
+baseline-diff flow is below.
 
 ## Quickstart
 
@@ -83,17 +98,39 @@ jobs:
 | `pr_number` | auto | Auto-detected on `pull_request` events |
 | `github_token` | `${{ github.token }}` | For posting comments |
 | `fail_fast` | `false` | Pass `--fail-fast` to `evalguard run` |
+| `server` | _empty_ | EvalGuard server URL. Push happens when this + `token` are both set. |
+| `token`  | _empty_ | Bearer token. Use `${{ secrets.EVALGUARD_TOKEN }}` — never inline. |
+| `push`   | `true` | Set `false` to run locally even when secrets are present. |
+| `fail_on` | `gate_failed` | Comma-separated `gate_status` values that fail the workflow. `never` to disable. |
 
 ## Outputs
 
 | Output | Notes |
 |---|---|
-| `exit_code` | `0` pass · `2` blocking gate failed · `1` infra error |
+| `exit_code` | `0` pass · `2` blocking gate failed · `1` infra error (raw exit of `evalguard run`) |
 | `run_id` | The new run's id (e.g. `run_abc123…`) |
 | `comment_url` | URL of the posted PR comment, if any |
+| `gate_status` | `passed` / `warned` / `gate_failed` / `row_failed` / `cost_capped` (or empty if the run never produced JSON) |
+| `cost_usd` | Total run cost (string, four decimals) |
+| `url` | Server-side URL for the run when `push` succeeded |
 
 ## Exit codes
 
-The Action exits with the same code as `evalguard run`. A blocking
-gate failure (exit 2) fails the workflow step — making the check
-red on the PR — even if the comment posted successfully.
+The Action's exit code follows `fail_on`, not `evalguard run` directly:
+
+- **Infra errors always fail.**  If `evalguard run` exited non-zero
+  AND there's no parseable `gate_status` to inspect (e.g., crashed
+  during model load, malformed config), the action exits with the
+  same code.  `fail_on` doesn't gate infra errors.
+- **Gate results filter through `fail_on`.**  The parsed
+  `gate_status` is compared against the comma-separated `fail_on`
+  list.  Default `gate_failed` keeps the v0 behaviour where only
+  blocking failures fail CI; widen to `gate_failed,warned` to fail
+  on warnings, or set `fail_on: never` for advisory-only runs.
+
+## Self-host vs published action
+
+When pinned at `evalguard/action@v1` the Docker image is pulled from
+GHCR.  Self-hosting (private fork / air-gapped) is supported via
+the `./packages/action` path in all examples — the Dockerfile builds
+from the source tree and never reaches out.

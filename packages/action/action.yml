@@ -52,6 +52,43 @@ inputs:
     required: false
     default: 'false'
 
+  # v1 additions (Phase 1.5)
+  server:
+    description: |
+      EvalGuard server URL (e.g., https://eval.your-corp.com).  When
+      set together with ``token`` and ``push: true``, the action
+      pushes the run after it completes.  Leave empty for a local-
+      only run (still gates the build, still comments on PRs).
+    required: false
+    default: ''
+  token:
+    description: |
+      EvalGuard API bearer token.  Pass via
+      ``${{ secrets.EVALGUARD_TOKEN }}`` so the runner logs never
+      echo it (``set +x`` in the entrypoint also guards against
+      ``ACTIONS_STEP_DEBUG=true``).
+    required: false
+    default: ''
+  push:
+    description: |
+      Push to ``server`` after the run.  ``true`` by default, but
+      the entrypoint also requires ``server`` and ``token`` to be
+      non-empty before actually pushing — set this to ``false`` to
+      run locally even when the secrets are configured (e.g., for
+      forks where pushing across orgs is risky).
+    required: false
+    default: 'true'
+  fail_on:
+    description: |
+      Comma-separated set of ``gate_status`` values that fail the
+      workflow.  Defaults to ``gate_failed`` (only "the gates said
+      no" trips CI).  Set to ``never`` to disable gating entirely
+      (the action will still set outputs and post comments).
+      Recognised values: ``passed``, ``warned``, ``row_failed``,
+      ``gate_failed``, ``cost_capped``, ``never``.
+    required: false
+    default: 'gate_failed'
+
 outputs:
   exit_code:
     description: 'Exit code from `evalguard run` (0 pass, 2 gate fail, 1 infra error).'
@@ -59,6 +96,13 @@ outputs:
     description: 'The run ID produced by this invocation.'
   comment_url:
     description: 'URL of the posted PR comment, if any.'
+  # v1 additions
+  gate_status:
+    description: 'gate_status from the run: passed | warned | gate_failed | row_failed | cost_capped | (empty if the run did not complete).'
+  cost_usd:
+    description: 'Total run cost in USD as a string (four decimals).'
+  url:
+    description: 'Server URL for the run (e.g., https://eval.your-corp.com/v1/runs/run_xxx) if push succeeded; otherwise empty.'
 
 runs:
   using: 'docker'
@@ -71,4 +115,8 @@ runs:
     EVALGUARD_INPUT_MARKER: ${{ inputs.marker }}
     EVALGUARD_INPUT_PR_NUMBER: ${{ inputs.pr_number }}
     EVALGUARD_INPUT_FAIL_FAST: ${{ inputs.fail_fast }}
+    EVALGUARD_INPUT_SERVER: ${{ inputs.server }}
+    EVALGUARD_INPUT_TOKEN: ${{ inputs.token }}
+    EVALGUARD_INPUT_PUSH: ${{ inputs.push }}
+    EVALGUARD_INPUT_FAIL_ON: ${{ inputs.fail_on }}
     GITHUB_TOKEN: ${{ inputs.github_token }}

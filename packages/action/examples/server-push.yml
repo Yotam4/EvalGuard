@@ -1,0 +1,44 @@
+# Minimal "run + push + gate" workflow — no PR comment, no baseline.
+#
+# Use this when you have a hosted EvalGuard server (Phase 2+) and just
+# want CI to run the evals, ship them to the server, and gate the
+# build on the result.  The richer baseline-diff + sticky-comment flow
+# lives in ``../README.md``.
+
+name: EvalGuard
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run + push
+        id: evalguard
+        uses: ./packages/action       # or: evalguard/action@v1
+        with:
+          config:   evalguard.yaml
+          server:   ${{ secrets.EVALGUARD_SERVER }}
+          token:    ${{ secrets.EVALGUARD_TOKEN }}
+          # ``gate_failed`` (default) fails the workflow.  Widen to
+          # ``gate_failed,warned`` to fail on warnings too, or set to
+          # ``never`` for advisory-only runs.
+          fail_on:  gate_failed
+          # Skip PR comments — this example assumes server-side UI is
+          # the surface operators look at.
+          comment:  'false'
+
+      - name: Show outputs
+        if: always()
+        run: |
+          echo "run_id:      ${{ steps.evalguard.outputs.run_id }}"
+          echo "gate_status: ${{ steps.evalguard.outputs.gate_status }}"
+          echo "cost_usd:    ${{ steps.evalguard.outputs.cost_usd }}"
+          echo "url:         ${{ steps.evalguard.outputs.url }}"

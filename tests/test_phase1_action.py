@@ -143,10 +143,37 @@ def test_action_yml_is_valid_and_declares_required_pieces():
     data = yaml.safe_load(p.read_text())
     assert data["name"] == "EvalGuard"
     inputs = data["inputs"]
+    # v0 inputs.
     for required in ("config", "baseline", "save_baseline", "comment", "marker", "github_token"):
         assert required in inputs, f"action.yml missing input: {required}"
+    # v1 inputs (Phase 1.5).
+    for required in ("server", "token", "push", "fail_on"):
+        assert required in inputs, f"action.yml missing v1 input: {required}"
     outputs = data["outputs"]
+    # v0 outputs.
     for required in ("exit_code", "run_id", "comment_url"):
         assert required in outputs, f"action.yml missing output: {required}"
+    # v1 outputs (Phase 1.5).
+    for required in ("gate_status", "cost_usd", "url"):
+        assert required in outputs, f"action.yml missing v1 output: {required}"
+    # Every output needs a ``description`` so the GitHub UI renders
+    # it.  (For composite actions ``value`` is also required; this is
+    # a Docker action so the entrypoint writes ``$GITHUB_OUTPUT``
+    # directly — there's a sibling test below that asserts the
+    # entrypoint actually emits every declared output.)
+    for k in ("run_id", "exit_code", "comment_url",
+              "gate_status", "cost_usd", "url"):
+        assert "description" in outputs[k], f"output {k} missing description"
     assert data["runs"]["using"] == "docker"
     assert data["runs"]["image"] == "Dockerfile"
+    # The v1 input env-block in ``runs.env`` must forward every v1
+    # input into ``EVALGUARD_INPUT_*`` so the entrypoint can read it.
+    env = data["runs"]["env"]
+    for var, key in (
+        ("EVALGUARD_INPUT_SERVER",  "inputs.server"),
+        ("EVALGUARD_INPUT_TOKEN",   "inputs.token"),
+        ("EVALGUARD_INPUT_PUSH",    "inputs.push"),
+        ("EVALGUARD_INPUT_FAIL_ON", "inputs.fail_on"),
+    ):
+        assert var in env, f"runs.env missing {var}"
+        assert key in env[var], f"runs.env[{var}] not wired to {key}"
