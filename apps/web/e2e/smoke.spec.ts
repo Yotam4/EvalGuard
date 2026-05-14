@@ -163,10 +163,14 @@ test("settings → runs → run detail → assets → asset detail", async ({ pa
   // a moment to flush localStorage and re-render.
   await page.goto("/runs/");
   await expect(page.getByRole("heading", { name: /^runs$/i })).toBeVisible();
-  await expect(page.getByText("run_e2e0000000001").first()).toBeVisible();
+  // Address the row by its ``data-run-id`` attribute rather than a
+  // text-match on the link — a future change that reorders columns
+  // or shares a prefix between two runs wouldn't break this.
+  const runRow = page.locator('[data-testid="run-row"][data-run-id="run_e2e0000000001"]');
+  await expect(runRow).toBeVisible();
 
-  // 3. Run detail — click the run id link.
-  await page.getByRole("link", { name: /run_e2e/i }).first().click();
+  // 3. Run detail — click the run id link inside the addressed row.
+  await runRow.getByRole("link").first().click();
   // Detail page renders the run_id as a header.
   await expect(
     page.getByRole("heading", { name: "run_e2e0000000001" }),

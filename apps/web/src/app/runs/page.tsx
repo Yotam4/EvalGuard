@@ -83,6 +83,14 @@ function RunsTable({ runs }: { runs: RunSummary[] }) {
           {runs.map((r) => (
             <tr
               key={r.run_id}
+              // ``data-testid`` + ``data-run-id`` so Playwright (and
+              // any future e2e) can locate a specific row by id
+              // rather than text-matching against the run_id link
+              // — text matching breaks the moment two runs share a
+              // prefix or the column reorders.
+              data-testid="run-row"
+              data-run-id={r.run_id}
+              data-source={r.source}
               className="border-b border-[var(--color-border)] hover:bg-[var(--color-bg-row)]"
             >
               <Td>
