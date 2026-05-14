@@ -8,6 +8,8 @@ in-memory app + Alembic-migrated DB.
 
 from __future__ import annotations
 
+import pytest
+
 
 # ---------------------------------------------------------------------------
 # Synthetic OTLP payload helpers — match the OTLP/HTTP JSON shape
@@ -92,6 +94,132 @@ def test_otlp_ingest_requires_auth(client):
     body = _otlp_body(_resource_spans("svc", _gen_ai_span("s")))
     r = client.post("/v1/otlp/v1/traces", json=body)
     assert r.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Phase 3c — sampler at the route boundary
+
+
+def _client_with_sample_rate(tmp_path, rate: float):
+    """Spin up an isolated app with ``otlp_sample_rate=rate``. Done
+    here (not via a conftest fixture) so the rate is right next to
+    the assertion that depends on it — the failure mode otherwise is
+    "tests interact" via shared fixtures, which is exactly the kind
+    of action-at-a-distance that wastes debug time."""
+    from fastapi.testclient import TestClient
+    from evalguard_api.config import Settings
+    from evalguard_api.main import build_app
+    s = Settings(
+        database_url=f"sqlite:///{tmp_path}/server.db",
+        api_key="test-secret",
+        cors_origins=("*",),
+        otlp_sample_rate=rate,
+    )
+    app = build_app(settings=s)
+    return TestClient(app)
+
+
+def test_otlp_sampler_rate_zero_drops_every_span(tmp_path, auth_headers):
+    """``EVALGUARD_OTLP_SAMPLE_RATE=0`` is the air-gap safety valve:
+    accept the request (200 OK so the OTel collector is happy) but
+    persist nothing.  The envelope reports zero accepted runs and
+    one dropped span so an operator can see the sampler is on."""
+    with _client_with_sample_rate(tmp_path, 0.0) as c:
+        body = _otlp_body(_resource_spans(
+            "rag", _gen_ai_span("span0001"),
+        ))
+        r = c.post("/v1/otlp/v1/traces", json=body, headers=auth_headers)
+        assert r.status_code == 200, r.text
+        env = r.json()["evalguard"]
+        assert env["accepted_runs"]  == 0
+        assert env["kept_spans"]     == 0
+        assert env["dropped_spans"]  == 1
+        assert env["sample_rate"]    == 0.0
+        # And no run materialised in the listing.
+        listing = c.get("/v1/runs", headers=auth_headers).json()
+        assert all(r["source"] != "otlp" for r in listing["runs"])
+
+
+def test_otlp_sampler_rate_one_accepts_every_span(tmp_path, auth_headers):
+    """The default. Two spans in, one synthetic run out, dropped=0."""
+    with _client_with_sample_rate(tmp_path, 1.0) as c:
+        body = _otlp_body(_resource_spans(
+            "rag",
+            _gen_ai_span("span0001"),
+            _gen_ai_span("span0002"),
+        ))
+        r = c.post("/v1/otlp/v1/traces", json=body, headers=auth_headers)
+        env = r.json()["evalguard"]
+        assert env["accepted_runs"] == 1
+        assert env["kept_spans"]    == 2
+        assert env["dropped_spans"] == 0
+        assert env["sample_rate"]   == 1.0
+
+
+def test_otlp_sampler_rate_zero_still_returns_otlp_shape(tmp_path, auth_headers):
+    """The OTel collector treats 2xx + ``partialSuccess: {}`` as
+    success.  Even when we drop everything, that contract holds —
+    otherwise the collector would back off / retry, which would be
+    counterproductive at the load-shedding boundary."""
+    with _client_with_sample_rate(tmp_path, 0.0) as c:
+        body = _otlp_body(_resource_spans("rag", _gen_ai_span("s1")))
+        r = c.post("/v1/otlp/v1/traces", json=body, headers=auth_headers)
+        assert r.status_code == 200
+        assert r.json()["partialSuccess"] == {}
+
+
+def test_otlp_sampler_decision_is_deterministic_across_requests(tmp_path, auth_headers):
+    """Same traceId, same rate → same verdict on a fresh client.
+    Pins the stability guarantee — a collector that retries the same
+    trace ID after a transient 5xx must get the same outcome the
+    second time, otherwise we'd ingest duplicates."""
+    body = _otlp_body(_resource_spans(
+        "rag",
+        # All three share the default traceId from _gen_ai_span.
+        _gen_ai_span("span0001"),
+        _gen_ai_span("span0002"),
+    ))
+    accepted_first = None
+    for _ in range(3):
+        with _client_with_sample_rate(tmp_path / f"db{_!r}", 0.5) as c:
+            r = c.post("/v1/otlp/v1/traces", json=body, headers=auth_headers)
+            kept = r.json()["evalguard"]["kept_spans"]
+            if accepted_first is None:
+                accepted_first = kept
+            else:
+                assert kept == accepted_first
+
+
+def test_otlp_sampler_does_not_split_a_trace(tmp_path, auth_headers):
+    """All spans of one traceId share a verdict — never a half-
+    rendered trace."""
+    body = _otlp_body(_resource_spans(
+        "rag",
+        _gen_ai_span("span0001"),
+        _gen_ai_span("span0002"),
+        _gen_ai_span("span0003"),
+    ))
+    # All three default to the same traceId, so kept_spans must be
+    # 0 OR 3 — never 1 or 2.
+    for rate in (0.1, 0.3, 0.7):
+        with _client_with_sample_rate(tmp_path / f"db{rate}", rate) as c:
+            r = c.post("/v1/otlp/v1/traces", json=body, headers=auth_headers)
+            kept = r.json()["evalguard"]["kept_spans"]
+            assert kept in (0, 3), (rate, kept)
+
+
+def test_invalid_otlp_sample_rate_refuses_to_boot(tmp_path):
+    """``Settings.otlp_sample_rate`` outside [0, 1] is a config bug;
+    fail loudly rather than silently clamping."""
+    from evalguard_api.config import Settings, StartupRefusal, validate_for_startup
+    bad = Settings(
+        database_url=f"sqlite:///{tmp_path}/x.db",
+        api_key="test-secret",
+        cors_origins=("https://x",),
+        otlp_sample_rate=2.0,
+    )
+    with pytest.raises(StartupRefusal, match="OTLP_SAMPLE_RATE"):
+        validate_for_startup(bad)
 
 
 # ---------------------------------------------------------------------------

@@ -183,6 +183,20 @@ def build_app(settings: Settings | None = None) -> FastAPI:
     (with a tmp-path sqlite DB and a known API key) so they don't
     depend on process env."""
     settings = settings or load_settings()
+    # Ensure the root logger has at least one handler so the structured
+    # ``_access_log`` middleware (and any module-level ``logger.info``
+    # call) actually reaches stderr. ``main.run()`` configures logging
+    # explicitly, but ``python -m uvicorn evalguard_api.main:app`` skips
+    # that path — without this the SOC 2 audit trail is silently
+    # disabled. ``basicConfig`` is a no-op when handlers already exist
+    # (pytest configures them, ``main.run()`` configures them, gunicorn
+    # configures them) so this is safe to call unconditionally.
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s %(message)s",
+            stream=sys.stderr,
+        )
     app = FastAPI(
         title="EvalGuard API",
         version=__import__("evalguard_api").__version__,

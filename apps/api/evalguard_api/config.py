@@ -63,6 +63,16 @@ class Settings:
     db_max_overflow: int = 0
     db_pool_pre_ping: bool = True
     db_pool_recycle_s: int = 1800   # recycle connections every 30 min
+    # Phase 3c — probabilistic head-based sampling on OTLP ingest.
+    # 1.0 (default) accepts every span; 0.1 keeps roughly 10 % of
+    # traces (deterministic on traceId, so all spans of the same
+    # trace agree). Drops are silent at the OTLP/HTTP layer (the
+    # collector sees 200 OK) and counted in the structured access
+    # log. Operators who want the OTel collector to do all sampling
+    # themselves should leave this at 1.0; this knob is the API-edge
+    # safety net for misconfigured collectors emitting orders of
+    # magnitude more traces than expected.
+    otlp_sample_rate: float = 1.0
 
     @property
     def is_open_mode(self) -> bool:
@@ -122,6 +132,8 @@ def load_settings() -> Settings:
                             in {"1", "true", "TRUE"},
         db_pool_recycle_s=int(os.environ.get("EVALGUARD_DB_POOL_RECYCLE_S",
                                               Settings.db_pool_recycle_s)),
+        otlp_sample_rate=float(os.environ.get("EVALGUARD_OTLP_SAMPLE_RATE",
+                                               Settings.otlp_sample_rate)),
     )
 
 
@@ -156,3 +168,10 @@ def validate_for_startup(settings: Settings) -> None:
         # risky; we *warn* but allow because some users genuinely
         # need it. The middleware install logs a follow-up.
         pass
+    if not (0.0 <= settings.otlp_sample_rate <= 1.0):
+        raise StartupRefusal(
+            f"EVALGUARD_OTLP_SAMPLE_RATE must be in [0.0, 1.0]; "
+            f"got {settings.otlp_sample_rate!r}. Use 0.0 to drop "
+            f"every trace, 1.0 to accept every trace, anything in "
+            f"between for probabilistic sampling."
+        )
