@@ -443,8 +443,14 @@ class DriftReport(_Strict):
 # multiple reviewers per row are supported so cross-annotator
 # agreement can be computed later.
 
-# Verdict enum. Kept as a frozen literal so the OpenAPI schema and
-# the SQL ``CHECK``-style validation stay in lockstep.
+# Verdict enum. ``REVIEW_VERDICTS`` is the single source of truth —
+# the Pydantic ``Literal`` below derives from it, and migration
+# 0006_row_reviews_verdict_check pins it as a SQL CHECK constraint so
+# the DB rejects bad values even if the Pydantic layer is bypassed
+# (raw SQL, future ORM swap, ad-hoc backfill scripts).
+REVIEW_VERDICTS: tuple[str, ...] = (
+    "agree", "override_pass", "override_fail", "skip",
+)
 _ReviewVerdict = Literal["agree", "override_pass", "override_fail", "skip"]
 
 
