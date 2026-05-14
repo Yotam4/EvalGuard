@@ -217,6 +217,24 @@ class RunOut(_Loose):
     The body is what the CLI's ``run_to_dict`` produces, plus the
     server-injected ``server`` envelope (ingested_at, ingested_by,
     project_id) so an operator can see who pushed what when.
+
+    **Trusted-input contract.** ``RunOut`` is intentionally
+    ``extra='allow'`` and does **not** strip secret-shaped keys
+    (``api_key``, ``password``, ``secret``, …) on read. Two reasons:
+
+    1. The ingest path (``RunIngest``) is strict and the CLI runs
+       ``redact_secrets`` over every audit payload before writing.
+       Anything that reaches the storage layer either came from a
+       trusted CLI or was already accepted by the ``RunIngest``
+       validation contract.
+    2. Stripping on read would erase fields that legitimately carry
+       those names (e.g., an eval that tests a password-hashing
+       function with ``password`` rows, or RAG metrics over secrets-
+       detection prompts). Silent erasure on read is worse than the
+       theoretical leak from a hostile-but-authenticated client.
+
+    A regression test in ``tests/api/test_review_round_4.py``
+    documents this surface and pins the behaviour.
     """
 
     schema_version: str
