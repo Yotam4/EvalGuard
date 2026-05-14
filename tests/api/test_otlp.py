@@ -241,7 +241,10 @@ def test_otlp_run_appears_in_runs_list_with_otlp_source(client, auth_headers):
     otlp = [x for x in runs if x["source"] == "otlp"]
     assert len(otlp) == 1
     run = otlp[0]
-    assert run["run_id"].startswith("run_otlp_")
+    # ``run_otlp`` (no trailing underscore) — the id is deterministic
+    # from sha256(trace_id) so a collector retry hashes to the same
+    # value. Matches the regex in models.py ``RunIngest.run_id``.
+    assert run["run_id"].startswith("run_otlp")
     assert run["project"] == "rag-service"
     assert run["row_count"] == 2
     assert run["row_pass_count"] == 2
@@ -428,3 +431,151 @@ def test_otlp_lands_in_callers_org_only(
         headers={"Authorization": f"Bearer {member_acme}"},
     ).json()["runs"]
     assert any(r["source"] == "otlp" for r in runs2)
+
+
+# ---------------------------------------------------------------------------
+# Round-4 review regressions — idempotency, cost pricing, audit chain,
+# schema validation, cardinality. Each test pins one finding from the
+# review of commit 8b7ff73 ("Phase 3a: OTLP / gen_ai.* ingest").
+
+
+def test_otlp_retry_with_same_trace_id_is_idempotent(client, auth_headers):
+    """OTel collectors retry whole batches on 5xx. A retry of the
+    same trace must NOT double-ingest — the run_id is now derived
+    deterministically from sha256(trace_id) so the duplicate check
+    at the route ack's 200 with ``duplicate_runs: 1`` and no new
+    row lands."""
+    body = _otlp_body(_resource_spans(
+        "rag",
+        _gen_ai_span("span0001", prompt="Q", completion="A"),
+    ))
+    r1 = client.post("/v1/otlp/v1/traces", json=body, headers=auth_headers)
+    assert r1.status_code == 200
+    assert r1.json()["evalguard"]["accepted_runs"]  == 1
+    assert r1.json()["evalguard"]["duplicate_runs"] == 0
+
+    # Same body, second time — collector retry.
+    r2 = client.post("/v1/otlp/v1/traces", json=body, headers=auth_headers)
+    assert r2.status_code == 200
+    assert r2.json()["evalguard"]["accepted_runs"]  == 0
+    assert r2.json()["evalguard"]["duplicate_runs"] == 1
+
+    # And the runs list shows exactly one OTLP run, not two.
+    runs = client.get("/v1/runs", headers=auth_headers).json()["runs"]
+    otlp = [r for r in runs if r["source"] == "otlp"]
+    assert len(otlp) == 1
+
+
+def test_otlp_cost_priced_from_token_usage_for_known_openai_models(
+    client, auth_headers,
+):
+    """When the span carries ``gen_ai.system=openai`` and a model in
+    the OpenAI pricing table, ``cost_usd`` is non-zero on the row
+    AND on the run aggregate. Before the fix, OTLP rows always
+    priced to $0 even with token counts present."""
+    body = _otlp_body(_resource_spans(
+        "rag",
+        # _gen_ai_span defaults to gpt-4o-mini + 12 in / 34 out tokens
+        _gen_ai_span("span0001", prompt="Q", completion="A"),
+    ))
+    r = client.post("/v1/otlp/v1/traces", json=body, headers=auth_headers)
+    assert r.status_code == 200
+
+    run_id = next(
+        rr["run_id"] for rr in client.get("/v1/runs", headers=auth_headers).json()["runs"]
+        if rr["source"] == "otlp"
+    )
+    body = client.get(f"/v1/runs/{run_id}", headers=auth_headers).json()
+    # gpt-4o-mini = ($0.15 in, $0.60 out) per 1M tokens
+    # → 12 * 0.15 / 1_000_000 + 34 * 0.60 / 1_000_000 = 2.22e-5
+    assert body["cost_usd"] > 0
+    assert body["trials"][0]["cost_usd"] > 0
+    assert body["trials"][0]["rows"][0]["cost_usd"] > 0
+
+
+def test_otlp_unknown_provider_prices_to_zero(client, auth_headers):
+    """A provider the pricing table doesn't know about (e.g.
+    'anthropic' until we ship its table) must still ingest cleanly,
+    just with cost_usd=0. No NaN, no exception, no skipped row."""
+    body = _otlp_body(_resource_spans(
+        "rag",
+        {
+            "traceId": "fedcba9876543210fedcba9876543210",
+            "spanId":  "span0001",
+            "name":    "anthropic chat",
+            "kind":    2,
+            "startTimeUnixNano": "1700000000000000000",
+            "endTimeUnixNano":   "1700000000123000000",
+            "attributes": [
+                _str_attr("gen_ai.system", "anthropic"),
+                _str_attr("gen_ai.request.model", "claude-3-5-sonnet"),
+                _int_attr("gen_ai.usage.input_tokens",  100),
+                _int_attr("gen_ai.usage.output_tokens", 200),
+            ],
+        },
+    ))
+    r = client.post("/v1/otlp/v1/traces", json=body, headers=auth_headers)
+    assert r.status_code == 200, r.text
+    run_id = next(
+        rr["run_id"] for rr in client.get("/v1/runs", headers=auth_headers).json()["runs"]
+        if rr["source"] == "otlp"
+    )
+    body = client.get(f"/v1/runs/{run_id}", headers=auth_headers).json()
+    assert body["cost_usd"] == 0
+    assert body["row_count"] == 1
+
+
+def test_otlp_run_carries_synthesized_audit_chain(client, auth_headers):
+    """Every OTLP run must produce a one-event hash-chained audit
+    block so the run appears in the audit log alongside CLI-pushed
+    runs. Before the fix, OTLP runs had no ``audit`` key at all."""
+    body = _otlp_body(_resource_spans("rag", _gen_ai_span("span0001")))
+    client.post("/v1/otlp/v1/traces", json=body, headers=auth_headers)
+    run_id = next(
+        r["run_id"] for r in client.get("/v1/runs", headers=auth_headers).json()["runs"]
+        if r["source"] == "otlp"
+    )
+    body = client.get(f"/v1/runs/{run_id}", headers=auth_headers).json()
+    audit = body.get("audit")
+    assert audit is not None
+    assert audit["event_count"] == 1
+    assert audit["chain_tip"]
+    assert len(audit["events"]) == 1
+    ev = audit["events"][0]
+    assert ev["kind"]       == "run.started"
+    assert ev["actor_type"] == "api_key"
+    # ``event_hash`` is sha256(canonical(event)); check the chain-tip
+    # matches so verify_chain would pass without special-casing.
+    assert audit["chain_tip"] == ev["event_hash"]
+
+
+def test_otlp_rejects_too_many_resource_spans(client, auth_headers):
+    """Adversarial / buggy clients pushing more than the
+    ResourceSpans cardinality cap (one Run per ResourceSpans, max 50)
+    get 400 instead of OOM-ing the worker."""
+    body = {
+        "resourceSpans": [
+            _resource_spans(f"svc-{i}", _gen_ai_span(f"span{i:04x}"))
+            for i in range(51)
+        ],
+    }
+    r = client.post("/v1/otlp/v1/traces", json=body, headers=auth_headers)
+    assert r.status_code == 400
+    assert "resourceSpans" in r.json()["detail"]
+
+
+def test_otlp_payload_round_trips_RunIngest_schema(client, auth_headers):
+    """Sanity: the synthesized payload survives RunIngest validation.
+    Catches drift where a future otlp.py change emits fields the
+    strict RunIngest model rejects (this would otherwise surface as
+    a 400 on ingest, not a unit-test failure)."""
+    from evalguard_api.models import RunIngest
+    from evalguard_api.otlp import parse_traces
+
+    body = _otlp_body(_resource_spans(
+        "rag",
+        _gen_ai_span("span0001", prompt="Q", completion="A"),
+    ))
+    [payload] = parse_traces(body, default_project="default")
+    # Must not raise — RunIngest is the contract the route enforces.
+    RunIngest.model_validate(payload)

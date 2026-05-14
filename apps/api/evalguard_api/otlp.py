@@ -24,9 +24,24 @@ Reference for the shape we accept:
 
 from __future__ import annotations
 
+import hashlib
 import secrets
 from datetime import datetime, timezone
 from typing import Any
+
+
+# ---------------------------------------------------------------------------
+# Cardinality caps
+#
+# OTLP collectors retry whole batches on 5xx — a hostile / buggy client
+# could push a 100 MB body full of millions of nested spans. The main.py
+# Content-Length gate caps body size, but a small body with deeply nested
+# attribute arrays can still allocate excessive memory once parsed.
+# These caps mirror ``RunIngest`` in models.py (50 trials, 50_000 rows
+# per trial); we reject before allocating.
+
+_MAX_RESOURCE_SPANS: int = 50         # one Run per ResourceSpans, capped at the trial-count limit
+_MAX_SPANS_PER_RESOURCE: int = 50_000  # mirrors Trial.rows max
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +120,8 @@ def parse_traces(
     body: dict,
     *,
     default_project: str = "default",
+    actor_id: str | None = None,
+    actor_type: str | None = None,
 ) -> list[dict]:
     """Convert one OTLP ``ExportTraceServiceRequest`` JSON body into a
     list of synthetic ``run_to_dict``-compatible payloads — one per
@@ -130,12 +147,23 @@ def parse_traces(
     rs_list = body.get("resourceSpans") or []
     if not isinstance(rs_list, list):
         raise OtlpParseError("``resourceSpans`` must be an array.")
+    if len(rs_list) > _MAX_RESOURCE_SPANS:
+        raise OtlpParseError(
+            f"OTLP body contains {len(rs_list)} resourceSpans entries; the "
+            f"limit is {_MAX_RESOURCE_SPANS} (one Run per ResourceSpans). "
+            "Split the export into smaller batches."
+        )
 
     payloads: list[dict] = []
     for rs in rs_list:
         if not isinstance(rs, dict):
             continue
-        payload = _resource_spans_to_run(rs, default_project=default_project)
+        payload = _resource_spans_to_run(
+            rs,
+            default_project=default_project,
+            actor_id=actor_id,
+            actor_type=actor_type,
+        )
         if payload is not None:
             payloads.append(payload)
     return payloads
@@ -145,6 +173,8 @@ def _resource_spans_to_run(
     rs: dict,
     *,
     default_project: str,
+    actor_id: str | None = None,
+    actor_type: str | None = None,
 ) -> dict | None:
     """One ``ResourceSpans`` → one Run dict. Returns None if no
     GenAI spans are present (caller skips it)."""
@@ -159,13 +189,22 @@ def _resource_spans_to_run(
     rows: list[dict] = []
     earliest_started: int | None = None
     latest_finished:  int | None = None
+    trace_id_hex: str | None = None  # captured for deterministic run_id
 
+    span_count = 0
     for scope in (rs.get("scopeSpans") or []):
         if not isinstance(scope, dict):
             continue
         for span in (scope.get("spans") or []):
             if not isinstance(span, dict):
                 continue
+            span_count += 1
+            if span_count > _MAX_SPANS_PER_RESOURCE:
+                raise OtlpParseError(
+                    f"ResourceSpans contains more than "
+                    f"{_MAX_SPANS_PER_RESOURCE} spans; split the trace "
+                    "or aggregate upstream."
+                )
             row = _span_to_row(span)
             if row is None:
                 continue
@@ -181,6 +220,14 @@ def _resource_spans_to_run(
                 earliest_started = start
             if end and (latest_finished is None or end > latest_finished):
                 latest_finished = end
+            # Capture the first non-empty traceId we see. All spans in
+            # one ResourceSpans typically share a trace; if they don't
+            # (multi-trace batch), the first one wins — collectors that
+            # retry the same batch hash to the same run_id.
+            if trace_id_hex is None:
+                t = span.get("traceId")
+                if isinstance(t, str) and t.strip():
+                    trace_id_hex = t.strip().lower()
 
     if not rows:
         return None
@@ -190,13 +237,28 @@ def _resource_spans_to_run(
     # across the rows.  If the spans disagree, we still pick one for
     # the trial label and the rows preserve their own provider/model.
     provider, model = _pick_provider_model(rows)
-    trial_id = f"trial_otlp_{secrets.token_hex(6)}"
+
+    # Deterministic ids — a collector that retries the same batch
+    # produces the same ``run_id`` so the duplicate-run-id 409 in
+    # ``ingest_run`` kicks in instead of double-ingesting. Derives
+    # from traceId + project so concurrent traces in the same project
+    # never collide, and the same trace re-exported to a different
+    # project lands as a different run (rare but valid).
+    run_id, trial_id = _deterministic_ids(trace_id_hex, project)
 
     # Move the per-span ``provider`` / ``model`` strings out of each
     # row (those fields exist on Row but are display-only) — and back
-    # them with the synthesized trial.
+    # them with the synthesized trial. Compute cost from token usage
+    # now that we know the trial-level model.
+    cost_total = 0.0
     for r in rows:
         r["trial_id"] = trial_id
+        r["cost_usd"] = _price_row(
+            provider=r.get("provider") or provider,
+            model=r.get("model") or model,
+            tokens=r.get("otlp_token_usage"),
+        )
+        cost_total += r["cost_usd"]
 
     pass_count = sum(1 for r in rows if r["passed"])
     fail_count = len(rows) - pass_count
@@ -204,7 +266,6 @@ def _resource_spans_to_run(
     started_at  = _ns_to_iso(earliest_started)
     finished_at = _ns_to_iso(latest_finished)
 
-    run_id = f"run_otlp_{secrets.token_hex(8)}"
     payload: dict[str, Any] = {
         "schema_version": "1.0.0",
         "run_id":         run_id,
@@ -217,7 +278,7 @@ def _resource_spans_to_run(
         "row_count":      len(rows),
         "row_pass_count": pass_count,
         "row_fail_count": fail_count,
-        "cost_usd":       sum(r.get("cost_usd", 0.0) for r in rows),
+        "cost_usd":       round(cost_total, 6),
         "trials": [
             {
                 "trial_id":       trial_id,
@@ -227,7 +288,7 @@ def _resource_spans_to_run(
                 "row_count":      len(rows),
                 "row_pass_count": pass_count,
                 "row_fail_count": fail_count,
-                "cost_usd":       sum(r.get("cost_usd", 0.0) for r in rows),
+                "cost_usd":       round(cost_total, 6),
                 "rows":           rows,
                 "status":         "passed" if fail_count == 0 else "failed",
                 "config":         {"otlp": True, "service_name": res_attrs.get("service.name")},
@@ -236,7 +297,108 @@ def _resource_spans_to_run(
         # No assets yet — OTLP doesn't carry prompt-version hashes.
         "assets":         [],
     }
+    # Synthesize a minimal hash-chained audit block so OTLP runs
+    # appear in the audit log the same way CLI-pushed runs do. The
+    # chain has exactly one event of kind ``run.started``; richer
+    # per-row events can land in a follow-up that maps span lifecycle
+    # to audit kinds. ``event_count`` and ``chain_tip`` follow the
+    # same recipe ``_hash_event`` uses in the CLI so the chain
+    # verifies under the same logic.
+    audit_block = _synthesize_audit_block(
+        run_id=run_id,
+        trace_id_hex=trace_id_hex,
+        # ``actor_type`` must match ``ACTOR_TYPES`` enum
+        # (cli|ci|api_key|system). OTLP traffic always arrives with a
+        # bearer api_key in the route, so that's the right default
+        # when the caller doesn't override.
+        actor_id=actor_id or "otlp",
+        actor_type=actor_type or "api_key",
+        n_rows=len(rows),
+        n_trials=1,
+    )
+    payload["audit"] = audit_block
     return payload
+
+
+def _synthesize_audit_block(
+    *,
+    run_id: str,
+    trace_id_hex: str | None,
+    actor_id: str,
+    actor_type: str,
+    n_rows: int,
+    n_trials: int,
+) -> dict[str, Any]:
+    """Build a one-event audit block for an OTLP-synthesized run.
+
+    Event id and event_hash are derived deterministically from the
+    trace id so a collector retry hashes to the same chain tip —
+    consistent with the deterministic run_id.
+    """
+    event_id = (
+        f"ev_otlp_{hashlib.sha256(trace_id_hex.encode()).hexdigest()[:16]}"
+        if trace_id_hex
+        else f"ev_otlp_{secrets.token_hex(8)}"
+    )
+    now = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    event: dict[str, Any] = {
+        "event_id":        event_id,
+        "kind":            "run.started",
+        "run_id":          run_id,
+        "actor_id":        actor_id,
+        "actor_type":      actor_type,
+        "started_at":      now,
+        "prev_event_hash": None,
+        "payload": {
+            "source":      "otlp",
+            "trace_id":    trace_id_hex,
+            "n_rows":      n_rows,
+            "n_trials":    n_trials,
+        },
+    }
+    # event_hash = sha256(canonical(event - event_hash)) — same recipe
+    # as the CLI's ``_hash_event`` so the existing chain-verify path
+    # in audit.py validates these without special-casing.
+    import json as _json
+    canonical = _json.dumps(event, sort_keys=True, separators=(",", ":"), default=str)
+    event["event_hash"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return {
+        "actor_id":    actor_id,
+        "actor_type":  actor_type,
+        "actor_meta":  {"source": "otlp"},
+        "event_count": 1,
+        "chain_tip":   event["event_hash"],
+        "events":      [event],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Deterministic id derivation — makes OTLP ingest idempotent under
+# collector-retry semantics.
+
+
+def _deterministic_ids(trace_id_hex: str | None, project: str) -> tuple[str, str]:
+    """Return ``(run_id, trial_id)`` derived from the trace id.
+
+    If the trace lacks an id (older SDKs / hand-crafted payloads), we
+    fall back to a random id — which costs idempotency but is the
+    only safe option. Logged in tests so a regression is loud.
+    """
+    if trace_id_hex:
+        digest = hashlib.sha256(
+            f"otlp:{project}:{trace_id_hex}".encode("utf-8")
+        ).hexdigest()
+        # ``run_<>`` regex requires lowercase alnum + ≥8 chars. The
+        # full sha256 hex satisfies it; we keep 16 chars for a stable,
+        # human-readable run_id.
+        run_id = f"run_otlp{digest[:16]}"
+        trial_id = f"trial_otlp{digest[16:28]}"
+        return run_id, trial_id
+    # Fallback — non-idempotent but at least valid id shape.
+    return (
+        f"run_otlp_{secrets.token_hex(8)}",
+        f"trial_otlp_{secrets.token_hex(6)}",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +456,10 @@ def _span_to_row(span: dict) -> dict | None:
         "n_scores":   0,
         "provider":   provider,
         "model":      model,
-        "cost_usd":   0.0,    # cost calc deferred until we wire pricing tables to OTLP
+        # Cost is computed at the trial level in
+        # ``_resource_spans_to_run`` so it can use the trial's
+        # canonical provider/model when the per-span value is missing.
+        "cost_usd":   0.0,
         "latency_ms": latency_ms,
         "cache_hit":  False,
         "tags":       _row_tags(attrs, span),
@@ -339,6 +504,51 @@ def _row_tags(attrs: dict, span: dict) -> list[str]:
     if isinstance(op, str):
         tags.append(f"gen_ai_op:{op}")
     return tags
+
+
+def _price_row(
+    *,
+    provider: str | None,
+    model: str | None,
+    tokens: dict | None,
+) -> float:
+    """Cost of one OTLP-derived row from its token usage, in USD.
+
+    Reuses the OpenAI provider's pricing table when ``provider ==
+    'openai'``. Other providers fall through to 0.0 until their
+    pricing tables ship — same fail-soft contract as a model the
+    table doesn't list (cost is 0, but the row still lands so token
+    counts are visible).
+
+    The import is lazy because ``evalguard_evaluators`` is an
+    optional dependency of the API (the CLI carries it, the server
+    only needs it for OTLP cost). If the package is absent, every
+    OTLP row prices to 0 — the current pre-fix behaviour.
+    """
+    if not provider or not model or not tokens:
+        return 0.0
+    if str(provider).lower() != "openai":
+        return 0.0
+    try:
+        from evalguard_evaluators.providers.openai_provider import _PRICING
+    except Exception:  # noqa: BLE001 — pricing is best-effort
+        return 0.0
+    in_price, out_price = _PRICING.get(model, (0.0, 0.0))
+    if in_price == 0.0 and out_price == 0.0:
+        return 0.0
+    in_tokens  = _safe_int(tokens.get("input_tokens"))
+    out_tokens = _safe_int(tokens.get("output_tokens"))
+    return round(
+        (in_tokens * in_price + out_tokens * out_price) / 1_000_000,
+        6,
+    )
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _pick_provider_model(rows: list[dict]) -> tuple[str | None, str | None]:

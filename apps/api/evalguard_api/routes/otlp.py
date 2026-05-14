@@ -37,9 +37,13 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from sqlalchemy.engine import Connection
 
+from pydantic import ValidationError
+from sqlalchemy import text
+
 from evalguard_api.auth import Principal, require_principal
 from evalguard_api.db import upsert_project
 from evalguard_api.deps import get_conn
+from evalguard_api.models import RunIngest
 from evalguard_api.otlp import OtlpParseError, parse_traces
 from evalguard_api.routes.runs import _persist_run
 from evalguard_api.sampling import filter_otlp_spans
@@ -88,22 +92,58 @@ async def ingest_traces(
         synthetic_runs = parse_traces(
             body,
             default_project=settings.default_project_slug,
+            actor_id=principal.key_id or "otlp",
+            actor_type="api_key",
         )
     except OtlpParseError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(e),
         )
 
-    # Persist each synthetic run in turn. Each lands in the caller's
-    # org under the project named by ``service.name`` (or the
-    # default). If two ResourceSpans blocks name the same project,
-    # ``upsert_project`` returns the same project_id for both.
+    # Persist each synthetic run. The synthesized payload must
+    # validate through ``RunIngest`` for the same reason the regular
+    # ``POST /v1/runs`` body does — schema correctness, cardinality
+    # caps, regex-checked ids. Without this, an OTLP path could
+    # write rows the JSON Schema validator would later reject on GET.
+    #
+    # Each run lands in the caller's org under the project named by
+    # ``service.name`` (or the default). If two ResourceSpans blocks
+    # name the same project, ``upsert_project`` returns the same
+    # project_id for both.
     accepted = 0
+    duplicates = 0
     for payload in synthetic_runs:
+        try:
+            validated = RunIngest.model_validate(payload)
+        except ValidationError as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"OTLP-synthesized payload failed schema validation: {e.errors()[:3]}",
+            )
+        # ``run_id`` is deterministic from the trace id; a collector
+        # retry hashes to the same value. If the run already exists,
+        # the OTLP contract is to ack 200 with no work (collectors
+        # treat 200 as final-success) — 409 would trigger an
+        # exponential-backoff retry that never converges.
+        already = conn.execute(
+            text("SELECT 1 FROM runs WHERE run_id = :rid"),
+            {"rid": validated.run_id},
+        ).fetchone()
+        if already is not None:
+            duplicates += 1
+            continue
         project_id = upsert_project(
-            conn, org_id=principal.org_id, project_name=payload["project"],
+            conn, org_id=principal.org_id, project_name=validated.project,
         )
-        _persist_run(conn, payload, project_id, principal, source="otlp")
+        # Use ``model_dump`` so ``_persist_run`` sees the validated
+        # (and field-aliased) shape, not the raw synthesized dict.
+        _persist_run(
+            conn,
+            validated.model_dump(mode="json"),
+            project_id,
+            principal,
+            source="otlp",
+        )
         accepted += 1
 
     # Structured log line: the access-log middleware records the
@@ -135,7 +175,15 @@ async def ingest_traces(
         content={
             "partialSuccess": {},
             "evalguard": {
-                "accepted_runs":  accepted,
+                "accepted_runs":   accepted,
+                # Collector retries hash to the same run_id; we count
+                # how many landed as duplicates so an operator can see
+                # whether something upstream is double-sending.
+                "duplicate_runs":  duplicates,
+                # Phase 3c — head-based sampler. ``kept_spans`` /
+                # ``dropped_spans`` are populated by the sampler before
+                # ``parse_traces`` runs; an operator can see drop rates
+                # at the response level.
                 "kept_spans":     kept_spans,
                 "dropped_spans":  dropped_spans,
                 "sample_rate":    settings.otlp_sample_rate,
