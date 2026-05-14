@@ -3,8 +3,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setServerUrl, setToken } from "../auth";
 import {
   ApiError, NotConfiguredError,
-  createApiKey, createOrg, getRun, getRunDrift,
-  health, listAssets, listRuns, revokeApiKey,
+  createApiKey, createOrg, getRun, getReviewQueue, getRunDrift,
+  health, listAssets, listRunReviews, listRuns,
+  revokeApiKey, submitReview,
 } from "../api";
 
 /**
@@ -260,6 +261,70 @@ describe("api client", () => {
     const [url] = fetchMock.mock.calls[0];
     expect(url).toBe(
       "https://api.example.com/v1/runs/run_a/drift?vs=run_b&alpha=0.01",
+    );
+  });
+
+
+  // ---------------------------------------------------------------------
+  // reviews (Phase 4)
+
+
+  it("getReviewQueue puts run_id into the query string (no path segment)", async () => {
+    // The server's route is ``/v1/reviews/queue?run_id=`` (a flat
+    // resource), NOT ``/v1/runs/{id}/reviews/queue``. Pin the URL
+    // so a refactor that confuses the two doesn't silently 404.
+    setServerUrl("https://api.example.com");
+    setToken("evk_x");
+    fetchMock.mockResolvedValueOnce({
+      ok: true, status: 200,
+      json: async () => ({ items: [], run_id: "run_a" }),
+    });
+    await getReviewQueue("run_a", { limit: 10 });
+    const [url] = fetchMock.mock.calls[0];
+    expect(url).toBe(
+      "https://api.example.com/v1/reviews/queue?run_id=run_a&limit=10",
+    );
+  });
+
+
+  it("submitReview POSTs the verdict body", async () => {
+    setServerUrl("https://api.example.com");
+    setToken("evk_x");
+    fetchMock.mockResolvedValueOnce({
+      ok: true, status: 201,
+      json: async () => ({
+        id: 1, run_id: "run_a", row_id: "r1", project_id: "proj_x",
+        reviewer_key_id: "key_a", verdict: "override_pass",
+        note: "fp", created_at: "2026-05-14T00:00:00",
+        updated_at: "2026-05-14T00:00:00",
+      }),
+    });
+    await submitReview({
+      run_id: "run_a", row_id: "r1",
+      verdict: "override_pass", note: "fp",
+    });
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("https://api.example.com/v1/reviews");
+    expect(init.method).toBe("POST");
+    const body = JSON.parse(init.body as string);
+    expect(body).toEqual({
+      run_id: "run_a", row_id: "r1",
+      verdict: "override_pass", note: "fp",
+    });
+  });
+
+
+  it("listRunReviews encodes the run_id path segment", async () => {
+    setServerUrl("https://api.example.com");
+    setToken("evk_x");
+    fetchMock.mockResolvedValueOnce({
+      ok: true, status: 200,
+      json: async () => ({ reviews: [] }),
+    });
+    await listRunReviews("run with spaces");
+    const [url] = fetchMock.mock.calls[0];
+    expect(url).toBe(
+      "https://api.example.com/v1/runs/run%20with%20spaces/reviews",
     );
   });
 });
