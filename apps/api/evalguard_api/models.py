@@ -13,7 +13,7 @@ models so the two sides of the contract can't silently disagree.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -412,3 +412,86 @@ class DriftReport(_Strict):
         default_factory=list,
         description="Metrics that couldn't be tested (e.g., one side had < 2 rows). "
                     "Each entry: {name, reason}.")
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — Argilla-style human review queue.
+#
+# A row that automated heuristics + judges flagged as failed (or
+# borderline) goes into the queue. A reviewer picks it up, sees the
+# input / output / scores, and submits one of four verdicts.
+# Decisions are immutable per-reviewer (a reviewer can update their
+# OWN review via UPSERT, but never overwrite someone else's), and
+# multiple reviewers per row are supported so cross-annotator
+# agreement can be computed later.
+
+# Verdict enum. Kept as a frozen literal so the OpenAPI schema and
+# the SQL ``CHECK``-style validation stay in lockstep.
+_ReviewVerdict = Literal["agree", "override_pass", "override_fail", "skip"]
+
+
+class ReviewIngest(_Strict):
+    """``POST /v1/reviews`` body."""
+
+    run_id:  str = Field(pattern=r"^run_[a-z0-9]{8,}$",
+                         description="The run the row belongs to.")
+    row_id:  str = Field(min_length=1, max_length=200,
+                         description="``row_id`` as ingested (not the surrogate ``run_rows.id``).")
+    verdict: _ReviewVerdict = Field(
+        description="``agree`` = automated verdict was right; "
+                    "``override_pass`` = automated said fail, human says pass; "
+                    "``override_fail`` = automated said pass, human says fail; "
+                    "``skip`` = punt to another reviewer.")
+    note:    str | None = Field(default=None, max_length=4_000,
+                                description="Free-text explanation. ``None`` is allowed; "
+                                            "empty string normalises to ``None`` on read.")
+
+
+class ReviewOut(_Strict):
+    """A single review record. Returned by ``GET /v1/runs/{id}/reviews``
+    and echoed back by ``POST /v1/reviews``."""
+
+    id:              int
+    run_id:          str
+    row_id:          str
+    project_id:      str
+    reviewer_key_id: str
+    verdict:         _ReviewVerdict
+    note:            str | None
+    created_at:      str
+    updated_at:      str
+
+
+class ReviewQueueItem(_Strict):
+    """One row in the queue — the row's identifying fields plus
+    enough context for the reviewer to act without an extra fetch.
+
+    Why bundle ``input`` / ``output`` / ``passed`` etc. here instead
+    of asking the UI to ``getRun`` per item? A queue with 100 items
+    would issue 100 follow-up fetches; bundling lets the queue page
+    render at one round-trip per page.
+    """
+
+    run_id:        str
+    row_id:        str
+    trial_id:      str
+    project_id:    str
+    passed:        bool
+    cost_usd:      float
+    latency_ms:    int
+    tags:          list[str] = Field(default_factory=list)
+    # The reasons it's in the queue. Right now we surface the names
+    # of the gates this row was associated with that failed; future
+    # policies (judge-confidence bands, manual tagging) extend this.
+    failing_gates: list[str] = Field(default_factory=list)
+
+
+class ReviewQueueResponse(_Strict):
+    items: list[ReviewQueueItem]
+    # ``run_id`` echoed so a stale UI tab can confirm the queue it's
+    # rendering matches the route it's on.
+    run_id: str | None = None
+
+
+class ReviewListResponse(_Strict):
+    reviews: list[ReviewOut]

@@ -106,6 +106,7 @@ def test_alembic_upgrade_head_creates_all_tables(client):
     expected = {
         "orgs", "projects", "api_keys",
         "runs", "trials", "run_rows", "gate_results", "assets", "events",
+        "row_reviews",       # Phase 4
         "alembic_version",   # Alembic's own bookkeeping table
     }
     assert expected <= actual, f"missing tables after upgrade: {expected - actual}"
@@ -120,8 +121,7 @@ def test_alembic_version_recorded(client):
     engine = client.app.state.engine
     with engine.connect() as conn:
         ver = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-    # Head bumps as we ship migrations. ``0004_rls_orgs`` chains the
-    # round-3 RLS-on-orgs migration after Phase 3a's
-    # ``0003_runs_source``; future migrations will keep moving this
-    # assertion forward.
-    assert ver == "0004_rls_orgs"
+    # Head bumps as we ship migrations. ``0005_row_reviews`` adds the
+    # Phase 4 review queue table on top of ``0004_rls_orgs``; future
+    # migrations will keep moving this assertion forward.
+    assert ver == "0005_row_reviews"

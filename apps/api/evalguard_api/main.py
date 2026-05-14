@@ -40,6 +40,7 @@ from evalguard_api.routes.health import router as health_router
 from evalguard_api.routes.orgs import router as orgs_router
 from evalguard_api.routes.otlp import router as otlp_router
 from evalguard_api.routes.projects import router as projects_router
+from evalguard_api.routes.reviews import router as reviews_router
 from evalguard_api.routes.runs import router as runs_router
 
 logger = logging.getLogger("evalguard.api")
@@ -317,6 +318,7 @@ def build_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(runs_router)
     app.include_router(assets_router)
     app.include_router(otlp_router)
+    app.include_router(reviews_router)
     return app
 
 

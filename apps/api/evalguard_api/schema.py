@@ -182,6 +182,34 @@ events = Table(
 )
 
 
+# Phase 4 — Argilla-style human review queue. One row per
+# (run_id, row_id, reviewer_key_id) tuple. A reviewer can update
+# their own review (UPSERT on the unique key) but never overwrite
+# someone else's. ``project_id`` is denormalised onto each review so
+# RLS scopes by org without an extra join through ``run_rows``.
+row_reviews = Table(
+    "row_reviews", metadata,
+    Column("id",               Integer, primary_key=True, autoincrement=True),
+    Column("run_id",           Text, ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False),
+    Column("row_id",           Text, nullable=False),
+    Column("project_id",       Text, nullable=False),
+    Column("reviewer_key_id",  Text, nullable=False),
+    # 'agree'         — the automated verdict (pass/fail) was right
+    # 'override_pass' — automated said fail, human says pass
+    # 'override_fail' — automated said pass, human says fail
+    # 'skip'          — reviewer punts; row stays in the queue for
+    #                   the NEXT reviewer (different key_id) to pick
+    Column("verdict",          Text, nullable=False),
+    Column("note",             Text),
+    Column("created_at",       Text, nullable=False),
+    Column("updated_at",       Text, nullable=False),
+    UniqueConstraint("run_id", "row_id", "reviewer_key_id",
+                     name="uq_row_reviews_per_reviewer"),
+    Index("idx_row_reviews_run",     "run_id"),
+    Index("idx_row_reviews_project", "project_id"),
+)
+
+
 # Tables that carry a ``project_id`` and whose rows are subject to
 # tenant scoping. The RLS migration enables RLS + creates policies on
 # this exact list, and any future table that touches per-org data
@@ -195,4 +223,5 @@ RLS_TARGET_TABLES: tuple[str, ...] = (
     "gate_results",
     "assets",
     "events",
+    "row_reviews",
 )
