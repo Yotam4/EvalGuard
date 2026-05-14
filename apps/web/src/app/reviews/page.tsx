@@ -128,10 +128,17 @@ function ReviewBody({ runId }: { runId: string }) {
   if (queue.isPending || existing.isPending)
     return <p className="text-sm text-[var(--color-fg-muted)]">Loading queue…</p>;
 
-  if (queue.error)
+  // Surface BOTH errors — previously only ``queue.error`` was
+  // rendered, so a 403 / 404 / timeout on ``listRunReviews`` would
+  // silently leave the reviewer staring at an empty "Existing
+  // reviews" section with no idea why. The single rendered banner
+  // takes whichever error fired first so a cascading failure
+  // doesn't double-stack the same message.
+  const err = queue.error ?? existing.error;
+  if (err)
     return (
       <p className="text-sm text-[var(--color-fail)]">
-        {queue.error instanceof Error ? queue.error.message : String(queue.error)}
+        {err instanceof Error ? err.message : String(err)}
       </p>
     );
 
@@ -222,5 +229,13 @@ function verdictTone(v: ReviewVerdict): "pass" | "warn" | "fail" | "muted" {
     case "override_pass": return "pass";
     case "override_fail": return "fail";
     case "skip":          return "warn";
+    default: {
+      // Exhaustiveness check — if the server ships a new verdict
+      // without the UI side being updated, TypeScript fails the
+      // build here instead of silently returning ``undefined`` and
+      // dropping the badge tone at runtime.
+      const _exhaustive: never = v;
+      throw new Error(`unhandled verdict: ${String(_exhaustive)}`);
+    }
   }
 }
