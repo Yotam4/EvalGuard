@@ -72,6 +72,35 @@ describe("api client", () => {
     expect((init.headers as Record<string, string>)["Authorization"]).toBe("Bearer evk_secret");
   });
 
+
+  it("listRuns forwards source filter when supplied", async () => {
+    setServerUrl("https://api.example.com");
+    setToken("evk_x");
+    fetchMock.mockResolvedValueOnce({
+      ok: true, status: 200,
+      json: async () => ({ runs: [], next: null }),
+    });
+    await listRuns({ source: "otlp", limit: 10 });
+    const [url] = fetchMock.mock.calls[0];
+    expect(url).toBe("https://api.example.com/v1/runs?source=otlp&limit=10");
+  });
+
+
+  it("listRuns omits source when not supplied", async () => {
+    setServerUrl("https://api.example.com");
+    setToken("evk_x");
+    fetchMock.mockResolvedValueOnce({
+      ok: true, status: 200,
+      json: async () => ({ runs: [], next: null }),
+    });
+    await listRuns({ limit: 50 });
+    const [url] = fetchMock.mock.calls[0];
+    // No ``source=`` substring — important so a misconfigured tab
+    // state of ``null`` doesn't accidentally send ``source=null``.
+    expect(url).toBe("https://api.example.com/v1/runs?limit=50");
+    expect(url).not.toContain("source");
+  });
+
   it("URL-encodes path segments to defend against odd run_ids", async () => {
     setServerUrl("https://api.example.com");
     setToken("evk_secret");

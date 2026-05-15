@@ -1,34 +1,68 @@
 "use client";
 
-import { useState } from "react";
+import { Suspense, useState } from "react";
 import Link from "next/link";
+import { useRouter, useSearchParams } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
 
 import { Card } from "@/components/Card";
 import { Badge, statusTone } from "@/components/Badge";
 import { ConnectionGate } from "@/components/ConnectionGate";
-import { listRuns, type RunSummary } from "@/lib/api";
+import { listRuns, type RunSource, type RunSummary } from "@/lib/api";
+
+
+// 3-state filter for ``?source=``.  ``null`` means "no filter";
+// ``cli`` and ``otlp`` are the canonical values the server's
+// ``_KNOWN_SOURCES`` whitelist accepts.
+type SourceFilter = null | RunSource;
+
 
 export default function RunsPage() {
   return (
     <ConnectionGate>
-      <RunsList />
+      <Suspense fallback={<p className="text-sm text-[var(--color-fg-muted)]">Loading…</p>}>
+        <RunsList />
+      </Suspense>
     </ConnectionGate>
   );
 }
 
 function RunsList() {
+  const router = useRouter();
+  const params = useSearchParams();
+  // ``source`` lives on the URL so the tab is shareable / bookmarkable
+  // and the React Query cache key picks it up naturally.  Unknown
+  // ``?source=`` values fall back to "all" rather than erroring
+  // client-side — the server would reject anyway, but the UI stays
+  // usable.
+  const rawSource = params.get("source");
+  const source: SourceFilter =
+    rawSource === "cli" || rawSource === "otlp" ? rawSource : null;
+
   const [project, setProject] = useState("");
 
   const q = useQuery({
-    queryKey: ["runs", project],
-    queryFn: () => listRuns({ project: project || undefined, limit: 50 }),
+    queryKey: ["runs", project, source],
+    queryFn: () => listRuns({
+      project: project || undefined,
+      source:  source ?? undefined,
+      limit:   50,
+    }),
     // Light polling so freshly-pushed runs appear without a manual
     // refresh. 10 s is generous — the underlying GET is cheap and
     // the server's QueryPool serves it from its hot path. React
     // Query dedupes the request with anything already in-flight.
     refetchInterval: 10_000,
   });
+
+  function setSource(next: SourceFilter) {
+    const qs = new URLSearchParams(params);
+    if (next === null) qs.delete("source");
+    else qs.set("source", next);
+    // ``replace`` (not push) so the user's history isn't littered
+    // with intermediate filter states as they click between tabs.
+    router.replace(qs.toString() ? `/runs/?${qs}` : "/runs/");
+  }
 
   return (
     <div className="space-y-4">
@@ -42,6 +76,8 @@ function RunsList() {
         />
       </div>
 
+      <SourceTabs value={source} onChange={setSource} />
+
       <Card>
         {q.isPending && <p className="text-sm text-[var(--color-fg-muted)]">Loading…</p>}
         {q.error && (
@@ -51,6 +87,47 @@ function RunsList() {
         )}
         {q.data && <RunsTable runs={q.data.runs} />}
       </Card>
+    </div>
+  );
+}
+
+
+function SourceTabs({
+  value, onChange,
+}: { value: SourceFilter; onChange: (v: SourceFilter) => void }) {
+  // Three pills.  ``null`` (all) is the default and the leftmost
+  // — most operators want "everything" most of the time.  Keep the
+  // order stable so muscle memory works.
+  const tabs: { value: SourceFilter; label: string }[] = [
+    { value: null,   label: "All" },
+    { value: "cli",  label: "CLI push" },
+    { value: "otlp", label: "OTLP traces" },
+  ];
+  return (
+    <div
+      data-testid="source-tabs"
+      className="flex flex-wrap gap-1 rounded border border-[var(--color-border)] bg-[var(--color-bg-card)] p-1"
+    >
+      {tabs.map((t) => {
+        const active = t.value === value;
+        return (
+          <button
+            key={t.label}
+            type="button"
+            data-source-tab={t.value ?? "all"}
+            aria-pressed={active}
+            onClick={() => onChange(t.value)}
+            className={
+              "rounded px-3 py-1.5 text-sm transition " +
+              (active
+                ? "bg-[var(--color-bg-row)] text-[var(--color-fg)]"
+                : "text-[var(--color-fg-muted)] hover:bg-[var(--color-bg-row)] hover:text-[var(--color-fg)]")
+            }
+          >
+            {t.label}
+          </button>
+        );
+      })}
     </div>
   );
 }
