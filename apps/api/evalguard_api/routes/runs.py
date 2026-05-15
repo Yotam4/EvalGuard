@@ -110,9 +110,21 @@ def ingest_run(
 # GET /v1/runs
 
 
+# Whitelist for the ``?source=`` filter on ``GET /v1/runs``.  The
+# column itself accepts any string (server_default=``'cli'``), but
+# the public surface is constrained so an unknown value 400s rather
+# than silently returning zero rows.  Matches the ingest paths the
+# server actually understands today: ``cli`` (push) and ``otlp``
+# (traces).
+_KNOWN_SOURCES: frozenset[str] = frozenset({"cli", "otlp"})
+
+
 @router.get("/v1/runs", response_model=RunList, tags=["runs"])
 def list_runs(
     project: str | None = Query(default=None, description="Filter by project slug."),
+    source:  str | None = Query(default=None,
+        description="Filter by ingest source: ``cli`` (pushed via ``evalguard push``) "
+                    "or ``otlp`` (synthesised from a posted OTLP trace)."),
     limit: int = Query(default=20, ge=1, le=200),
     conn: Connection = Depends(get_conn),
     principal: Principal = Depends(require_principal),
@@ -123,7 +135,16 @@ def list_runs(
     run unless ``project`` narrows the listing further. The org
     filter is implicit so a member can never enumerate a foreign
     org's runs by listing without a filter.
+
+    ``source`` is the Phase-3a ingest-path discriminator.  Unknown
+    values 400 — the public surface is ``cli`` / ``otlp`` only.
     """
+    if source is not None and source not in _KNOWN_SOURCES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unknown source {source!r}. Allowed: {sorted(_KNOWN_SOURCES)}.",
+        )
+
     # SQLAlchemy ``text()`` with named bind params — same syntax on
     # SQLite + Postgres. The org filter via correlated subquery means
     # we don't need to JOIN projects every row.
@@ -135,6 +156,9 @@ def list_runs(
     if project is not None:
         clauses.append("project_name = :project")
         params["project"] = project
+    if source is not None:
+        clauses.append("source = :source")
+        params["source"] = source
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
     sql = text(

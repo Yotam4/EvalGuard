@@ -168,6 +168,146 @@ def test_list_runs_rejects_invalid_limit(client, auth_headers):
 
 
 # ---------------------------------------------------------------------------
+# ``?source=`` filter (Phase-3a column, surface added later)
+#
+# Two ingest paths feed the same ``runs`` table: ``evalguard push``
+# stamps ``source='cli'`` (the column default), the OTLP route
+# stamps ``source='otlp'``.  The filter lets a UI tab partition the
+# listing without joining payload_json.
+
+
+def _otlp_body_for_filter(span_id: str) -> dict:
+    """Smallest legal OTLP/HTTP body that lands as one synthetic run.
+    Inlined here (not imported from test_otlp.py) so the runs-test
+    file stays self-contained — if test_otlp's fixture shape evolves,
+    the listing-filter tests don't accidentally drift with it."""
+    return {
+        "resourceSpans": [{
+            "resource": {"attributes": [
+                {"key": "service.name",
+                 "value": {"stringValue": "otlp-filter-svc"}},
+            ]},
+            "scopeSpans": [{
+                "scope": {"name": "test", "version": "0"},
+                "spans": [{
+                    "traceId":           "deadbeef" * 4,
+                    "spanId":            span_id,
+                    "name":              "chat openai gpt-4o-mini",
+                    "kind":              2,
+                    "startTimeUnixNano": "1700000000000000000",
+                    "endTimeUnixNano":   "1700000000100000000",
+                    "attributes": [
+                        {"key": "gen_ai.system",
+                         "value": {"stringValue": "openai"}},
+                        {"key": "gen_ai.request.model",
+                         "value": {"stringValue": "gpt-4o-mini"}},
+                    ],
+                    "status": {"code": 1},
+                }],
+            }],
+        }],
+    }
+
+
+def test_list_runs_source_filter_returns_only_matching(
+    client, auth_headers, tmp_path,
+):
+    """One CLI run + one OTLP run ingested into the same org; each
+    ``?source=`` filter returns exactly its half."""
+    # CLI run.
+    cli_payload = _produce_real_run(tmp_path / "cli-side", project="filter-cli")
+    client.post("/v1/runs", json=cli_payload, headers=auth_headers)
+    # OTLP run.
+    client.post(
+        "/v1/otlp/v1/traces",
+        json=_otlp_body_for_filter("span0001"),
+        headers=auth_headers,
+    )
+
+    r_cli = client.get("/v1/runs?source=cli", headers=auth_headers)
+    assert r_cli.status_code == 200
+    cli_runs = r_cli.json()["runs"]
+    assert len(cli_runs) >= 1
+    assert all(run["source"] == "cli" for run in cli_runs)
+
+    r_otlp = client.get("/v1/runs?source=otlp", headers=auth_headers)
+    assert r_otlp.status_code == 200
+    otlp_runs = r_otlp.json()["runs"]
+    assert len(otlp_runs) == 1
+    assert otlp_runs[0]["source"] == "otlp"
+
+    # No filter ⇒ both surface.
+    r_all = client.get("/v1/runs", headers=auth_headers)
+    sources = {run["source"] for run in r_all.json()["runs"]}
+    assert sources == {"cli", "otlp"}
+
+
+def test_list_runs_source_filter_unknown_value_returns_400(
+    client, auth_headers, tmp_path,
+):
+    # No setup needed — the whitelist guard fires before the SQL runs.
+    r = client.get("/v1/runs?source=nonsense", headers=auth_headers)
+    assert r.status_code == 400
+    detail = r.json()["detail"]
+    assert "nonsense" in detail
+    # Helpful: the error names the allowed values.
+    assert "cli"  in detail
+    assert "otlp" in detail
+
+
+def test_list_runs_source_filter_combines_with_project(
+    client, auth_headers, tmp_path,
+):
+    """``?source=cli&project=X`` is the AND of both filters — pinned
+    here so a future refactor that turns the WHERE clause into a
+    list-comprehension can't accidentally swap to OR."""
+    cli_alpha = _produce_real_run(tmp_path / "a", project="alpha")
+    cli_beta  = _produce_real_run(tmp_path / "b", project="beta")
+    client.post("/v1/runs", json=cli_alpha, headers=auth_headers)
+    client.post("/v1/runs", json=cli_beta,  headers=auth_headers)
+    client.post(
+        "/v1/otlp/v1/traces",
+        json=_otlp_body_for_filter("span0001"),
+        headers=auth_headers,
+    )
+
+    r = client.get(
+        "/v1/runs?source=cli&project=alpha", headers=auth_headers,
+    )
+    runs = r.json()["runs"]
+    projects = {run["project"] for run in runs}
+    sources  = {run["source"]  for run in runs}
+    assert projects == {"alpha"}
+    assert sources  == {"cli"}
+
+
+def test_list_runs_source_filter_respects_org_scoping(
+    client, auth_headers, make_org, make_member_token, tmp_path,
+):
+    """The source filter must compose with the implicit org filter —
+    a member of org-A asking for ``?source=otlp`` must never see an
+    OTLP run from org-B."""
+    make_org("acme")
+    member_default = make_member_token("org_default", name="d")
+    member_acme    = make_member_token("org_acme",    name="a")
+
+    # ACME pushes an OTLP run.
+    client.post(
+        "/v1/otlp/v1/traces",
+        json=_otlp_body_for_filter("spanACMEx1"),
+        headers={"Authorization": f"Bearer {member_acme}"},
+    )
+    # Default-org member queries OTLP runs.
+    r = client.get(
+        "/v1/runs?source=otlp",
+        headers={"Authorization": f"Bearer {member_default}"},
+    )
+    assert r.status_code == 200
+    # Empty — the filter doesn't bypass the implicit org scoping.
+    assert r.json()["runs"] == []
+
+
+# ---------------------------------------------------------------------------
 # Project provisioning — server auto-creates by name on first push
 
 

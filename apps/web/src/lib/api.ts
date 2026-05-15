@@ -235,10 +235,16 @@ export interface RunOut {
   };
 }
 
-export const listRuns = (opts: { project?: string; limit?: number } = {}) => {
+export type RunSource = "cli" | "otlp";
+
+
+export const listRuns = (
+  opts: { project?: string; source?: RunSource; limit?: number } = {},
+) => {
   const qs = new URLSearchParams();
   if (opts.project) qs.set("project", opts.project);
-  if (opts.limit) qs.set("limit", String(opts.limit));
+  if (opts.source)  qs.set("source",  opts.source);
+  if (opts.limit)   qs.set("limit",   String(opts.limit));
   const suffix = qs.toString() ? `?${qs.toString()}` : "";
   return request<RunListResponse>(`/v1/runs${suffix}`);
 };
