@@ -4,9 +4,9 @@ import { setServerUrl, setToken } from "../auth";
 import {
   ApiError, NotConfiguredError,
   createApiKey, createOrg, getCallDetail, getRun, getReviewQueue, getRunDrift,
-  health, listAssets, listAssetVersions, listProjectCalls,
-  listRunReviews, listRuns,
-  revokeApiKey, submitReview,
+  health, listAssets, listAssetVersions, listGoldenCandidates,
+  listProjectCalls, listRunReviews, listRuns,
+  promoteToGolden, revokeApiKey, submitReview, unPromoteGolden,
 } from "../api";
 
 /**
@@ -488,5 +488,59 @@ describe("api client", () => {
     expect(url).toBe(
       "https://api.example.com/v1/projects/demo/calls/run_a/r%2F1",
     );
+  });
+
+
+  // ---------------------------------------------------------------------
+  // golden candidates (Phase OBS-4)
+
+
+  it("promoteToGolden POSTs run_id + row_id + optional note", async () => {
+    setServerUrl("https://api.example.com");
+    setToken("evk_x");
+    fetchMock.mockResolvedValueOnce({
+      ok: true, status: 201,
+      json: async () => ({
+        id: 1, run_id: "run_a", row_id: "r-1",
+        project_id: "proj", promoted_by: "key_a",
+        note: "edge case", created_at: "2026-05-15T07:30:00",
+      }),
+    });
+    await promoteToGolden({ run_id: "run_a", row_id: "r-1", note: "edge case" });
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("https://api.example.com/v1/golden/candidates");
+    expect(init.method).toBe("POST");
+    const body = JSON.parse(init.body as string);
+    expect(body).toEqual({ run_id: "run_a", row_id: "r-1", note: "edge case" });
+  });
+
+
+  it("listGoldenCandidates targets the project's nested resource", async () => {
+    setServerUrl("https://api.example.com");
+    setToken("evk_x");
+    fetchMock.mockResolvedValueOnce({
+      ok: true, status: 200,
+      json: async () => ({ candidates: [] }),
+    });
+    await listGoldenCandidates("customer-service", { limit: 50 });
+    const [url] = fetchMock.mock.calls[0];
+    expect(url).toBe(
+      "https://api.example.com/v1/projects/customer-service/golden/candidates?limit=50",
+    );
+  });
+
+
+  it("unPromoteGolden DELETEs by candidate id", async () => {
+    setServerUrl("https://api.example.com");
+    setToken("evk_x");
+    fetchMock.mockResolvedValueOnce({
+      ok: true, status: 204,
+      // 204 has no body — the client must not call .json().
+      json: async () => { throw new Error("204 has no body"); },
+    });
+    await unPromoteGolden(42);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("https://api.example.com/v1/golden/candidates/42");
+    expect(init.method).toBe("DELETE");
   });
 });

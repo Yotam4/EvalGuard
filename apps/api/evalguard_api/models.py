@@ -320,6 +320,37 @@ class CallListResponse(_Strict):
     next_cursor: str | None = None
 
 
+class GoldenCandidateIngest(_Strict):
+    """``POST /v1/golden/candidates`` body.
+
+    Phase OBS-4 — staging area for rows the operator wants to
+    capture as regression cases.  UPSERT keyed on
+    ``(run_id, row_id, promoted_by)`` so re-clicking Promote is
+    idempotent; the reviewer can update their own ``note`` by
+    re-submitting.
+    """
+
+    run_id: str = Field(pattern=r"^run_[a-z0-9]{8,}$")
+    row_id: str = Field(min_length=1, max_length=200)
+    note:   str | None = Field(default=None, max_length=4_000)
+
+
+class GoldenCandidate(_Strict):
+    """One staged golden candidate.  Returned by POST + GET."""
+
+    id:          int
+    run_id:      str
+    row_id:      str
+    project_id:  str
+    promoted_by: str
+    note:        str | None
+    created_at:  str
+
+
+class GoldenCandidateList(_Strict):
+    candidates: list[GoldenCandidate]
+
+
 class CallDetail(_Loose):
     """Drill-down for one call (OBS-2).
 

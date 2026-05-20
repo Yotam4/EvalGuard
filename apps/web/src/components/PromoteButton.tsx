@@ -1,0 +1,105 @@
+/**
+ * "Promote to golden" button — sits on the call detail panel.
+ *
+ * Lives in its own file so the mutation lifecycle (idle → pending
+ * → success-chip) is unit-testable in isolation.  Server UPSERT
+ * means re-clicking is idempotent — no need to dedupe client-side.
+ */
+
+"use client";
+
+import { useState } from "react";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+
+import { promoteToGolden } from "@/lib/api";
+
+
+export function PromoteButton({
+  runId,
+  rowId,
+  projectSlug,
+}: {
+  runId: string;
+  rowId: string;
+  /** When provided, the project's golden-list query is invalidated
+   *  on success so a sibling ``<GoldenList>`` refetches. */
+  projectSlug?: string;
+}) {
+  const qc = useQueryClient();
+  const [note, setNote] = useState<string>("");
+  const [editing, setEditing] = useState<boolean>(false);
+
+  const m = useMutation({
+    mutationFn: () => promoteToGolden({
+      run_id: runId, row_id: rowId,
+      note: note.trim() || undefined,
+    }),
+    onSuccess: () => {
+      setEditing(false);
+      setNote("");
+      if (projectSlug) {
+        qc.invalidateQueries({
+          queryKey: ["golden-candidates", projectSlug],
+        });
+      }
+    },
+  });
+
+  if (!editing) {
+    return (
+      <button
+        type="button"
+        data-testid="promote-button"
+        onClick={() => setEditing(true)}
+        className="rounded border border-[var(--color-border)] px-2 py-0.5 text-xs hover:bg-[var(--color-bg-row)]"
+      >
+        {m.isSuccess ? "✓ Promoted" : "Promote to golden"}
+      </button>
+    );
+  }
+
+  return (
+    <form
+      data-testid="promote-form"
+      onSubmit={(e) => { e.preventDefault(); m.mutate(); }}
+      className="flex flex-wrap items-center gap-2"
+    >
+      <input
+        type="text"
+        placeholder="Optional note"
+        value={note}
+        onChange={(e) => setNote(e.target.value)}
+        maxLength={4000}
+        className="flex-1 rounded border border-[var(--color-border)] bg-[var(--color-bg)] px-2 py-1 text-xs"
+      />
+      <button
+        type="submit"
+        disabled={m.isPending}
+        data-testid="promote-confirm"
+        className={
+          "rounded border px-2 py-0.5 text-xs " +
+          (m.isPending
+            ? "cursor-not-allowed border-[var(--color-border)] text-[var(--color-fg-muted)]"
+            : "border-[var(--color-accent)] hover:bg-[var(--color-bg-row)]")
+        }
+      >
+        {m.isPending ? "Saving…" : "Save"}
+      </button>
+      <button
+        type="button"
+        onClick={() => { setEditing(false); setNote(""); }}
+        className="rounded border border-[var(--color-border)] px-2 py-0.5 text-xs text-[var(--color-fg-muted)] hover:bg-[var(--color-bg-row)]"
+      >
+        cancel
+      </button>
+      {m.error && (
+        <span
+          data-testid="promote-error"
+          className="text-xs text-[var(--color-fail)]"
+        >
+          {m.error instanceof Error ? m.error.message : String(m.error)}
+        </span>
+      )}
+    </form>
+  );
+}

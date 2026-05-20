@@ -198,6 +198,35 @@ events = Table(
 )
 
 
+# Phase OBS-4 — golden-candidates staging table.
+#
+# When a reviewer (or anyone with access to a call's detail page)
+# decides a row is worth keeping as a regression case, they click
+# "Promote to golden".  That POSTs to ``/v1/golden/candidates`` and
+# lands a row here.  A separate (future) CLI command exports the
+# staged candidates to the operator's on-disk JSONL dataset — this
+# table is the staging area between "I noticed this in production"
+# and "this is now part of my golden dataset".
+#
+# UNIQUE(run_id, row_id, promoted_by) means a reviewer can re-click
+# Promote idempotently (no duplicate row) but two different reviewers
+# can independently promote the same row (their notes captured
+# separately).
+golden_candidates = Table(
+    "golden_candidates", metadata,
+    Column("id",          Integer, primary_key=True, autoincrement=True),
+    Column("run_id",      Text, ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False),
+    Column("row_id",      Text, nullable=False),
+    Column("project_id",  Text, nullable=False),
+    Column("promoted_by", Text, nullable=False),
+    Column("note",        Text),
+    Column("created_at",  Text, nullable=False),
+    UniqueConstraint("run_id", "row_id", "promoted_by",
+                     name="uq_golden_candidates_per_reviewer"),
+    Index("idx_golden_project", "project_id", "created_at"),
+)
+
+
 # Phase 4 — Argilla-style human review queue. One row per
 # (run_id, row_id, reviewer_key_id) tuple. A reviewer can update
 # their own review (UPSERT on the unique key) but never overwrite
@@ -240,4 +269,5 @@ RLS_TARGET_TABLES: tuple[str, ...] = (
     "assets",
     "events",
     "row_reviews",
+    "golden_candidates",
 )
