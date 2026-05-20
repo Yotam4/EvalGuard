@@ -121,7 +121,7 @@ def test_alembic_version_recorded(client):
     engine = client.app.state.engine
     with engine.connect() as conn:
         ver = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-    # Head bumps as we ship migrations. ``0006_row_reviews_verdict_check``
+    # Head bumps as we ship migrations. ``0007_run_rows_calls_index``
     # locks the verdict enum at the DB layer + tightens ``row_id`` to
     # VARCHAR(200); future migrations will keep moving this forward.
-    assert ver == "0006_row_reviews_verdict_check"
+    assert ver == "0007_run_rows_calls_index"

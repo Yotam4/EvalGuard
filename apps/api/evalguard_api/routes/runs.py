@@ -34,6 +34,13 @@ from evalguard_api.stats import welchs_t_test
 router = APIRouter()
 
 
+# OBS-1: cap on the denormalised ``run_rows.output_preview`` snippet.
+# 240 characters is enough for ~2 lines in the stream-view card without
+# the column getting fat in the on-disk row.  Full output remains
+# available via ``GET /v1/runs/{id}`` and the per-call detail endpoint.
+_PREVIEW_CHARS: int = 240
+
+
 # ---------------------------------------------------------------------------
 # POST /v1/runs
 
@@ -359,6 +366,12 @@ def _persist_run(
     The UI surfaces it as a badge.
     """
     run_id = payload["run_id"]
+    # Compute once: ``runs.ingested_at`` AND every ``run_rows.ingested_at``
+    # under this run share the same value so the denormalised
+    # ``run_rows.ingested_at`` (OBS-1) and the parent ``runs.ingested_at``
+    # never drift apart — important because the calls-stream's
+    # composite index orders by the denormalised column.
+    ingested_at = now_iso()
     conn.execute(
         text("""INSERT INTO runs(
                   run_id, project_id, project_name, config_hash,
@@ -387,7 +400,7 @@ def _persist_run(
             "row_pass_count": int(payload.get("row_pass_count") or 0),
             "row_fail_count": int(payload.get("row_fail_count") or 0),
             "payload_json":   json.dumps(payload, default=str),
-            "ingested_at":    now_iso(),
+            "ingested_at":    ingested_at,
             "ingested_by":    principal.key_id,
             "source":         source,
         },
@@ -452,26 +465,47 @@ def _persist_run(
         # SQL latency is the dominant cost on bulk import.
         rows_param: list[dict] = []
         for r in trial.get("rows") or []:
+            # ``output_preview`` denormalises a leading slice of the
+            # raw output for the calls-stream UI (OBS-1).  We trim
+            # at ``_PREVIEW_CHARS`` because the stream card has a
+            # fixed width — the full output is still available via
+            # the per-call detail endpoint.  Non-string outputs are
+            # rendered via ``json.dumps`` so structured outputs
+            # (tool calls, etc.) survive the trim with their shape
+            # intact for a glance.
+            output = r.get("output")
+            if isinstance(output, str):
+                preview = output[:_PREVIEW_CHARS]
+            elif output is None:
+                preview = None
+            else:
+                preview = json.dumps(output, default=str)[:_PREVIEW_CHARS]
             rows_param.append({
-                "run_id":     run_id,
-                "trial_id":   trial["trial_id"],
-                "project_id": project_id,
-                "row_id":     r["row_id"],
-                "passed":     1 if r.get("passed") else 0,
-                "n_scores":   int(r.get("n_scores") or 0),
-                "cost_usd":   float(r.get("cost_usd") or 0.0),
-                "latency_ms": int(r.get("latency_ms") or 0),
-                "cache_hit":  1 if r.get("cache_hit") else 0,
-                "tags_json":  json.dumps(r.get("tags") or []),
+                "run_id":         run_id,
+                "trial_id":       trial["trial_id"],
+                "project_id":     project_id,
+                "row_id":         r["row_id"],
+                "passed":         1 if r.get("passed") else 0,
+                "n_scores":       int(r.get("n_scores") or 0),
+                "cost_usd":       float(r.get("cost_usd") or 0.0),
+                "latency_ms":     int(r.get("latency_ms") or 0),
+                "cache_hit":      1 if r.get("cache_hit") else 0,
+                "tags_json":      json.dumps(r.get("tags") or []),
+                # OBS-1: stamp from the same ``now_iso()`` the parent
+                # ``runs`` row used so rows + parent agree to the µs.
+                "ingested_at":    ingested_at,
+                "output_preview": preview,
             })
         if rows_param:
             conn.execute(
                 text("""INSERT INTO run_rows(
                           run_id, trial_id, project_id, row_id,
-                          passed, n_scores, cost_usd, latency_ms, cache_hit, tags_json)
+                          passed, n_scores, cost_usd, latency_ms, cache_hit, tags_json,
+                          ingested_at, output_preview)
                         VALUES (
                           :run_id, :trial_id, :project_id, :row_id,
-                          :passed, :n_scores, :cost_usd, :latency_ms, :cache_hit, :tags_json)"""),
+                          :passed, :n_scores, :cost_usd, :latency_ms, :cache_hit, :tags_json,
+                          :ingested_at, :output_preview)"""),
                 rows_param,
             )
 

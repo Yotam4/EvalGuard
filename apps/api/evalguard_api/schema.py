@@ -129,19 +129,35 @@ trials = Table(
 
 run_rows = Table(
     "run_rows", metadata,
-    Column("id",         Integer, primary_key=True, autoincrement=True),
-    Column("run_id",     Text, ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False),
-    Column("trial_id",   Text, nullable=False),
-    Column("project_id", Text, nullable=False),
-    Column("row_id",     Text, nullable=False),
-    Column("passed",     Integer, nullable=False),
-    Column("n_scores",   Integer, nullable=False),
-    Column("cost_usd",   Float, server_default="0"),
-    Column("latency_ms", Integer, server_default="0"),
-    Column("cache_hit",  Integer, server_default="0"),
-    Column("tags_json",  Text),
+    Column("id",             Integer, primary_key=True, autoincrement=True),
+    Column("run_id",         Text, ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False),
+    Column("trial_id",       Text, nullable=False),
+    Column("project_id",     Text, nullable=False),
+    Column("row_id",         Text, nullable=False),
+    Column("passed",         Integer, nullable=False),
+    Column("n_scores",       Integer, nullable=False),
+    Column("cost_usd",       Float, server_default="0"),
+    Column("latency_ms",     Integer, server_default="0"),
+    Column("cache_hit",      Integer, server_default="0"),
+    Column("tags_json",      Text),
+    # Phase OBS-1: denormalised ``runs.ingested_at`` so the
+    # project-wide ``calls`` stream can paginate over a single
+    # composite index without a JOIN.  Stamped at insert in
+    # ``_persist_run``; backfilled by migration 0007 for older rows.
+    Column("ingested_at",    Text),
+    # First ~240 chars of ``rows[].output`` so the stream UI's row
+    # card can show a preview without rehydrating ``payload_json``.
+    # Nullable because (a) backfill leaves older rows blank and
+    # (b) some rows legitimately have no output (cache hits, errors).
+    Column("output_preview", Text),
     Index("idx_run_rows_run",   "run_id"),
     Index("idx_run_rows_trial", "trial_id"),
+    # Composite index that drives the calls stream's two tabs:
+    # ``recent``  ⇒ ``ORDER BY ingested_at DESC, id DESC``
+    # ``failures`` ⇒ ``WHERE passed = 0 ORDER BY ingested_at DESC, id DESC``
+    # Index column order matches the WHERE+ORDER pair so both
+    # planners pick it without a sort step.
+    Index("idx_run_rows_calls", "project_id", "ingested_at", "id"),
 )
 
 gate_results = Table(

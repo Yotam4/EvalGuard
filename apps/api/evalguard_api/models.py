@@ -274,6 +274,53 @@ class RunList(_Strict):
 
 
 # ---------------------------------------------------------------------------
+# Phase OBS-1 — calls stream (one row per run_rows entry).
+#
+# A "call" here is one ``run_rows`` row — what the customer-service
+# operator thinks of as one LLM interaction.  The endpoint that
+# returns these is ``GET /v1/projects/{slug}/calls`` (newest-first
+# with cursor pagination); ``CallDetail`` is the per-call drill-down
+# returned by ``GET /v1/projects/{slug}/calls/{run_id}/{row_id}``.
+
+_CALLS_TAB_DEFAULT = "recent"
+
+
+class CallSummary(_Strict):
+    """Stream-view card.  Reflects the denormalised columns on
+    ``run_rows`` so the stream paginator never touches
+    ``payload_json``.
+    """
+
+    run_id:         str
+    row_id:         str
+    trial_id:       str
+    project_id:     str
+    passed:         bool
+    cost_usd:       float
+    latency_ms:     int
+    cache_hit:      bool
+    tags:           list[str] = Field(default_factory=list)
+    # Stamped by ``_persist_run`` from the parent ``runs.ingested_at``
+    # so a row's wall-clock matches its run's, to the µs.  Rows
+    # pre-OBS-1 have this populated by the 0007 backfill.
+    ingested_at:    str | None = None
+    # First 240 chars of the row's ``output``.  ``None`` for legacy
+    # rows (backfill is deferred — see migration 0007 docstring) or
+    # for rows that legitimately had no output (cache hits, errors).
+    output_preview: str | None = None
+
+
+class CallListResponse(_Strict):
+    """Cursor-paginated calls list."""
+
+    calls: list[CallSummary]
+    # Opaque base64 cursor encoding ``(ingested_at, id)`` from the
+    # last row of this page.  Clients pass it back as ``?cursor=``
+    # for the next page.  ``None`` on the final page.
+    next_cursor: str | None = None
+
+
+# ---------------------------------------------------------------------------
 # Org / Project / API-key resources
 #
 # Slugs are URL-safe lowercase identifiers (a-z, 0-9, hyphen). Names
