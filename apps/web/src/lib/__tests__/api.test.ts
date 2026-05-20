@@ -3,8 +3,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setServerUrl, setToken } from "../auth";
 import {
   ApiError, NotConfiguredError,
-  createApiKey, createOrg, getRun, getReviewQueue, getRunDrift,
-  health, listAssets, listAssetVersions, listRunReviews, listRuns,
+  createApiKey, createOrg, getCallDetail, getRun, getReviewQueue, getRunDrift,
+  health, listAssets, listAssetVersions, listProjectCalls,
+  listRunReviews, listRuns,
   revokeApiKey, submitReview,
 } from "../api";
 
@@ -403,6 +404,89 @@ describe("api client", () => {
     const [url] = fetchMock.mock.calls[0];
     expect(url).toBe(
       "https://api.example.com/v1/assets/dataset/g/versions?project_id=proj_a",
+    );
+  });
+
+
+  // ---------------------------------------------------------------------
+  // calls (Phase OBS)
+
+
+  it("listProjectCalls composes tab + limit + source + opaque cursor", async () => {
+    setServerUrl("https://api.example.com");
+    setToken("evk_x");
+    fetchMock.mockResolvedValueOnce({
+      ok: true, status: 200,
+      json: async () => ({ calls: [], next_cursor: null }),
+    });
+    await listProjectCalls("customer-service", {
+      tab: "failures", limit: 25, source: "otlp",
+      cursor: "eyJ0IjogIjIwMjYtMDUtMTUiLCAiaSI6IDQyfQ",
+    });
+    const [url] = fetchMock.mock.calls[0];
+    // Tab is always emitted; cursor is passed through unchanged
+    // (clients never construct it client-side).  Path slug is
+    // percent-encoded so a slug with a slash doesn't break the
+    // router.
+    expect(url).toBe(
+      "https://api.example.com/v1/projects/customer-service/calls"
+      + "?tab=failures&cursor=eyJ0IjogIjIwMjYtMDUtMTUiLCAiaSI6IDQyfQ"
+      + "&limit=25&source=otlp",
+    );
+  });
+
+
+  it("listProjectCalls defaults tab to recent and omits unset params", async () => {
+    setServerUrl("https://api.example.com");
+    setToken("evk_x");
+    fetchMock.mockResolvedValueOnce({
+      ok: true, status: 200,
+      json: async () => ({ calls: [], next_cursor: null }),
+    });
+    await listProjectCalls("demo");
+    const [url] = fetchMock.mock.calls[0];
+    // ``tab=recent`` is the default we always emit so the server
+    // ``Literal`` validator never sees a missing value.  No other
+    // params slip in.
+    expect(url).toBe(
+      "https://api.example.com/v1/projects/demo/calls?tab=recent",
+    );
+  });
+
+
+  it("listProjectCalls percent-encodes the project slug path segment", async () => {
+    setServerUrl("https://api.example.com");
+    setToken("evk_x");
+    fetchMock.mockResolvedValueOnce({
+      ok: true, status: 200,
+      json: async () => ({ calls: [], next_cursor: null }),
+    });
+    await listProjectCalls("weird slug/with bits");
+    const [url] = fetchMock.mock.calls[0];
+    expect(url).toContain(
+      "/v1/projects/weird%20slug%2Fwith%20bits/calls?",
+    );
+  });
+
+
+  it("getCallDetail encodes every path segment", async () => {
+    setServerUrl("https://api.example.com");
+    setToken("evk_x");
+    fetchMock.mockResolvedValueOnce({
+      ok: true, status: 200,
+      json: async () => ({
+        run_id: "run_a", row_id: "r/1",
+        trial_id: null, project_id: "proj", project: "demo",
+        ingested_at: null, provider: null, model: null,
+        passed: true, n_scores: 0, cost_usd: 0, latency_ms: 0,
+        cache_hit: false, tags: [], input: null, expected: null,
+        output: null, scores: [], trial_gates: [],
+      }),
+    });
+    await getCallDetail("demo", "run_a", "r/1");
+    const [url] = fetchMock.mock.calls[0];
+    expect(url).toBe(
+      "https://api.example.com/v1/projects/demo/calls/run_a/r%2F1",
     );
   });
 });

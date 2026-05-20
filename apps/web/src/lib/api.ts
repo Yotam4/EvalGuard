@@ -249,6 +249,87 @@ export const listRuns = (
   return request<RunListResponse>(`/v1/runs${suffix}`);
 };
 
+
+// ---------------------------------------------------------------------------
+// Calls stream (Phase OBS).  Mirrors ``CallSummary`` /
+// ``CallListResponse`` / ``CallDetail`` in ``apps/api/evalguard_api/models.py``.
+
+
+export type CallsTab = "recent" | "failures";
+
+
+export interface CallSummary {
+  run_id: string;
+  row_id: string;
+  trial_id: string;
+  project_id: string;
+  passed: boolean;
+  cost_usd: number;
+  latency_ms: number;
+  cache_hit: boolean;
+  tags: string[];
+  ingested_at: string | null;
+  output_preview: string | null;
+}
+
+
+export interface CallListResponse {
+  calls: CallSummary[];
+  next_cursor: string | null;
+}
+
+
+export interface CallDetail {
+  run_id: string;
+  row_id: string;
+  trial_id: string | null;
+  project_id: string;
+  project: string;
+  ingested_at: string | null;
+  provider: string | null;
+  model: string | null;
+  passed: boolean;
+  n_scores: number;
+  cost_usd: number;
+  latency_ms: number;
+  cache_hit: boolean;
+  tags: string[];
+  // The "actual answer" surface — these can all be null when:
+  //  - ``include_scores=False`` push omits them
+  //  - cache hits / errors have no output
+  //  - dataset has no ``expected``
+  input:    unknown;
+  expected: unknown;
+  output:   string | null;
+  scores:   Score[];
+  trial_gates: Gate[];
+}
+
+
+export const listProjectCalls = (
+  projectSlug: string,
+  opts: { tab?: CallsTab; cursor?: string; limit?: number; source?: RunSource } = {},
+) => {
+  const qs = new URLSearchParams();
+  qs.set("tab", opts.tab ?? "recent");
+  if (opts.cursor) qs.set("cursor", opts.cursor);
+  if (opts.limit)  qs.set("limit",  String(opts.limit));
+  if (opts.source) qs.set("source", opts.source);
+  return request<CallListResponse>(
+    `/v1/projects/${encodeURIComponent(projectSlug)}/calls?${qs.toString()}`,
+  );
+};
+
+
+export const getCallDetail = (
+  projectSlug: string, runId: string, rowId: string,
+) =>
+  request<CallDetail>(
+    `/v1/projects/${encodeURIComponent(projectSlug)}`
+    + `/calls/${encodeURIComponent(runId)}`
+    + `/${encodeURIComponent(rowId)}`,
+  );
+
 export const getRun = (runId: string) =>
   request<RunOut>(`/v1/runs/${encodeURIComponent(runId)}`);
 
