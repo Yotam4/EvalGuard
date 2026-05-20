@@ -11,15 +11,21 @@
 "use client";
 
 import { Badge } from "./Badge";
+import { PromoteButton } from "./PromoteButton";
 import type { CallDetail, Score } from "@/lib/api";
 
 
 export function CallDetailPanel({
   data,
   onClose,
+  projectSlug,
 }: {
   data: CallDetail;
   onClose?: () => void;
+  /** When provided, enables the "Promote to golden" button and
+   *  refetches the project's golden list on success.  Optional so
+   *  this component remains testable without a project context. */
+  projectSlug?: string;
 }) {
   return (
     <div
@@ -28,7 +34,7 @@ export function CallDetailPanel({
       data-row-id={data.row_id}
       className="space-y-4 rounded border border-[var(--color-border)] bg-[var(--color-bg-card)] p-4"
     >
-      <Header data={data} onClose={onClose} />
+      <Header data={data} onClose={onClose} projectSlug={projectSlug} />
       <ContentGrid data={data} />
       {data.scores.length > 0 && <ScoresTable scores={data.scores} />}
       {data.trial_gates.length > 0 && <TrialGates gates={data.trial_gates} />}
@@ -40,9 +46,11 @@ export function CallDetailPanel({
 function Header({
   data,
   onClose,
+  projectSlug,
 }: {
   data: CallDetail;
   onClose?: () => void;
+  projectSlug?: string;
 }) {
   return (
     <div className="flex flex-wrap items-baseline gap-3">
@@ -61,6 +69,13 @@ function Header({
       <span className="ml-auto flex items-center gap-3 text-xs text-[var(--color-fg-muted)]">
         <span className="font-mono">{data.latency_ms} ms</span>
         <span className="font-mono">${data.cost_usd.toFixed(4)}</span>
+        {projectSlug && (
+          <PromoteButton
+            runId={data.run_id}
+            rowId={data.row_id}
+            projectSlug={projectSlug}
+          />
+        )}
         {onClose && (
           <button
             type="button"

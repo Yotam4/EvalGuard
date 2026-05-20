@@ -398,5 +398,13 @@ function DetailFetcher({
     );
   }
   if (!q.data) return null;
-  return <CallDetailPanel data={q.data} onClose={onClose} />;
+  return (
+    <CallDetailPanel
+      data={q.data}
+      onClose={onClose}
+      // Pass the slug so the panel renders the Promote button +
+      // invalidates the golden list on success.
+      projectSlug={project}
+    />
+  );
 }

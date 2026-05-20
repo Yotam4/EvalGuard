@@ -106,8 +106,9 @@ def test_alembic_upgrade_head_creates_all_tables(client):
     expected = {
         "orgs", "projects", "api_keys",
         "runs", "trials", "run_rows", "gate_results", "assets", "events",
-        "row_reviews",       # Phase 4
-        "alembic_version",   # Alembic's own bookkeeping table
+        "row_reviews",        # Phase 4
+        "golden_candidates",  # Phase OBS-4
+        "alembic_version",    # Alembic's own bookkeeping table
     }
     assert expected <= actual, f"missing tables after upgrade: {expected - actual}"
 
@@ -121,7 +122,7 @@ def test_alembic_version_recorded(client):
     engine = client.app.state.engine
     with engine.connect() as conn:
         ver = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-    # Head bumps as we ship migrations. ``0007_run_rows_calls_index``
+    # Head bumps as we ship migrations. ``0008_golden_candidates``
     # locks the verdict enum at the DB layer + tightens ``row_id`` to
     # VARCHAR(200); future migrations will keep moving this forward.
-    assert ver == "0007_run_rows_calls_index"
+    assert ver == "0008_golden_candidates"

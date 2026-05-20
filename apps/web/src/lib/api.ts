@@ -330,6 +330,52 @@ export const getCallDetail = (
     + `/${encodeURIComponent(rowId)}`,
   );
 
+
+// ---------------------------------------------------------------------------
+// Golden candidates (Phase OBS-4).  Mirrors ``GoldenCandidate*``
+// in ``apps/api/evalguard_api/models.py``.
+
+
+export interface GoldenCandidate {
+  id: number;
+  run_id: string;
+  row_id: string;
+  project_id: string;
+  promoted_by: string;
+  note: string | null;
+  created_at: string;
+}
+
+
+export const promoteToGolden = (body: {
+  run_id: string;
+  row_id: string;
+  note?: string;
+}) =>
+  request<GoldenCandidate>(`/v1/golden/candidates`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+
+
+export const listGoldenCandidates = (
+  projectSlug: string,
+  opts: { limit?: number } = {},
+) => {
+  const qs = new URLSearchParams();
+  if (opts.limit) qs.set("limit", String(opts.limit));
+  const suffix = qs.toString() ? `?${qs.toString()}` : "";
+  return request<{ candidates: GoldenCandidate[] }>(
+    `/v1/projects/${encodeURIComponent(projectSlug)}/golden/candidates${suffix}`,
+  );
+};
+
+
+export const unPromoteGolden = (id: number) =>
+  request<void>(`/v1/golden/candidates/${id}`, {
+    method: "DELETE",
+  });
+
 export const getRun = (runId: string) =>
   request<RunOut>(`/v1/runs/${encodeURIComponent(runId)}`);
 
