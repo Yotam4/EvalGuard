@@ -39,7 +39,7 @@ from evalguard_api.auth import Principal, require_principal
 from evalguard_api.db import get_project_by_slug
 from evalguard_api.deps import get_conn
 from evalguard_api.models import (
-    CallListResponse, CallSummary,
+    CallDetail, CallListResponse, CallSummary,
 )
 
 
@@ -222,3 +222,101 @@ def _safe_json_list(raw: str | None) -> list[str]:
     except (TypeError, ValueError):
         return []
     return v if isinstance(v, list) else []
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/projects/{slug}/calls/{run_id}/{row_id}  (OBS-2)
+
+
+@router.get(
+    "/v1/projects/{project_slug}/calls/{run_id}/{row_id}",
+    response_model=CallDetail,
+    tags=["calls"],
+)
+def get_call_detail(
+    project_slug: str,
+    run_id:       str,
+    row_id:       str,
+    conn:      Connection = Depends(get_conn),
+    principal: Principal  = Depends(require_principal),
+) -> CallDetail:
+    """One call's full content — input / expected / output / scores
+    plus the trial's gate verdicts as context.
+
+    Source of truth is ``runs.payload_json`` — re-parsed at request
+    time so the heavy fields stay out of the stream paginator's hot
+    path.  Cross-org / missing combos all collapse to 404 (anti-
+    enumeration shape used elsewhere).
+    """
+    # Verify project + cross-org gate in one query: the project must
+    # exist, the run must belong to it, AND (for non-admin) the
+    # project must be in the caller's org.  Same JOIN ``get_run``
+    # uses, plus the project slug check so a foreign-org slug never
+    # leaks an existence signal.
+    row = conn.execute(
+        text("""SELECT runs.payload_json,
+                       runs.ingested_at,
+                       runs.project_id,
+                       projects.slug   AS project_slug,
+                       projects.org_id AS owning_org_id
+                FROM runs
+                JOIN projects ON projects.project_id = runs.project_id
+                WHERE runs.run_id = :run_id AND projects.slug = :slug"""),
+        {"run_id": run_id, "slug": project_slug},
+    ).mappings().fetchone()
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Call {run_id}/{row_id!r} not found in project {project_slug!r}.",
+        )
+    if not principal.is_admin and row["owning_org_id"] != principal.org_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Call {run_id}/{row_id!r} not found in project {project_slug!r}.",
+        )
+
+    payload = json.loads(row["payload_json"])
+    # Walk trials → rows looking for the requested row_id.  Linear
+    # scan, but the per-trial cap is 50000 rows and the typical run
+    # has < 1000 — fine for a single GET.  If this ever becomes hot
+    # we'd add (run_id, row_id) → trial_id pre-resolution to
+    # ``run_rows`` (the trial_id is already there).
+    target_trial: dict | None = None
+    target_row:   dict | None = None
+    for trial in payload.get("trials") or []:
+        for r in trial.get("rows") or []:
+            if r.get("row_id") == row_id:
+                target_trial = trial
+                target_row   = r
+                break
+        if target_row is not None:
+            break
+    if target_row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Call {run_id}/{row_id!r} not found in project {project_slug!r}.",
+        )
+
+    return CallDetail(
+        run_id=run_id,
+        row_id=row_id,
+        trial_id=(target_trial or {}).get("trial_id"),
+        project_id=row["project_id"],
+        project=payload.get("project", ""),
+        ingested_at=row["ingested_at"],
+        # ``provider`` / ``model`` denormalised from the parent trial
+        # so the UI's detail panel renders without a second fetch.
+        provider=(target_trial or {}).get("provider"),
+        model=(target_trial or {}).get("model"),
+        passed=bool(target_row.get("passed")),
+        n_scores=int(target_row.get("n_scores") or 0),
+        cost_usd=float(target_row.get("cost_usd") or 0.0),
+        latency_ms=int(target_row.get("latency_ms") or 0),
+        cache_hit=bool(target_row.get("cache_hit")),
+        tags=target_row.get("tags") or [],
+        input=target_row.get("input"),
+        expected=target_row.get("expected"),
+        output=target_row.get("output"),
+        scores=target_row.get("scores") or [],
+        trial_gates=(target_trial or {}).get("gates") or [],
+    )
