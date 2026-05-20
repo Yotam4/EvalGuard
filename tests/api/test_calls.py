@@ -371,3 +371,145 @@ def test_cross_org_project_returns_404_for_member(
 def test_requires_auth(client):
     r = client.get("/v1/projects/x/calls?tab=recent")
     assert r.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# OBS-2: GET /v1/projects/{slug}/calls/{run_id}/{row_id}
+#
+# Drill-down for a single call.  Source of truth is
+# ``payload_json``; the stream paginator never has to load these
+# heavy fields.
+
+
+def test_call_detail_returns_input_output_scores(client, auth_headers, tmp_path):
+    """Happy path: the CLI executor produces a real run with input/
+    output/scores, and the detail endpoint surfaces all three."""
+    payload = _produce_real_run(tmp_path, project="detail-happy", rows=2)
+    _post(client, auth_headers, payload)
+    slug = _project_slug_from_listing(client, auth_headers, "detail-happy")
+
+    # Discover the row_id from the stream — never hard-code, the
+    # CLI executor decides them.
+    listing = client.get(
+        f"/v1/projects/{slug}/calls?tab=recent",
+        headers=auth_headers,
+    ).json()["calls"]
+    assert listing, "expected at least one call in the stream"
+    first = listing[0]
+
+    r = client.get(
+        f"/v1/projects/{slug}/calls/{first['run_id']}/{first['row_id']}",
+        headers=auth_headers,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["run_id"]  == first["run_id"]
+    assert body["row_id"]  == first["row_id"]
+    assert body["passed"]  in (True, False)
+    # Provider/model denormalised from the parent trial.
+    assert body["provider"] == "mock"
+    assert body["model"]    == "m"
+    # The "actual answer" surfaces; with the CLI executor + mock
+    # provider the input is the dataset row's ``input`` field.
+    assert body["input"] is not None
+    assert body["output"] is not None
+    # Scores list is populated (the test config defines a heuristic
+    # + a judge, so at least 2 scores per row).
+    assert len(body["scores"]) >= 1
+    # Trial gates surface as context — the test config has no
+    # explicit gates, so this is just a shape check.
+    assert isinstance(body["trial_gates"], list)
+
+
+def test_call_detail_unknown_row_returns_404(client, auth_headers, tmp_path):
+    payload = _produce_real_run(tmp_path, project="detail-missing", rows=1)
+    _post(client, auth_headers, payload)
+    slug = _project_slug_from_listing(client, auth_headers, "detail-missing")
+    listing = client.get(
+        f"/v1/projects/{slug}/calls?tab=recent", headers=auth_headers,
+    ).json()["calls"]
+    run_id = listing[0]["run_id"]
+    r = client.get(
+        f"/v1/projects/{slug}/calls/{run_id}/nope",
+        headers=auth_headers,
+    )
+    assert r.status_code == 404
+    detail = r.json()["detail"]
+    # Detail names BOTH the row_id and the project so an operator
+    # debugging a 404 sees enough to fix without diving into logs.
+    assert "nope" in detail
+    assert "detail-missing" in detail
+
+
+def test_call_detail_unknown_run_returns_404(client, auth_headers, tmp_path):
+    payload = _produce_real_run(tmp_path, project="detail-norun", rows=1)
+    _post(client, auth_headers, payload)
+    slug = _project_slug_from_listing(client, auth_headers, "detail-norun")
+    r = client.get(
+        f"/v1/projects/{slug}/calls/run_doesnotexist/r0",
+        headers=auth_headers,
+    )
+    assert r.status_code == 404
+
+
+def test_call_detail_mismatched_project_returns_404(
+    client, auth_headers, tmp_path,
+):
+    """A run that exists in project A but is requested under
+    project B's URL must 404 — same anti-enumeration shape as the
+    other endpoints."""
+    payload_a = _produce_real_run(tmp_path / "a", project="detail-real", rows=1)
+    payload_b = _produce_real_run(tmp_path / "b", project="detail-other", rows=1)
+    _post(client, auth_headers, payload_a)
+    _post(client, auth_headers, payload_b)
+    listing = client.get(
+        f"/v1/projects/{_project_slug_from_listing(client, auth_headers, 'detail-real')}/calls?tab=recent",
+        headers=auth_headers,
+    ).json()["calls"]
+    run_a = listing[0]["run_id"]
+    row_a = listing[0]["row_id"]
+
+    # Request run_a under the WRONG project (detail-other) — must 404.
+    other_slug = _project_slug_from_listing(client, auth_headers, "detail-other")
+    r = client.get(
+        f"/v1/projects/{other_slug}/calls/{run_a}/{row_a}",
+        headers=auth_headers,
+    )
+    assert r.status_code == 404
+
+
+def test_call_detail_cross_org_returns_404_for_member(
+    client, auth_headers, make_org, make_member_token, tmp_path,
+):
+    make_org("acme")
+    member_default = make_member_token("org_default", name="d")
+    member_acme    = make_member_token("org_acme",    name="a")
+    payload = _produce_real_run(tmp_path, project="detail-acmep", rows=1)
+    _post(client, {"Authorization": f"Bearer {member_acme}"}, payload)
+
+    # Discover the row via the acme member's own listing.
+    listing = client.get(
+        "/v1/projects/detail-acmep/calls?tab=recent",
+        headers={"Authorization": f"Bearer {member_acme}"},
+    ).json()["calls"]
+    run_id = listing[0]["run_id"]
+    row_id = listing[0]["row_id"]
+
+    # default-org member tries to read the acme row.
+    r = client.get(
+        f"/v1/projects/detail-acmep/calls/{run_id}/{row_id}",
+        headers={"Authorization": f"Bearer {member_default}"},
+    )
+    assert r.status_code == 404
+
+    # Admin can.
+    r2 = client.get(
+        f"/v1/projects/detail-acmep/calls/{run_id}/{row_id}",
+        headers=auth_headers,
+    )
+    assert r2.status_code == 200
+
+
+def test_call_detail_requires_auth(client):
+    r = client.get("/v1/projects/x/calls/run_x/r0")
+    assert r.status_code == 401

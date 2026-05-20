@@ -320,6 +320,54 @@ class CallListResponse(_Strict):
     next_cursor: str | None = None
 
 
+class CallDetail(_Loose):
+    """Drill-down for one call (OBS-2).
+
+    Loose-shape (``extra='allow'``) so a future row attribute the
+    server adds doesn't 422 a client that's already pinned to a
+    specific Pydantic version.  The fields below are the stable
+    minimum every caller relies on.
+
+    Returned by ``GET /v1/projects/{slug}/calls/{run_id}/{row_id}``.
+    Source of truth is the run's ``payload_json.trials[].rows[]``
+    entry — re-parsed at request time so the heavy data stays out
+    of the calls-stream paginator.
+    """
+
+    # Identifiers + context.
+    run_id:        str
+    row_id:        str
+    trial_id:      str | None = None
+    project_id:    str
+    project:       str
+    ingested_at:   str | None = None
+    # The provider + model that produced this call (denormalised
+    # from the parent trial because the UI's detail panel wants
+    # them at a glance without a second fetch).
+    provider:      str | None = None
+    model:         str | None = None
+    # Per-row outcome flags.
+    passed:        bool
+    n_scores:      int = 0
+    cost_usd:      float = 0.0
+    latency_ms:    int = 0
+    cache_hit:     bool = False
+    tags:          list[str] = Field(default_factory=list)
+    # The "actual answer" — input/expected/output/scores.  Each
+    # is optional because: (a) ``include_scores=False`` pushes
+    # don't ship them, (b) some flows (cache hits, errors) have
+    # no output, (c) ``expected`` is dataset-dependent.
+    input:         Any = None
+    expected:      Any = None
+    output:        str | None = None
+    scores:        list[Score] = Field(default_factory=list)
+    # Trial-level gate verdicts surfaced as context.  Gate engine
+    # today is trial-scoped (not row-scoped), so the UI shows
+    # "the gates that ran around this row" — useful for triage
+    # without claiming the gates apply per-row.
+    trial_gates:   list[Gate] = Field(default_factory=list)
+
+
 # ---------------------------------------------------------------------------
 # Org / Project / API-key resources
 #
