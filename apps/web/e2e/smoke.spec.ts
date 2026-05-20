@@ -140,6 +140,76 @@ test.beforeEach(async ({ context }) => {
       });
     }
 
+    // Calls stream — the OBS-3 surface.  One pass + one fail row;
+    // every meaningful field populated so the CallCard and the
+    // detail panel exercise their full rendering paths.
+    if (path === "/v1/projects/demo/calls") {
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          calls: [
+            {
+              run_id: "run_e2e0000000001",
+              row_id: "r-pass",
+              trial_id: "trial_e2e000001",
+              project_id: "proj_e2e",
+              passed: true,
+              cost_usd: 0.0042, latency_ms: 142,
+              cache_hit: false,
+              tags: ["edge"],
+              ingested_at: "2026-05-15T07:30:00",
+              output_preview: "the configured LLM handled the request.",
+            },
+            {
+              run_id: "run_e2e0000000001",
+              row_id: "r-fail",
+              trial_id: "trial_e2e000001",
+              project_id: "proj_e2e",
+              passed: false,
+              cost_usd: 0.0050, latency_ms: 320,
+              cache_hit: false,
+              tags: [],
+              ingested_at: "2026-05-15T07:29:00",
+              output_preview: "I'm not sure I can help with that.",
+            },
+          ],
+          next_cursor: null,
+        }),
+      });
+    }
+
+    // Per-call detail — the drill-down panel.
+    if (path === "/v1/projects/demo/calls/run_e2e0000000001/r-pass") {
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          run_id: "run_e2e0000000001",
+          row_id: "r-pass",
+          trial_id: "trial_e2e000001",
+          project_id: "proj_e2e",
+          project: "demo",
+          ingested_at: "2026-05-15T07:30:00",
+          provider: "mock", model: "m",
+          passed: true,
+          n_scores: 2, cost_usd: 0.0042, latency_ms: 142,
+          cache_hit: false,
+          tags: ["edge"],
+          input:    "what is X?",
+          expected: "X is the value.",
+          output:   "X is the value, exactly as expected.",
+          scores: [
+            { evaluator_id: "lex.faithfulness", evaluator_kind: "heuristic",
+              layer: 2, value: 0.78, passed: true },
+            { evaluator_id: "judge.q", evaluator_kind: "judge",
+              layer: 3, value: 4.5, passed: true },
+          ],
+          trial_gates: [],
+        }),
+      });
+    }
+
     // Fall through to a 404 so an un-mocked endpoint surfaces
     // clearly in the test output (rather than the test hanging
     // on a network call to a fake hostname).
@@ -152,7 +222,7 @@ test.beforeEach(async ({ context }) => {
 });
 
 
-test("settings → runs → run detail → assets → asset detail", async ({ page }) => {
+test("settings → runs → run detail → assets → asset detail → calls → call detail", async ({ page }) => {
   // 1. Settings.
   await page.goto("/settings/");
   await page.getByLabel(/server url/i).fill(SERVER);
@@ -195,4 +265,34 @@ test("settings → runs → run detail → assets → asset detail", async ({ pa
   await expect(
     page.locator('[data-testid="asset-version-row"][data-run-id="run_e2e0000000001"]'),
   ).toBeVisible();
+
+  // 6. Calls stream (OBS-3) — per-call observability.
+  await page.goto("/calls/?project=demo");
+  await expect(page.getByRole("heading", { name: /^calls$/i })).toBeVisible();
+  // Both mocked rows render; addressed by ``data-row-id`` so a
+  // future reorder or label change doesn't break the spec.
+  const passCard = page.locator('[data-testid="call-card"][data-row-id="r-pass"]');
+  const failCard = page.locator('[data-testid="call-card"][data-row-id="r-fail"]');
+  await expect(passCard).toBeVisible();
+  await expect(failCard).toBeVisible();
+  // ``data-passed`` accurately reflects each row's outcome.
+  await expect(passCard).toHaveAttribute("data-passed", "true");
+  await expect(failCard).toHaveAttribute("data-passed", "false");
+
+  // 7. Drill into the passing call → the detail panel renders
+  // input / expected / output and the scores table.  Addressed by
+  // ``data-testid="call-detail-panel"`` rather than text so the
+  // assertions survive copy edits.
+  await passCard.click();
+  const detail = page.locator('[data-testid="call-detail-panel"]');
+  await expect(detail).toBeVisible();
+  await expect(detail).toHaveAttribute("data-row-id", "r-pass");
+  // Two score rows for the two evaluators in the mocked detail.
+  await expect(
+    page.locator('[data-testid="call-score-row"]'),
+  ).toHaveCount(2);
+  // Output block shows the canned response.
+  await expect(
+    page.getByTestId("call-content-output"),
+  ).toContainText("X is the value");
 });
