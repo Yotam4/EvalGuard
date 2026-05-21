@@ -127,9 +127,15 @@ function Body({ projectSlug }: { projectSlug: string }) {
                 >
                   <td className="px-2 py-1.5 font-mono text-xs">
                     <Link
+                      // Encode the composite ``run_id:row_id`` as one
+                      // value, not each half separately — separately
+                      // percent-encoding both produces ``a%3Aa%3Aroot``
+                      // patterns that the consumer's ``indexOf(":")``
+                      // splits on the FIRST ``%3A``, sending you to
+                      // the wrong row when ``row_id`` contains a ``:``.
                       href={
                         `/calls/?project=${encodeURIComponent(projectSlug)}`
-                        + `&call=${encodeURIComponent(c.run_id)}:${encodeURIComponent(c.row_id)}`
+                        + `&call=${encodeURIComponent(`${c.run_id}:${c.row_id}`)}`
                       }
                       className="text-[var(--color-accent)] hover:underline"
                     >

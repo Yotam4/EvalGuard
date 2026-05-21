@@ -330,3 +330,31 @@ def test_delete_unknown_id_returns_404(client, auth_headers):
         "/v1/golden/candidates/9999999", headers=auth_headers,
     )
     assert r.status_code == 404
+
+
+def test_list_admin_sees_other_org_candidates(
+    client, auth_headers, make_org, make_member_token, tmp_path,
+):
+    """The list endpoint mirrors the calls + detail endpoints'
+    cross-org behaviour: a non-admin member 404s on another org's
+    project, but admin (the bootstrap key used by ``auth_headers``)
+    sees it.  Pinning admin's positive case prevents a regression
+    where a future "scope=" gate accidentally clamps admin too."""
+    make_org("admingold")
+    member_admingold = make_member_token("org_admingold", name="a")
+    payload = _produce_run(tmp_path, project="admingold-proj", rows=1)
+    _post_run(client, {"Authorization": f"Bearer {member_admingold}"}, payload)
+    # Member promotes one of their own org's rows.
+    client.post(
+        "/v1/golden/candidates",
+        json={"run_id": payload["run_id"], "row_id": "r0",
+              "note": "from admingold member"},
+        headers={"Authorization": f"Bearer {member_admingold}"},
+    )
+    # Admin lists the foreign org's golden candidates and SEES them.
+    r = client.get(
+        "/v1/projects/admingold-proj/golden/candidates",
+        headers=auth_headers,
+    )
+    assert r.status_code == 200, r.text
+    assert len(r.json()["candidates"]) == 1

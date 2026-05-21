@@ -28,7 +28,7 @@ from __future__ import annotations
 
 from sqlalchemy import (
     Column, ForeignKey, Index, Integer, MetaData, Float,
-    Table, Text, UniqueConstraint,
+    Table, Text, UniqueConstraint, text,
 )
 
 
@@ -156,8 +156,12 @@ run_rows = Table(
     # ``recent``  ⇒ ``ORDER BY ingested_at DESC, id DESC``
     # ``failures`` ⇒ ``WHERE passed = 0 ORDER BY ingested_at DESC, id DESC``
     # Index column order matches the WHERE+ORDER pair so both
-    # planners pick it without a sort step.
-    Index("idx_run_rows_calls", "project_id", "ingested_at", "id"),
+    # planners pick it without a sort step.  The ORDER BY columns
+    # are declared DESC so Postgres can do a forward seek (an ASC
+    # index for a DESC query forces a backward scan + sort).  SQLite
+    # ignores the directionality at our table sizes.
+    Index("idx_run_rows_calls",
+          "project_id", text("ingested_at DESC"), text("id DESC")),
 )
 
 gate_results = Table(
@@ -223,7 +227,9 @@ golden_candidates = Table(
     Column("created_at",  Text, nullable=False),
     UniqueConstraint("run_id", "row_id", "promoted_by",
                      name="uq_golden_candidates_per_reviewer"),
-    Index("idx_golden_project", "project_id", "created_at"),
+    # ``created_at DESC`` because the list endpoint orders newest-
+    # first; same Postgres backward-scan concern as ``run_rows``.
+    Index("idx_golden_project", "project_id", text("created_at DESC")),
 )
 
 

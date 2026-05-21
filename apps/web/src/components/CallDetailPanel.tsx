@@ -70,7 +70,13 @@ function Header({
         <span className="font-mono">{data.latency_ms} ms</span>
         <span className="font-mono">${data.cost_usd.toFixed(4)}</span>
         {projectSlug && (
+          // ``key`` forces React to unmount + remount when the
+          // selected call changes so the mutation state (idle /
+          // pending / "✓ Promoted") resets cleanly.  Without it
+          // a previously-promoted row's success label would carry
+          // over onto the next row when the panel updates in place.
           <PromoteButton
+            key={`${data.run_id}:${data.row_id}`}
             runId={data.run_id}
             rowId={data.row_id}
             projectSlug={projectSlug}
