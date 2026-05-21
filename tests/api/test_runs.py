@@ -227,7 +227,10 @@ def test_list_runs_source_filter_returns_only_matching(
     r_cli = client.get("/v1/runs?source=cli", headers=auth_headers)
     assert r_cli.status_code == 200
     cli_runs = r_cli.json()["runs"]
-    assert len(cli_runs) >= 1
+    # Exactly one CLI run was ingested; a broken filter that
+    # returned ``all`` runs (regression to OR semantics) would
+    # surface as length 2 here.
+    assert len(cli_runs) == 1, [r["run_id"] for r in cli_runs]
     assert all(run["source"] == "cli" for run in cli_runs)
 
     r_otlp = client.get("/v1/runs?source=otlp", headers=auth_headers)
@@ -275,10 +278,49 @@ def test_list_runs_source_filter_combines_with_project(
         "/v1/runs?source=cli&project=alpha", headers=auth_headers,
     )
     runs = r.json()["runs"]
+    # Exactly one row — the alpha CLI run.  An OR regression would
+    # return 3 (both CLI + the OTLP); a broken AND would return 0.
+    assert len(runs) == 1, [r["run_id"] for r in runs]
     projects = {run["project"] for run in runs}
     sources  = {run["source"]  for run in runs}
     assert projects == {"alpha"}
     assert sources  == {"cli"}
+
+
+def test_list_runs_source_filter_is_case_insensitive(
+    client, auth_headers, tmp_path,
+):
+    """``?source=CLI`` should match the same set as ``?source=cli`` —
+    a human poking at the API shouldn't have to guess the case."""
+    cli_payload = _produce_real_run(tmp_path / "cli-side", project="case-test")
+    client.post("/v1/runs", json=cli_payload, headers=auth_headers)
+    for variant in ("cli", "CLI", "Cli", "  cli  "):
+        r = client.get(
+            f"/v1/runs?source={variant}", headers=auth_headers,
+        )
+        assert r.status_code == 200, (variant, r.text)
+        runs = r.json()["runs"]
+        assert len(runs) == 1, (variant, runs)
+        assert runs[0]["source"] == "cli"
+
+
+def test_list_runs_source_filter_combined_with_limit(
+    client, auth_headers, tmp_path,
+):
+    """``?source=cli&limit=2`` returns at most 2 CLI rows.  The two
+    filters compose without one clobbering the other."""
+    for i in range(3):
+        p = _produce_real_run(tmp_path / f"lim{i}", project=f"limp{i}")
+        client.post("/v1/runs", json=p, headers=auth_headers)
+    client.post(
+        "/v1/otlp/v1/traces",
+        json=_otlp_body_for_filter("spanlimit01"),
+        headers=auth_headers,
+    )
+    r = client.get("/v1/runs?source=cli&limit=2", headers=auth_headers)
+    runs = r.json()["runs"]
+    assert len(runs) == 2
+    assert all(run["source"] == "cli" for run in runs)
 
 
 def test_list_runs_source_filter_respects_org_scoping(

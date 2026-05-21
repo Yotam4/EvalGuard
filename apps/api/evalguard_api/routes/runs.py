@@ -146,11 +146,18 @@ def list_runs(
     ``source`` is the Phase-3a ingest-path discriminator.  Unknown
     values 400 — the public surface is ``cli`` / ``otlp`` only.
     """
-    if source is not None and source not in _KNOWN_SOURCES:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unknown source {source!r}. Allowed: {sorted(_KNOWN_SOURCES)}.",
-        )
+    # Normalise to lowercase BEFORE the whitelist check so an
+    # operator who guesses ``?source=CLI`` or ``OTLP`` gets a
+    # matching result instead of a confusing 400.  The column is
+    # stamped lowercase at ingest (``_persist_run`` / OTLP route),
+    # so we can also use the normalised value as the bind param.
+    if source is not None:
+        source = source.strip().lower()
+        if source not in _KNOWN_SOURCES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Unknown source {source!r}. Allowed: {sorted(_KNOWN_SOURCES)}.",
+            )
 
     # SQLAlchemy ``text()`` with named bind params — same syntax on
     # SQLite + Postgres. The org filter via correlated subquery means
