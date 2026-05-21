@@ -300,3 +300,142 @@ def test_versions_uses_env_vars_when_flags_omitted(tmp_path: Path):
         stop()
     assert result.returncode == 0, result.stderr or result.stdout
     assert captured["auth"] == "Bearer env-token-secret"
+
+
+# ---------------------------------------------------------------------------
+# Review-pass additions (audit findings)
+
+
+def test_versions_explicit_limit_reaches_server(tmp_path: Path):
+    """``--limit 25`` reaches the server as ``limit=25`` — pins
+    the flag actually propagates instead of falling back to the
+    200 default."""
+    captured: dict = {}
+    port, stop = _stub_server(_make_handler(
+        200,
+        json.dumps({
+            "kind": "judge", "asset_id": "q",
+            "project_id": "proj_demo", "project_name": "demo",
+            "versions": [],
+        }).encode("utf-8"),
+        captured,
+    ))
+    try:
+        result = _assets(
+            "versions", "judge", "q",
+            "--project-id", "proj_demo",
+            "--limit", "25",
+            "--server", f"http://127.0.0.1:{port}",
+            cwd=tmp_path,
+        )
+    finally:
+        stop()
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert "limit=25" in captured["path"]
+
+
+def test_versions_limit_above_max_rejected_client_side(tmp_path: Path):
+    """``--limit 9999`` is above the CLI's typer ``max=1000`` and is
+    rejected before any network call — fast-failure on a typo."""
+    result = _assets(
+        "versions", "judge", "q",
+        "--project-id", "proj_demo",
+        "--limit", "9999",
+        "--server", "http://127.0.0.1:1",
+        cwd=tmp_path,
+    )
+    assert result.returncode != 0
+    # Typer's validation message mentions the bound.  We don't
+    # pin the exact wording (it changes across Click/Typer
+    # versions), only that the call is rejected.
+    assert "1000" in (result.stdout + result.stderr)
+
+
+def test_versions_unreachable_server_exits_with_urlerror_hint(tmp_path: Path):
+    """``--server http://127.0.0.1:1`` points at a refused port —
+    confirms the ``urllib.error.URLError`` branch surfaces a
+    readable "Could not reach server" message rather than a raw
+    traceback."""
+    result = _assets(
+        "versions", "judge", "q",
+        "--project-id", "proj_demo",
+        "--server", "http://127.0.0.1:1",
+        cwd=tmp_path,
+    )
+    assert result.returncode == 1
+    out = (result.stdout + result.stderr).lower()
+    assert "could not reach server" in out
+
+
+def test_versions_non_json_200_body_exits_with_clear_message(tmp_path: Path):
+    """A reverse-proxy that returns a 200 with HTML (auth wall, error
+    page) used to crash the CLI with a JSON-decode traceback.  Now
+    surfaces a readable message and exit 1."""
+    captured: dict = {}
+    port, stop = _stub_server(_make_handler(
+        200,
+        b"<html><body>upstream not authenticated</body></html>",
+        captured,
+    ))
+    try:
+        result = _assets(
+            "versions", "judge", "q",
+            "--project-id", "proj_demo",
+            "--server", f"http://127.0.0.1:{port}",
+            cwd=tmp_path,
+        )
+    finally:
+        stop()
+    assert result.returncode == 1
+    out = (result.stdout + result.stderr).lower()
+    assert "non-json" in out
+
+
+def test_versions_empty_token_env_var_caught_explicitly(tmp_path: Path):
+    """``EVALGUARD_API_TOKEN=`` (empty string) used to silently
+    omit the bearer header and produce a server 401 the operator
+    has to debug.  Now the CLI catches the empty-string case
+    locally and tells them what to fix."""
+    result = _assets(
+        "versions", "judge", "q",
+        "--project-id", "proj_demo",
+        "--server", "http://127.0.0.1:1",  # unreachable, but we shouldn't get there
+        env={
+            "EVALGUARD_SERVER":    "ignored",  # ``--server`` flag wins
+            "EVALGUARD_API_TOKEN": "",
+        },
+        cwd=tmp_path,
+    )
+    assert result.returncode == 2
+    out = (result.stdout + result.stderr).lower()
+    assert "empty string" in out
+
+
+def test_versions_json_mode_does_not_mix_errors_into_stdout(tmp_path: Path):
+    """The whole point of ``--json`` is downstream ``jq``.  An error
+    on a ``--json`` invocation must go to stderr, not corrupt the
+    pipe."""
+    captured: dict = {}
+    port, stop = _stub_server(_make_handler(
+        404,
+        json.dumps({"detail": "Asset judge/'q' not found"}).encode("utf-8"),
+        captured,
+    ))
+    try:
+        result = _assets(
+            "versions", "judge", "q",
+            "--project-id", "proj_x",
+            "--server", f"http://127.0.0.1:{port}",
+            "--json",
+            cwd=tmp_path,
+        )
+    finally:
+        stop()
+    assert result.returncode == 1
+    # stdout must be EMPTY or pure-JSON (it's empty here because
+    # the request failed before any JSON could be emitted).
+    # ``jq < /dev/null`` succeeds; ``jq < "...error message..."``
+    # would fail loudly — so the contract we pin is "no error
+    # text on stdout".
+    assert "not found" not in result.stdout.lower()
+    assert "not found" in result.stderr.lower()

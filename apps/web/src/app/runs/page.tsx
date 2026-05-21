@@ -8,6 +8,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Card } from "@/components/Card";
 import { Badge, statusTone } from "@/components/Badge";
 import { ConnectionGate } from "@/components/ConnectionGate";
+import { Tabs, type TabSpec } from "@/components/Tabs";
 import { listRuns, type RunSource, type RunSummary } from "@/lib/api";
 
 
@@ -98,37 +99,20 @@ function SourceTabs({
   // Three pills.  ``null`` (all) is the default and the leftmost
   // — most operators want "everything" most of the time.  Keep the
   // order stable so muscle memory works.
-  const tabs: { value: SourceFilter; label: string }[] = [
-    { value: null,   label: "All" },
-    { value: "cli",  label: "CLI push" },
-    { value: "otlp", label: "OTLP traces" },
+  const tabs: TabSpec<SourceFilter>[] = [
+    { value: null,   label: "All",         dataAttr: "all" },
+    { value: "cli",  label: "CLI push",    dataAttr: "cli" },
+    { value: "otlp", label: "OTLP traces", dataAttr: "otlp" },
   ];
   return (
-    <div
-      data-testid="source-tabs"
-      className="flex flex-wrap gap-1 rounded border border-[var(--color-border)] bg-[var(--color-bg-card)] p-1"
-    >
-      {tabs.map((t) => {
-        const active = t.value === value;
-        return (
-          <button
-            key={t.label}
-            type="button"
-            data-source-tab={t.value ?? "all"}
-            aria-pressed={active}
-            onClick={() => onChange(t.value)}
-            className={
-              "rounded px-3 py-1.5 text-sm transition " +
-              (active
-                ? "bg-[var(--color-bg-row)] text-[var(--color-fg)]"
-                : "text-[var(--color-fg-muted)] hover:bg-[var(--color-bg-row)] hover:text-[var(--color-fg)]")
-            }
-          >
-            {t.label}
-          </button>
-        );
-      })}
-    </div>
+    <Tabs
+      value={value}
+      onChange={onChange}
+      tabs={tabs}
+      ariaLabel="Filter runs by source"
+      testid="source-tabs"
+      dataAttrName="source-tab"
+    />
   );
 }
 

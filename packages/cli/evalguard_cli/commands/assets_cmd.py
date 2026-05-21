@@ -31,9 +31,18 @@ import urllib.parse
 import urllib.request
 
 import typer
+from rich.console import Console
 from rich.table import Table
 
 from evalguard_cli.console import console
+
+
+# Errors and progress notes go to STDERR so ``--json`` mode keeps
+# stdout machine-readable for a downstream ``jq``.  The shared
+# ``console`` (stdout) stays the channel for tables and ``--json``
+# output.  Without this, any error rendered via ``console.print``
+# would corrupt a piped JSON payload.
+_stderr = Console(stderr=True)
 
 
 assets_app = typer.Typer(help="Query the server's asset surface.")
@@ -66,7 +75,7 @@ def versions(
     """Every ``(version_id, run_id, ingested_at, source)`` tuple for
     one asset inside one project, newest-first."""
     if kind not in _KNOWN_KINDS:
-        console.print(
+        _stderr.print(
             f"[red]Unknown kind[/red] [cyan]{kind}[/cyan].  "
             f"Allowed: {', '.join(sorted(_KNOWN_KINDS))}"
         )
@@ -74,12 +83,29 @@ def versions(
 
     server = server or os.environ.get(ENV_SERVER)
     if not server:
-        console.print(
+        _stderr.print(
             f"[red]No server configured.[/red]  Set [cyan]${ENV_SERVER}[/cyan] "
             f"or pass [cyan]--server[/cyan]."
         )
         raise typer.Exit(2)
-    token = token or os.environ.get(ENV_TOKEN)
+
+    # ``token or os.environ.get(...)`` would silently fall back when
+    # the env var is set to the empty string (``EVALGUARD_API_TOKEN=``
+    # in a Docker env block is a common foot-gun), and the server's
+    # subsequent 401 doesn't tell the operator the cause.  Detect
+    # the explicit-empty case here.
+    if token is None:
+        env_token = os.environ.get(ENV_TOKEN)
+        if env_token is None:
+            token = None
+        elif env_token == "":
+            _stderr.print(
+                f"[red]${ENV_TOKEN} is set to an empty string.[/red]  "
+                f"Either unset it or provide a real token."
+            )
+            raise typer.Exit(2)
+        else:
+            token = env_token
 
     qs = urllib.parse.urlencode({"project_id": project_id, "limit": limit})
     path = (
@@ -96,21 +122,35 @@ def versions(
 
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310 — explicit user-supplied URL
-            body = json.loads(resp.read().decode("utf-8"))
+            raw_body = resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as e:
         # Map server error shapes to specific exits so a CI workflow
         # can act on the result without parsing stderr.
         detail = _read_error_detail(e)
         if e.code in (401, 403):
-            console.print(f"[red]Authentication failed[/red] ({e.code}) — {detail}")
+            _stderr.print(f"[red]Authentication failed[/red] ({e.code}) — {detail}")
             raise typer.Exit(2) from e
         if e.code == 404:
-            console.print(f"[red]Not found[/red] — {detail}")
+            _stderr.print(f"[red]Not found[/red] — {detail}")
             raise typer.Exit(1) from e
-        console.print(f"[red]Request failed[/red] ({e.code}) — {detail}")
+        _stderr.print(f"[red]Request failed[/red] ({e.code}) — {detail}")
         raise typer.Exit(1) from e
     except urllib.error.URLError as e:
-        console.print(f"[red]Could not reach server[/red] {server}: {e.reason}")
+        _stderr.print(f"[red]Could not reach server[/red] {server}: {e.reason}")
+        raise typer.Exit(1) from e
+
+    # A misconfigured reverse-proxy can return a 200 with an HTML
+    # error page or an empty body.  Without this guard the JSON parse
+    # raises and the user sees a Python traceback instead of a
+    # readable error.
+    try:
+        body = json.loads(raw_body)
+    except (TypeError, ValueError) as e:
+        snippet = raw_body[:200].replace("\n", " ").strip()
+        _stderr.print(
+            f"[red]Server returned non-JSON 200 response.[/red]  "
+            f"First 200 bytes: {snippet!r}"
+        )
         raise typer.Exit(1) from e
 
     if as_json:

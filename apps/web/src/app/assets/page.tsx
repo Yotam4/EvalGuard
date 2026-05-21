@@ -8,6 +8,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Card } from "@/components/Card";
 import { Badge } from "@/components/Badge";
 import { ConnectionGate } from "@/components/ConnectionGate";
+import { Tabs, type TabSpec } from "@/components/Tabs";
 import { listAssets, type AssetKind, type AssetSummary } from "@/lib/api";
 
 /**
@@ -85,27 +86,22 @@ function Inner() {
 function KindTabs({
   value, onChange,
 }: { value: AssetKind; onChange: (k: AssetKind) => void }) {
+  // Same shape Tabs primitive used by /runs's source filter — proper
+  // ``role=tablist`` + roving tabindex + ArrowLeft/Right + Home/End.
+  const tabs: TabSpec<AssetKind>[] = KINDS.map((k) => ({
+    value:    k.value,
+    label:    k.label,
+    dataAttr: k.value,
+  }));
   return (
-    <div className="flex flex-wrap gap-1 rounded border border-[var(--color-border)] bg-[var(--color-bg-card)] p-1">
-      {KINDS.map((k) => {
-        const active = k.value === value;
-        return (
-          <button
-            key={k.value}
-            type="button"
-            onClick={() => onChange(k.value)}
-            className={
-              "rounded px-3 py-1.5 text-sm transition " +
-              (active
-                ? "bg-[var(--color-bg-row)] text-[var(--color-fg)]"
-                : "text-[var(--color-fg-muted)] hover:bg-[var(--color-bg-row)] hover:text-[var(--color-fg)]")
-            }
-          >
-            {k.label}
-          </button>
-        );
-      })}
-    </div>
+    <Tabs
+      value={value}
+      onChange={onChange}
+      tabs={tabs}
+      ariaLabel="Filter assets by kind"
+      testid="kind-tabs"
+      dataAttrName="kind-tab"
+    />
   );
 }
 

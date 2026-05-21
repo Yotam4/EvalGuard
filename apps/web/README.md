@@ -56,12 +56,14 @@ code, same family as `apps/api/`); the MIT-licensed CLI / evaluators
 | `/assets/` | Cross-run aggregate, kind tabs, project filter | `GET /v1/assets` |
 | `/assets/detail/?kind=&asset_id=&project_id=` | Every `(version, run, ingested)` for one asset | `GET /v1/assets/{kind}/{asset_id}/versions` |
 | `/reviews?run_id=run_xxx` | Human review queue for failing rows + verdict submit | `GET /v1/reviews/queue`, `POST /v1/reviews`, `GET /v1/runs/{id}/reviews` |
+| `/calls/?project=…` | Per-project call stream with cursor pagination, Recent / Failures tabs | `GET /v1/projects/{slug}/calls` |
+| `/golden/?project=…` | Promoted golden-dataset candidates | `GET /v1/projects/{slug}/golden/candidates` |
 | `/orgs/` | Org list + create (admin) | `GET /v1/orgs`, `POST /v1/orgs` |
 | `/projects/` | Project list + create | `GET /v1/projects`, `POST /v1/projects` |
-| `/keys/` | API-key CRUD; new keys flash plaintext once with Copy | `GET\|POST\|DELETE /v1/api_keys` |
+| `/keys/` | API-key CRUD; new keys flash plaintext once with Copy | `GET /v1/orgs/{id}/api_keys`, `POST /v1/orgs/{id}/api_keys`, `DELETE /v1/api_keys/{id}` |
 
-12 static routes today (`next build` finalises all of them at build
-time).
+`next build` finalises every route as static content; the exact
+count moves as features land — verify with `npm run build`.
 
 ## File layout
 
@@ -187,6 +189,22 @@ EVALGUARD_CORS_ORIGINS="http://localhost:3000" \
   uvicorn evalguard_api.main:app --port 8787
 ```
 
+**Naming gotcha** — there are two similarly-named env vars on
+different sides of the wire:
+
+- `EVALGUARD_API_KEY` (server-side) — bootstrap admin token the
+  lifespan materialises into the `api_keys` table on first start.
+  This is what the quickstart sets above so you have *some* valid
+  bearer to paste into the UI.
+- `EVALGUARD_API_TOKEN` (CLI / external clients) — the bearer your
+  HTTP client sends. The CLI reads it from this var; the web UI
+  reads its equivalent from `localStorage`.
+
+For dev they happen to be the same string (the bootstrap key) — for
+a real deployment you'd create per-user `evk_…` keys via
+`POST /v1/orgs/{id}/api_keys` and hand those out, never the
+bootstrap key.
+
 Then in the browser at http://localhost:3000:
 1. Open **Settings**, paste `http://localhost:8787` as the Server URL
    and the API key as the token.
@@ -215,7 +233,7 @@ npm run test:watch # development
 npm run type-check # tsc --noEmit
 ```
 
-67 tests across:
+Tests live next to the code they cover:
 
 - `src/lib/__tests__/api.test.ts` — every endpoint's URL composition,
   bearer injection, error translation, 204 handling, the 30-s
@@ -225,7 +243,9 @@ npm run type-check # tsc --noEmit
   `ConnectionGate` (renders Settings prompt when unconfigured),
   `DriftBody` (formatting helpers + direction-of-regression tones),
   `ReviewItem` (Submit gated by verdict, trims note on submit),
-  `AssetVersionsTable` (truncation, source badge, data-* attrs).
+  `AssetVersionsTable` (truncation, source badge, data-* attrs),
+  `Tabs` (ARIA tablist semantics, roving tabindex, ArrowLeft/Right
+  + Home/End keyboard navigation).
 
 ### Playwright (e2e)
 
@@ -235,8 +255,9 @@ npm run e2e             # boots `npx serve out` + runs spec
 ```
 
 One spec — `e2e/smoke.spec.ts` — walks Settings → Runs → Run detail
-→ Assets → Asset detail.  API responses are mocked via `page.route()`
-so the workflow doesn't need a live FastAPI.
+→ Assets → Asset detail → Calls stream → call detail.  API
+responses are mocked via `page.route()` so the workflow doesn't
+need a live FastAPI.
 
 The `web-e2e` GitHub workflow runs this on every PR that touches
 `apps/web/**`.  See [`.github/workflows/web-e2e.yml`](../../.github/workflows/web-e2e.yml).
