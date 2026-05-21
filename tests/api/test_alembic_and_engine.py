@@ -125,4 +125,4 @@ def test_alembic_version_recorded(client):
     # Head bumps as we ship migrations. ``0008_golden_candidates``
     # locks the verdict enum at the DB layer + tightens ``row_id`` to
     # VARCHAR(200); future migrations will keep moving this forward.
-    assert ver == "0008_golden_candidates"
+    assert ver == "0009_calls_indexes_desc"

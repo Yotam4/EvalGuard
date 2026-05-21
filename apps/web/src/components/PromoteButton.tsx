@@ -14,6 +14,18 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { promoteToGolden } from "@/lib/api";
 
 
+/**
+ * NOTE for consumers: the mutation state (idle / pending / success)
+ * sticks for the lifetime of this component instance.  If a parent
+ * renders one ``<PromoteButton>`` and swaps its ``runId``/``rowId``
+ * via prop updates (rather than unmount + remount), the previously-
+ * promoted row's "✓ Promoted" label will carry over onto the new
+ * row.  The fix is consumer-side: pass ``key={`${runId}:${rowId}`}``
+ * so React unmounts + remounts on row change.  This is the
+ * idiomatic React pattern for "identity changes when props change"
+ * and avoids the timing-fragile ``useEffect(reset, [runId, rowId])``
+ * dance.  ``CallDetailPanel`` does exactly that.
+ */
 export function PromoteButton({
   runId,
   rowId,

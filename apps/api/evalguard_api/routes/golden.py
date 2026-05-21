@@ -27,6 +27,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
+from sqlalchemy.exc import IntegrityError
 
 from evalguard_api.auth import Principal, require_principal
 from evalguard_api.db import get_project_by_slug, now_iso
@@ -103,39 +104,74 @@ def promote(
     project_id = row["project_id"]
     now = now_iso()
 
-    # UPSERT: SELECT-then-INSERT/UPDATE inside the same transaction.
-    # Avoids per-dialect ``ON CONFLICT`` syntax differences; same
-    # pattern as ``routes/reviews.py:submit_review``.
-    existing = conn.execute(
-        text("""SELECT id, created_at FROM golden_candidates
-                WHERE run_id = :run_id AND row_id = :row_id
-                  AND promoted_by = :promoter"""),
-        {"run_id": body.run_id, "row_id": body.row_id,
-         "promoter": principal.key_id},
-    ).mappings().fetchone()
+    # UPSERT.  Two-step (SELECT-then-INSERT/UPDATE) under a
+    # SAVEPOINT so a concurrent same-reviewer click can't crash
+    # the request with the UNIQUE constraint — if the INSERT
+    # races, we catch ``IntegrityError``, roll back the savepoint,
+    # and fall through to the SELECT+UPDATE branch.  Same pattern
+    # as ``db.py:upsert_project``.
+    #
+    # ``lastrowid`` is unreliable across dialects: ``None`` on
+    # Postgres, ``int`` on SQLite.  After every code path we
+    # re-SELECT the canonical ``id`` and ``created_at`` so the
+    # response body always matches what's in the table — no more
+    # ``"id": 0`` placeholders in the response.
 
-    if existing:
+    def _update_existing(existing_row) -> tuple[int, str]:
         conn.execute(
             text("""UPDATE golden_candidates
                     SET note = :note
                     WHERE id = :id"""),
-            {"note": note, "id": existing["id"]},
+            {"note": note, "id": existing_row["id"]},
         )
-        candidate_id = existing["id"]
-        created_at   = existing["created_at"]
-    else:
-        result = conn.execute(
-            text("""INSERT INTO golden_candidates(
-                      run_id, row_id, project_id, promoted_by,
-                      note, created_at)
-                    VALUES (:run_id, :row_id, :project_id, :promoter,
-                            :note, :now)"""),
+        return existing_row["id"], existing_row["created_at"]
+
+    def _select_existing():
+        return conn.execute(
+            text("""SELECT id, created_at FROM golden_candidates
+                    WHERE run_id = :run_id AND row_id = :row_id
+                      AND promoted_by = :promoter"""),
             {"run_id": body.run_id, "row_id": body.row_id,
-             "project_id": project_id, "promoter": principal.key_id,
-             "note": note, "now": now},
-        )
-        candidate_id = int(result.lastrowid) if result.lastrowid else 0
-        created_at   = now
+             "promoter": principal.key_id},
+        ).mappings().fetchone()
+
+    existing = _select_existing()
+    if existing:
+        candidate_id, created_at = _update_existing(existing)
+    else:
+        try:
+            with conn.begin_nested():
+                conn.execute(
+                    text("""INSERT INTO golden_candidates(
+                              run_id, row_id, project_id, promoted_by,
+                              note, created_at)
+                            VALUES (:run_id, :row_id, :project_id, :promoter,
+                                    :note, :now)"""),
+                    {"run_id": body.run_id, "row_id": body.row_id,
+                     "project_id": project_id, "promoter": principal.key_id,
+                     "note": note, "now": now},
+                )
+        except IntegrityError:
+            # Concurrent same-reviewer click won the race.  The other
+            # transaction inserted the row; we update its note to
+            # match the latest request (last write wins for the note
+            # field, same semantics as the non-racing path).
+            existing = _select_existing()
+            if existing is None:
+                # Shouldn't happen — the UNIQUE constraint must have
+                # been satisfied by a row that exists.  Surface as a
+                # 500 so the operator notices something is wrong with
+                # the DB rather than us silently swallowing it.
+                raise
+            candidate_id, created_at = _update_existing(existing)
+        else:
+            # Successful INSERT — re-SELECT to get the canonical id
+            # rather than depending on ``lastrowid`` (None on
+            # Postgres).
+            row = _select_existing()
+            assert row is not None, "row vanished immediately after INSERT"
+            candidate_id = row["id"]
+            created_at   = row["created_at"]
 
     return GoldenCandidate(
         id=candidate_id,

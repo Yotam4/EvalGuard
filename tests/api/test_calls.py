@@ -35,11 +35,14 @@ def _produce_real_run(
     tmp_path: Path,
     project: str = "p",
     rows: int = 2,
+    judge_score: float = 4.5,
 ) -> dict:
     """Run the CLI executor with N rows and serialize.  Reuses the
     same shape as ``tests/api/test_runs.py:_produce_real_run`` but
     parameterised so the cursor-pagination tests can ingest more
-    than two rows."""
+    than two rows.  ``judge_score`` below the (hard-coded) 4.0
+    threshold produces all-failing rows, which the failures-tab
+    tests rely on."""
     base = tmp_path / "cli"
     base.mkdir(parents=True, exist_ok=True)
     (base / "datasets").mkdir(parents=True, exist_ok=True)
@@ -54,7 +57,7 @@ def _produce_real_run(
         "providers: [{ id: 'mock:m', config: { mode: echo, latency_ms: 0 } }]\n"
         "datasets: [{ id: g, file: datasets/g.jsonl }]\n"
         "heuristics: [{ id: len, type: length, max: 10000 }]\n"
-        "judges: [{ id: q, type: mock_pointwise, score: 4.5, threshold: 4.0 }]\n"
+        f"judges: [{{ id: q, type: mock_pointwise, score: {judge_score}, threshold: 4.0 }}]\n"
     )
     cfg = load_config(base / "evalguard.yaml")
     store = SqliteStore(base / "local.db")
@@ -513,3 +516,78 @@ def test_call_detail_cross_org_returns_404_for_member(
 def test_call_detail_requires_auth(client):
     r = client.get("/v1/projects/x/calls/run_x/r0")
     assert r.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Review-pass additions
+
+
+def test_failures_tab_empty_when_all_rows_pass(client, auth_headers, tmp_path):
+    """A project with zero failing rows still returns a well-formed
+    response from ``tab=failures`` — empty ``calls`` list, null
+    ``next_cursor``.  Pins the edge case where the WHERE clause's
+    ``passed = 0`` filter eliminates everything; an off-by-one in
+    the seek logic would surface as a 500 here."""
+    p = _produce_real_run(tmp_path, project="all-pass", rows=3)
+    _post(client, auth_headers, p)
+    slug = _project_slug_from_listing(client, auth_headers, "all-pass")
+    r = client.get(
+        f"/v1/projects/{slug}/calls?tab=failures",
+        headers=auth_headers,
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["calls"] == []
+    assert body["next_cursor"] is None
+
+
+def test_failures_tab_paginates_with_cursor(client, auth_headers, tmp_path):
+    """``tab=failures`` + ``limit=1`` across a mix of passing and
+    failing rows.  The cursor's seek logic must keep finding the
+    next failing row, not stop at the boundary between a failing
+    and a passing row."""
+    # Three runs each carrying one failing row.  ``_produce_real_run``
+    # with the mock judge ``score < threshold`` shape produces all-fail.
+    p1 = _produce_real_run(tmp_path / "a", project="fail-page", rows=1, judge_score=1.0)
+    p2 = _produce_real_run(tmp_path / "b", project="fail-page", rows=1, judge_score=1.0)
+    p3 = _produce_real_run(tmp_path / "c", project="fail-page", rows=1, judge_score=1.0)
+    for p in (p1, p2, p3):
+        _post(client, auth_headers, p)
+    slug = _project_slug_from_listing(client, auth_headers, "fail-page")
+
+    seen: list[str] = []
+    cursor: str | None = None
+    for _ in range(5):  # bounded to prevent runaway
+        qs = "tab=failures&limit=1"
+        if cursor is not None:
+            qs += f"&cursor={cursor}"
+        r = client.get(
+            f"/v1/projects/{slug}/calls?{qs}",
+            headers=auth_headers,
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        for call in body["calls"]:
+            assert call["passed"] is False
+            seen.append(call["run_id"])
+        cursor = body["next_cursor"]
+        if cursor is None:
+            break
+    assert {p1["run_id"], p2["run_id"], p3["run_id"]} <= set(seen)
+
+
+def test_source_filter_case_insensitive(client, auth_headers, tmp_path):
+    """``?source=CLI`` should match ``?source=cli`` — sibling
+    behaviour of ``GET /v1/runs?source=`` (review-pass 5d58536).
+    Pinned here so the two endpoints stay in lockstep."""
+    p = _produce_real_run(tmp_path, project="case-src", rows=2)
+    _post(client, auth_headers, p)
+    slug = _project_slug_from_listing(client, auth_headers, "case-src")
+    for variant in ("cli", "CLI", "Cli", "  cli  "):
+        r = client.get(
+            f"/v1/projects/{slug}/calls?source={variant}",
+            headers=auth_headers,
+        )
+        assert r.status_code == 200, (variant, r.text)
+        body = r.json()
+        assert len(body["calls"]) >= 1, (variant, body)

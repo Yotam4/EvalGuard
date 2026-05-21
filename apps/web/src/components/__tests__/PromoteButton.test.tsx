@@ -147,6 +147,44 @@ describe("<PromoteButton>", () => {
   });
 
 
+  it("consumer-side `key` resets the success label when (runId, rowId) changes", async () => {
+    // The call-detail panel passes ``key={`${runId}:${rowId}`}`` so
+    // navigating between calls remounts the button cleanly — the
+    // previously-promoted row's ``✓ Promoted`` label MUST NOT carry
+    // over.  This test simulates that exact consumer pattern.
+    fetchMock.mockResolvedValueOnce({
+      ok: true, status: 201,
+      json: async () => ({
+        id: 7, run_id: "run_a", row_id: "r-1",
+        project_id: "proj", promoted_by: "key_a",
+        note: null, created_at: "2026-05-15T07:30:00",
+      }),
+    });
+    // Use a single QueryClient across rerenders so the mutation
+    // state would otherwise persist — which makes the ``key``
+    // remount the real fix being tested.
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    const Wrap = ({ rowId }: { rowId: string }) => (
+      <QueryClientProvider client={client}>
+        <PromoteButton key={`run_a:${rowId}`} runId="run_a" rowId={rowId} />
+      </QueryClientProvider>
+    );
+    const { rerender } = render(<Wrap rowId="r-1" />);
+    fireEvent.click(screen.getByTestId("promote-button"));
+    fireEvent.click(screen.getByTestId("promote-confirm"));
+    await waitFor(() =>
+      expect(screen.getByTestId("promote-button").textContent).toMatch(/promoted/i),
+    );
+    // Same QueryClient, different ``rowId`` — the ``key`` forces
+    // unmount + remount, so the new button is back at idle.
+    rerender(<Wrap rowId="r-2" />);
+    expect(screen.getByTestId("promote-button").textContent).toMatch(/promote to golden/i);
+    expect(screen.getByTestId("promote-button").textContent).not.toMatch(/promoted/i);
+  });
+
+
   it("surfaces server errors inline (4xx → red banner, idle button still visible)", async () => {
     fetchMock.mockResolvedValueOnce({
       ok: false, status: 404, statusText: "Not Found",

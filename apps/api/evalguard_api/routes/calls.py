@@ -51,28 +51,36 @@ router = APIRouter()
 _KNOWN_SOURCES: frozenset[str] = frozenset({"cli", "otlp"})
 
 
-def _encode_cursor(ingested_at: str, row_id: int) -> str:
-    """Opaque base64-URL cursor.  The format is intentionally not
+def _encode_cursor(ingested_at: str | None, row_id: int) -> str:
+    """Opaque base64-URL cursor.  Format is intentionally not
     documented to clients — they should treat it as a black-box
-    token and pass it back unchanged.  Changing the encoding here
-    is safe as long as ``_decode_cursor`` accepts the old form
-    during the rollout window (currently a no-op since this is the
-    first version)."""
-    payload = json.dumps({"t": ingested_at, "i": row_id}).encode("utf-8")
-    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+    token.  ``t`` (the ISO timestamp) is optional: when the last row
+    of a page has a NULL ``ingested_at`` (pre-OBS-1 legacy data the
+    backfill couldn't fix), we emit an id-only cursor and the next
+    page WHERE-clause falls back to ``id < :cur_id``.  Without this
+    fallback the stream silently terminates the first time the
+    cursor lands on a NULL-timestamped row."""
+    payload: dict = {"i": row_id}
+    if ingested_at is not None:
+        payload["t"] = ingested_at
+    return base64.urlsafe_b64encode(
+        json.dumps(payload).encode("utf-8"),
+    ).decode("ascii").rstrip("=")
 
 
-def _decode_cursor(cursor: str) -> tuple[str, int]:
+def _decode_cursor(cursor: str) -> tuple[str | None, int]:
     """Decode a cursor.  Raises ``HTTPException(400)`` on tampered
     or malformed input — see the module docstring for why we don't
-    silently drop to page-one."""
+    silently drop to page-one.  Returns ``(None, id)`` for legacy
+    rows where the encoder couldn't supply a timestamp."""
     try:
         # Re-pad — ``rstrip("=")`` in the encoder means the decoder
         # has to add it back to a multiple of 4.
         padded = cursor + "=" * (-len(cursor) % 4)
         raw = base64.urlsafe_b64decode(padded.encode("ascii"))
         data = json.loads(raw.decode("utf-8"))
-        return str(data["t"]), int(data["i"])
+        ts = data.get("t")
+        return (str(ts) if ts is not None else None), int(data["i"])
     except (ValueError, KeyError, TypeError, json.JSONDecodeError) as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -98,11 +106,18 @@ def list_project_calls(
     principal: Principal  = Depends(require_principal),
 ) -> CallListResponse:
     """Cursor-paginated stream of one project's calls, newest-first."""
-    if source is not None and source not in _KNOWN_SOURCES:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unknown source {source!r}. Allowed: {sorted(_KNOWN_SOURCES)}.",
-        )
+    if source is not None:
+        # Normalise to lowercase + trim BEFORE the whitelist check so
+        # ``?source=CLI`` matches ``?source=cli``.  The sibling
+        # endpoint in ``runs.py:list_runs`` does the same; consistency
+        # matters because the calls + runs lists are linked from the
+        # same UI tab.
+        source = source.strip().lower()
+        if source not in _KNOWN_SOURCES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Unknown source {source!r}. Allowed: {sorted(_KNOWN_SOURCES)}.",
+            )
 
     # Project visibility — admin sees any project, member must own it.
     # Same anti-enumeration 404 used elsewhere; never surface "exists
@@ -150,12 +165,22 @@ def list_project_calls(
         # before ``(cur_ts, cur_id)`` in the ``(ingested_at DESC, id
         # DESC)`` order.  Row-value tuple comparisons aren't portable
         # to old SQLite, so we expand the lexicographic test manually.
-        clauses.append(
-            "(ingested_at < :cur_ts "
-            " OR (ingested_at = :cur_ts AND id < :cur_id))"
-        )
-        params["cur_ts"] = cur_ts
-        params["cur_id"] = cur_id
+        #
+        # Legacy fallback: when ``cur_ts`` is None we're paginating
+        # through pre-OBS-1 rows whose ``ingested_at`` is NULL.
+        # Order them by ``id DESC`` alone; the ``ingested_at IS NULL``
+        # guard keeps us on the legacy side until those rows are
+        # exhausted (callers can then re-ingest to backfill timestamps).
+        if cur_ts is None:
+            clauses.append("ingested_at IS NULL AND id < :cur_id")
+            params["cur_id"] = cur_id
+        else:
+            clauses.append(
+                "(ingested_at < :cur_ts "
+                " OR (ingested_at = :cur_ts AND id < :cur_id))"
+            )
+            params["cur_ts"] = cur_ts
+            params["cur_id"] = cur_id
 
     where = " AND ".join(clauses)
 
@@ -198,15 +223,13 @@ def list_project_calls(
     next_cursor: str | None = None
     if has_more and page:
         last = page[-1]
-        # ``ingested_at`` is NULL for some pre-OBS-1 rows where the
+        # ``ingested_at`` can be NULL for pre-OBS-1 rows where the
         # 0007 backfill couldn't find a parent ``runs.ingested_at``.
-        # We never emit a cursor with a NULL timestamp because the
-        # decoder would round-trip it as the string "None" and the
-        # SQL compare would silently misbehave.  In that edge case
-        # the operator paginates by one page and re-ingests the
-        # legacy run to fix the timestamp.
-        if last["ingested_at"] is not None:
-            next_cursor = _encode_cursor(last["ingested_at"], last["id"])
+        # The encoder accepts that and emits an id-only cursor; the
+        # WHERE clause above handles the NULL branch by ordering on
+        # ``id`` alone within the NULL partition.  Without this the
+        # stream silently terminated at the first legacy row.
+        next_cursor = _encode_cursor(last["ingested_at"], last["id"])
 
     return CallListResponse(calls=calls, next_cursor=next_cursor)
 
