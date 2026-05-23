@@ -14,10 +14,10 @@ import { listGoldenCandidates, unPromoteGolden } from "@/lib/api";
  * /golden/?project=customer-service — staged candidates list.
  *
  * Phase OBS-4.  Shows what's been promoted from the /calls/ stream
- * and lets the operator un-promote.  The actual export to JSONL
- * (writing the rows back to an on-disk dataset) is a future CLI
- * subcommand — this page is the audit trail of "what got promoted,
- * by whom, when".
+ * and lets the operator un-promote.  The export to JSONL (writing
+ * the rows back to an on-disk dataset) lives in the
+ * ``evalguard golden export`` CLI subcommand; this page surfaces a
+ * footer hint so the operator can copy-paste the right invocation.
  */
 export default function GoldenPage() {
   return (
@@ -170,6 +170,29 @@ function Body({ projectSlug }: { projectSlug: string }) {
           </table>
         )}
       </Card>
+
+      {candidates.length > 0 && (
+        <Card title="Export to JSONL">
+          <p className="text-sm text-[var(--color-fg-muted)]">
+            Materialise these candidates into a dataset file:
+          </p>
+          <pre
+            data-testid="golden-export-hint"
+            className="mt-2 overflow-x-auto rounded bg-[var(--color-bg-row)] px-3 py-2 font-mono text-xs"
+          >
+            evalguard golden export --project {projectSlug} --to datasets/golden.jsonl
+          </pre>
+          <p className="mt-2 text-xs text-[var(--color-fg-muted)]">
+            Use{" "}
+            <code className="rounded bg-[var(--color-bg-row)] px-1 py-0.5">--mode merge</code>{" "}
+            to append without overwriting existing rows.{" "}
+            <code className="rounded bg-[var(--color-bg-row)] px-1 py-0.5">EVALGUARD_SERVER</code>{" "}
+            and{" "}
+            <code className="rounded bg-[var(--color-bg-row)] px-1 py-0.5">EVALGUARD_API_TOKEN</code>{" "}
+            must be set in the shell.
+          </p>
+        </Card>
+      )}
     </div>
   );
 }
