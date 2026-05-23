@@ -5,8 +5,8 @@ from __future__ import annotations
 import typer
 
 from evalguard_cli.commands import (
-    assets_cmd, audit_cmd, comment_cmd, diff_cmd, init_cmd, push_cmd,
-    run_cmd, validate_cmd, view_cmd,
+    assets_cmd, audit_cmd, comment_cmd, diff_cmd, golden_cmd, init_cmd,
+    push_cmd, run_cmd, validate_cmd, view_cmd,
 )
 
 app = typer.Typer(
@@ -25,6 +25,7 @@ app.command("comment")(comment_cmd.comment)
 app.command("push")(push_cmd.push)
 app.add_typer(audit_cmd.audit_app, name="audit")
 app.add_typer(assets_cmd.assets_app, name="assets")
+app.add_typer(golden_cmd.golden_app, name="golden")
 
 
 if __name__ == "__main__":
