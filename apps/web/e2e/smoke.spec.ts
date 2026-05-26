@@ -210,6 +210,40 @@ test.beforeEach(async ({ context }) => {
       });
     }
 
+    // Project picker on the golden page.
+    if (path === "/v1/projects") {
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          projects: [{
+            project_id: "proj_e2e", org_id: "org_default",
+            slug: "demo", name: "demo", created_at: "2026-05-14T07:00:00",
+          }],
+        }),
+      });
+    }
+
+    // Golden candidates list with ?expand=row.
+    if (path === "/v1/projects/demo/golden/candidates") {
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          candidates: [{
+            id: 1, run_id: "run_e2e0000000001", row_id: "r-fail",
+            project_id: "proj_e2e", promoted_by: "key_e2e",
+            note: "needs review", created_at: "2026-05-14T07:05:00",
+            row_data: {
+              input: "Why was my order late?",
+              expected: "apologise + offer refund",
+              output: "I don't know.",
+            },
+          }],
+        }),
+      });
+    }
+
     // Fall through to a 404 so an un-mocked endpoint surfaces
     // clearly in the test output (rather than the test hanging
     // on a network call to a fake hostname).
@@ -295,4 +329,21 @@ test("settings → runs → run detail → assets → asset detail → calls →
   await expect(
     page.getByTestId("call-content-output"),
   ).toContainText("X is the value");
+
+  // 8. Golden DB view — pick the project, see the staged candidate,
+  // expand its inline preview, confirm the row content renders.
+  await page.goto("/golden/?project=demo");
+  const goldenRow = page.locator('[data-testid="golden-row"][data-row-id="r-fail"]');
+  await expect(goldenRow).toBeVisible();
+  // Expand the inline preview (no need to leave the page to see the
+  // curated content).
+  await goldenRow.getByTestId("golden-expand").click();
+  const expanded = page.locator('[data-testid="golden-row-expanded"]');
+  await expect(expanded).toBeVisible();
+  await expect(expanded).toContainText("Why was my order late?");      // input
+  await expect(expanded).toContainText("apologise + offer refund");    // expected
+  // The download-all button reflects the candidate count.
+  await expect(
+    page.getByTestId("golden-download-all"),
+  ).toContainText("Download JSONL (1)");
 });

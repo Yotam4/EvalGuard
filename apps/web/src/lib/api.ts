@@ -336,6 +336,16 @@ export const getCallDetail = (
 // in ``apps/api/evalguard_api/models.py``.
 
 
+/** The promoted row's content — present only when the list is
+ *  fetched with ``expand: "row"``; null otherwise or when the
+ *  parent run was deleted. */
+export interface GoldenRowData {
+  input?: unknown;
+  expected?: unknown;
+  output?: string | null;
+}
+
+
 export interface GoldenCandidate {
   id: number;
   run_id: string;
@@ -344,6 +354,7 @@ export interface GoldenCandidate {
   promoted_by: string;
   note: string | null;
   created_at: string;
+  row_data?: GoldenRowData | null;
 }
 
 
@@ -360,10 +371,11 @@ export const promoteToGolden = (body: {
 
 export const listGoldenCandidates = (
   projectSlug: string,
-  opts: { limit?: number } = {},
+  opts: { limit?: number; expand?: "row" } = {},
 ) => {
   const qs = new URLSearchParams();
   if (opts.limit) qs.set("limit", String(opts.limit));
+  if (opts.expand) qs.set("expand", opts.expand);
   const suffix = qs.toString() ? `?${qs.toString()}` : "";
   return request<{ candidates: GoldenCandidate[] }>(
     `/v1/projects/${encodeURIComponent(projectSlug)}/golden/candidates${suffix}`,
