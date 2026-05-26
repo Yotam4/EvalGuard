@@ -90,7 +90,15 @@ function Inner() {
         )}
       </div>
 
-      {project ? <Body projectSlug={project} /> : (
+      {project ? (
+        // ``key`` forces a full unmount/remount when the picker
+        // switches projects so ``Body``'s local state (selected ids,
+        // filter, sort, expanded row) resets cleanly.  Without it the
+        // stale ``selected`` set — holding auto-increment ids from the
+        // previous project — would target the WRONG rows on bulk
+        // remove.
+        <Body key={project} projectSlug={project} />
+      ) : (
         <Card>
           <p className="text-sm text-[var(--color-fg-muted)]">
             Pick a project to view its staged golden candidates.
@@ -112,16 +120,33 @@ function Body({ projectSlug }: { projectSlug: string }) {
     refetchOnWindowFocus: false,
   });
 
-  const del = useMutation({
-    mutationFn: (id: number) => unPromoteGolden(id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["golden-candidates", projectSlug] }),
-  });
-
   const [filter, setFilter]   = useState("");
   const [sortKey, setSortKey] = useState<SortKey>("when");
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [expandedId, setExpandedId] = useState<number | null>(null);
   const [copiedId, setCopiedId]     = useState<number | null>(null);
+  const [copyFailedId, setCopyFailedId] = useState<number | null>(null);
+  // Per-id in-flight tracking so one row's "remove" doesn't disable
+  // every other row's button.  Also drives bulk-remove error
+  // retention.
+  const [removingIds, setRemovingIds] = useState<Set<number>>(new Set());
+
+  const del = useMutation({
+    mutationFn: (id: number) => unPromoteGolden(id),
+  });
+
+  function removeOne(id: number) {
+    setRemovingIds((p) => new Set(p).add(id));
+    del.mutateAsync(id)
+      .then(() => {
+        setSelected((p) => { const n = new Set(p); n.delete(id); return n; });
+      })
+      .catch(() => { /* leave it selected so the user can retry */ })
+      .finally(() => {
+        setRemovingIds((p) => { const n = new Set(p); n.delete(id); return n; });
+        qc.invalidateQueries({ queryKey: ["golden-candidates", projectSlug] });
+      });
+  }
 
   const candidates = useMemo(
     () => filterAndSort(q.data?.candidates ?? [], filter, sortKey),
@@ -157,19 +182,32 @@ function Body({ projectSlug }: { projectSlug: string }) {
   function download(subset: GoldenCandidate[]) {
     const { jsonl, exportedCount } = composeJsonl(subset);
     if (exportedCount === 0) return;
-    triggerDownload(`${projectSlug}-golden.jsonl`, jsonl);
+    // Sanitise the slug for the filename even though slugs are
+    // server-constrained to ``[a-z0-9-]`` — the value comes off the
+    // URL query string, which a user can set to anything before the
+    // fetch resolves.
+    const safe = projectSlug.replace(/[^a-z0-9-]/gi, "_");
+    triggerDownload(`${safe}-golden.jsonl`, jsonl);
   }
 
   async function copyRow(c: GoldenCandidate) {
     const line = candidateToJsonlRow(c);
     if (line === null) return;
     try {
+      // ``navigator.clipboard`` is undefined in an insecure (http)
+      // context; guard so we surface a "copy failed" state instead
+      // of throwing.
+      if (!navigator.clipboard) throw new Error("clipboard unavailable");
       await navigator.clipboard.writeText(line);
+      setCopyFailedId((cur) => (cur === c.id ? null : cur));
       setCopiedId(c.id);
       setTimeout(() => setCopiedId((cur) => (cur === c.id ? null : cur)), 1500);
     } catch {
-      // Clipboard blocked (insecure context / permissions) — silent;
-      // the download button is the reliable fallback.
+      // Insecure context / permissions blocked — tell the user so
+      // they reach for the Download button instead of clicking copy
+      // into a void.
+      setCopyFailedId(c.id);
+      setTimeout(() => setCopyFailedId((cur) => (cur === c.id ? null : cur)), 2500);
     }
   }
 
@@ -209,8 +247,11 @@ function Body({ projectSlug }: { projectSlug: string }) {
               type="button"
               data-testid="golden-remove-selected"
               onClick={() => {
-                selectedCandidates.forEach((c) => del.mutate(c.id));
-                setSelected(new Set());
+                // ``removeOne`` removes each id from ``selected`` only
+                // on its own success — a failed delete (403 / 500)
+                // stays selected so the user can retry just the
+                // failures rather than losing the whole selection.
+                selectedCandidates.forEach((c) => removeOne(c.id));
               }}
               className="rounded border border-[var(--color-border)] px-3 py-1 text-xs text-[var(--color-fail)] hover:bg-[var(--color-bg-row)]"
             >
@@ -266,11 +307,12 @@ function Body({ projectSlug }: { projectSlug: string }) {
                   selected={selected.has(c.id)}
                   expanded={expandedId === c.id}
                   copied={copiedId === c.id}
-                  removing={del.isPending}
+                  copyFailed={copyFailedId === c.id}
+                  removing={removingIds.has(c.id)}
                   onToggleSelect={() => toggle(c.id)}
                   onToggleExpand={() => setExpandedId((cur) => (cur === c.id ? null : c.id))}
                   onCopy={() => copyRow(c)}
-                  onRemove={() => del.mutate(c.id)}
+                  onRemove={() => removeOne(c.id)}
                 />
               ))}
             </tbody>
@@ -298,7 +340,7 @@ function Body({ projectSlug }: { projectSlug: string }) {
 
 
 function RowGroup({
-  c, projectSlug, selected, expanded, copied, removing,
+  c, projectSlug, selected, expanded, copied, copyFailed, removing,
   onToggleSelect, onToggleExpand, onCopy, onRemove,
 }: {
   c: GoldenCandidate;
@@ -306,6 +348,7 @@ function RowGroup({
   selected: boolean;
   expanded: boolean;
   copied: boolean;
+  copyFailed: boolean;
   removing: boolean;
   onToggleSelect: () => void;
   onToggleExpand: () => void;
@@ -364,10 +407,19 @@ function RowGroup({
               data-testid="golden-copy"
               onClick={onCopy}
               disabled={!canCopy}
-              title={canCopy ? "Copy this row as JSON" : "No exportable content"}
-              className="rounded border border-[var(--color-border)] px-2 py-0.5 text-xs hover:bg-[var(--color-bg-row)] disabled:opacity-40"
+              title={
+                !canCopy ? "No exportable content"
+                : copyFailed ? "Clipboard blocked (try the Download button)"
+                : "Copy this row as JSON"
+              }
+              className={
+                "rounded border px-2 py-0.5 text-xs hover:bg-[var(--color-bg-row)] disabled:opacity-40 " +
+                (copyFailed
+                  ? "border-[var(--color-fail)] text-[var(--color-fail)]"
+                  : "border-[var(--color-border)]")
+              }
             >
-              {copied ? "✓ copied" : "copy"}
+              {copyFailed ? "copy failed" : copied ? "✓ copied" : "copy"}
             </button>
             <button
               type="button"
@@ -436,25 +488,59 @@ export function filterAndSort(
         const hay = [
           c.row_id, c.run_id, c.promoted_by, c.note ?? "",
           // Include the row content so "find the candidate about
-          // refunds" works even when the row_id is opaque.
-          typeof c.row_data?.input === "string" ? c.row_data.input : "",
-          typeof c.row_data?.output === "string" ? c.row_data.output : "",
+          // refunds" works even when the row_id is opaque.  Match
+          // the preview's rendering — ``stringifyForSearch`` covers
+          // structured (object / array) inputs too, not just plain
+          // strings, so a RAG row with ``input: {query: "refunds"}``
+          // is findable.
+          stringifyForSearch(c.row_data?.input),
+          stringifyForSearch(c.row_data?.expected),
+          stringifyForSearch(c.row_data?.output),
         ].join(" ").toLowerCase();
         return hay.includes(needle);
       })
     : candidates.slice();
 
+  // Stable, locale-independent sort.  ISO-8601 timestamps + ids are
+  // pure ASCII, so a plain lexical compare orders them correctly
+  // without ``localeCompare``'s browser-locale variance.  Every
+  // branch falls back to an id tiebreaker so equal primary keys
+  // keep a deterministic order (mirrors the server's
+  // ``ORDER BY ..., id DESC``).
   matched.sort((a, b) => {
     switch (sortKey) {
-      case "reviewer": return a.promoted_by.localeCompare(b.promoted_by);
-      case "row":      return a.row_id.localeCompare(b.row_id);
+      case "reviewer":
+        return cmp(a.promoted_by, b.promoted_by) || (a.id - b.id);
+      case "row":
+        return cmp(a.row_id, b.row_id) || (a.id - b.id);
       case "when":
       default:
-        // Newest-first (descending created_at).
-        return b.created_at.localeCompare(a.created_at);
+        // Newest-first: descending created_at, then descending id.
+        return cmp(b.created_at, a.created_at) || (b.id - a.id);
     }
   });
   return matched;
+}
+
+
+/** Lexical (ASCII) string compare — locale-independent, unlike
+ *  ``String.prototype.localeCompare``. */
+function cmp(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+
+/** Stringify any value for the search haystack — strings pass
+ *  through, structured values JSON-stringify (matching what
+ *  ``GoldenRowPreview`` renders), null/undefined → "". */
+function stringifyForSearch(value: unknown): string {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return "";
+  }
 }
 
 

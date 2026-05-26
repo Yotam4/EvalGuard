@@ -266,47 +266,60 @@ def _expand_row_content(
     candidates,
 ) -> dict[tuple[str, str], GoldenRowData]:
     """Load the input / expected / output for each ``(run_id, row_id)``
-    candidate by parsing the parent run's ``payload_json`` once per
-    distinct run (not once per candidate).  A run that was deleted
-    via CASCADE between promote and list simply has no entry — the
-    caller leaves ``row_data`` as ``None``.
+    candidate by parsing the parent run's ``payload_json``.  A run
+    that was deleted out-of-band simply has no entry — the caller
+    leaves ``row_data`` as ``None``.
+
+    Memory discipline: ``payload_json`` is the FULL run blob (can be
+    tens of MB for a 10k-row run).  We fetch + parse + discard ONE
+    run's payload at a time so peak memory is bounded by the single
+    largest run, not by ``sum(payloads)`` across every distinct run
+    the candidate set references.  At the 500-candidate cap a naive
+    ``WHERE run_id IN (...)`` + ``fetchall()`` could otherwise pull
+    hundreds of multi-MB blobs into memory simultaneously.
+
+    A future optimisation is to denormalise input/expected/output
+    onto ``run_rows`` at ingest (the way ``output_preview`` already
+    is) so this never touches ``payload_json`` — tracked separately;
+    that needs a migration + ingest change.
     """
-    run_ids = sorted({c["run_id"] for c in candidates})
-    if not run_ids:
-        return {}
-
-    # Bind each run_id individually — never f-string user values.
-    keys = [f"r{i}" for i in range(len(run_ids))]
-    placeholders = ", ".join(f":{k}" for k in keys)
-    params = dict(zip(keys, run_ids))
-    payload_rows = conn.execute(
-        text(f"SELECT run_id, payload_json FROM runs "
-             f"WHERE run_id IN ({placeholders})"),
-        params,
-    ).mappings().fetchall()
-
     # Which row_ids do we actually need per run?  Avoids building
     # GoldenRowData for every row in a 50k-row run.
     wanted: dict[str, set[str]] = {}
     for c in candidates:
         wanted.setdefault(c["run_id"], set()).add(c["row_id"])
+    if not wanted:
+        return {}
 
     out: dict[tuple[str, str], GoldenRowData] = {}
-    for pr in payload_rows:
+    # Iterate distinct runs deterministically; one PK-indexed lookup
+    # per run, payload discarded before the next iteration.
+    for run_id in sorted(wanted):
+        need = wanted[run_id]
+        row = conn.execute(
+            text("SELECT payload_json FROM runs WHERE run_id = :run_id"),
+            {"run_id": run_id},
+        ).mappings().fetchone()
+        if row is None:
+            continue   # orphaned candidate — leave row_data None.
         try:
-            payload = json.loads(pr["payload_json"])
+            payload = json.loads(row["payload_json"])
         except (TypeError, ValueError):
             continue
-        need = wanted.get(pr["run_id"], set())
+        remaining = set(need)
         for trial in payload.get("trials") or []:
             for r in trial.get("rows") or []:
                 rid = r.get("row_id")
-                if rid in need:
-                    out[(pr["run_id"], rid)] = GoldenRowData(
+                if rid in remaining:
+                    out[(run_id, rid)] = GoldenRowData(
                         input=r.get("input"),
                         expected=r.get("expected"),
                         output=r.get("output"),
                     )
+                    remaining.discard(rid)
+            if not remaining:
+                break   # found every wanted row in this run.
+        # ``payload`` goes out of scope at the next loop iteration.
     return out
 
 

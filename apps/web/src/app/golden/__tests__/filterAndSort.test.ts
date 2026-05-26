@@ -57,6 +57,31 @@ describe("filterAndSort", () => {
     expect(filterAndSort(data, "  REFUND  ", "when").map((c) => c.id)).toEqual([1]);
   });
 
+  it("filters across STRUCTURED (object) input content", () => {
+    // A RAG-style row whose input is an object must still be
+    // findable by a term inside the object — the search stringifies
+    // it the same way the preview renders it.
+    const structured = [
+      cand({ id: 9, row_id: "rag-1",
+             row_data: { input: { query: "refund policy", contexts: ["doc-a"] } } }),
+      cand({ id: 10, row_id: "rag-2",
+             row_data: { input: { query: "shipping eta" } } }),
+    ];
+    expect(filterAndSort(structured, "refund policy", "when").map((c) => c.id)).toEqual([9]);
+    expect(filterAndSort(structured, "doc-a", "when").map((c) => c.id)).toEqual([9]);
+  });
+
+  it("breaks created_at ties deterministically by id (desc)", () => {
+    const sameTime = [
+      cand({ id: 1, created_at: "2026-05-21T07:00:00" }),
+      cand({ id: 3, created_at: "2026-05-21T07:00:00" }),
+      cand({ id: 2, created_at: "2026-05-21T07:00:00" }),
+    ];
+    // Equal timestamps → newest id first (3, 2, 1), mirroring the
+    // server's ``ORDER BY created_at DESC, id DESC``.
+    expect(filterAndSort(sameTime, "", "when").map((c) => c.id)).toEqual([3, 2, 1]);
+  });
+
   it("returns a copy — never mutates the input array order", () => {
     const original = [...data];
     filterAndSort(data, "", "row");

@@ -388,6 +388,11 @@ def test_list_expand_row_attaches_content(client, auth_headers, tmp_path):
         # The mock echo provider sets output = input; input is the
         # dataset's ``q0`` / ``q1``.
         assert c["row_data"]["input"] in ("q0", "q1")
+        # ``output`` is also attached (echo provider ⇒ equals input).
+        assert c["row_data"]["output"] == c["row_data"]["input"]
+        # ``expected`` key is present even when the dataset row
+        # didn't carry one (null) — the shape is stable.
+        assert "expected" in c["row_data"]
 
 
 def test_list_without_expand_omits_row_data(client, auth_headers, tmp_path):

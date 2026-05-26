@@ -346,4 +346,13 @@ test("settings → runs → run detail → assets → asset detail → calls →
   await expect(
     page.getByTestId("golden-download-all"),
   ).toContainText("Download JSONL (1)");
+
+  // Clicking Download actually produces a JSONL file (not just
+  // shows the count).  Assert the browser download event fires with
+  // the sanitised ``<slug>-golden.jsonl`` filename.
+  const [download] = await Promise.all([
+    page.waitForEvent("download"),
+    page.getByTestId("golden-download-all").click(),
+  ]);
+  expect(download.suggestedFilename()).toBe("demo-golden.jsonl");
 });
