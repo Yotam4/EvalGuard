@@ -335,6 +335,21 @@ class GoldenCandidateIngest(_Strict):
     note:   str | None = Field(default=None, max_length=4_000)
 
 
+class GoldenRowData(_Strict):
+    """The promoted row's content, attached to a ``GoldenCandidate``
+    only when the list endpoint is called with ``?expand=row``.
+
+    ``output`` is the full output (not a preview) so the UI can
+    render the candidate inline and the browser can compose a JSONL
+    export without a second fetch.  ``None`` for any field the
+    source row didn't carry (OTLP-derived rows often lack
+    ``expected``)."""
+
+    input:    Any = None
+    expected: Any = None
+    output:   str | None = None
+
+
 class GoldenCandidate(_Strict):
     """One staged golden candidate.  Returned by POST + GET."""
 
@@ -345,6 +360,11 @@ class GoldenCandidate(_Strict):
     promoted_by: str
     note:        str | None
     created_at:  str
+    # Populated only when the list endpoint is queried with
+    # ``?expand=row``.  ``None`` when not expanded OR when the
+    # parent run was deleted (CASCADE) between promote and list —
+    # the UI renders "row content unavailable" in that case.
+    row_data:    GoldenRowData | None = None
 
 
 class GoldenCandidateList(_Strict):

@@ -358,3 +358,102 @@ def test_list_admin_sees_other_org_candidates(
     )
     assert r.status_code == 200, r.text
     assert len(r.json()["candidates"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# ?expand=row  (golden DB view)
+
+
+def test_list_expand_row_attaches_content(client, auth_headers, tmp_path):
+    """``?expand=row`` attaches each candidate's input/expected/output
+    so the UI can render the curated row inline + compose a JSONL
+    download without an N+1 fan-out."""
+    payload = _produce_run(tmp_path, project="gold-expand", rows=2)
+    _post_run(client, auth_headers, payload)
+    for rid in ("r0", "r1"):
+        client.post(
+            "/v1/golden/candidates",
+            json={"run_id": payload["run_id"], "row_id": rid},
+            headers=auth_headers,
+        )
+    r = client.get(
+        "/v1/projects/gold-expand/golden/candidates?expand=row",
+        headers=auth_headers,
+    )
+    assert r.status_code == 200, r.text
+    cands = r.json()["candidates"]
+    assert len(cands) == 2
+    for c in cands:
+        assert c["row_data"] is not None, c
+        # The mock echo provider sets output = input; input is the
+        # dataset's ``q0`` / ``q1``.
+        assert c["row_data"]["input"] in ("q0", "q1")
+
+
+def test_list_without_expand_omits_row_data(client, auth_headers, tmp_path):
+    """Default (no ``?expand``) keeps the lightweight metadata shape —
+    ``row_data`` is null so a metadata-only consumer pays nothing
+    for the payload parse."""
+    payload = _produce_run(tmp_path, project="gold-noexpand", rows=1)
+    _post_run(client, auth_headers, payload)
+    client.post(
+        "/v1/golden/candidates",
+        json={"run_id": payload["run_id"], "row_id": "r0"},
+        headers=auth_headers,
+    )
+    r = client.get(
+        "/v1/projects/gold-noexpand/golden/candidates",
+        headers=auth_headers,
+    )
+    assert r.status_code == 200
+    assert r.json()["candidates"][0]["row_data"] is None
+
+
+def test_list_expand_unknown_value_returns_400(client, auth_headers, tmp_path):
+    payload = _produce_run(tmp_path, project="gold-badexpand", rows=1)
+    _post_run(client, auth_headers, payload)
+    r = client.get(
+        "/v1/projects/gold-badexpand/golden/candidates?expand=nonsense",
+        headers=auth_headers,
+    )
+    assert r.status_code == 400
+    assert "expand" in r.json()["detail"].lower()
+
+
+def test_list_expand_row_orphaned_candidate_gets_null_row_data(
+    client, auth_headers, tmp_path,
+):
+    """An ``?expand=row`` lookup must tolerate a candidate whose
+    parent run no longer exists — ``row_data`` comes back null
+    rather than 500.  We orphan the candidate by deleting the run
+    via a raw connection that doesn't enforce the CASCADE (the
+    app's pooled connections set ``PRAGMA foreign_keys=ON``; this
+    raw one doesn't), which is the state an out-of-band cleanup or
+    a backup-restore mismatch could leave behind."""
+    payload = _produce_run(tmp_path, project="gold-orphan", rows=1)
+    _post_run(client, auth_headers, payload)
+    client.post(
+        "/v1/golden/candidates",
+        json={"run_id": payload["run_id"], "row_id": "r0"},
+        headers=auth_headers,
+    )
+    import sqlite3
+    settings = client.app.state.settings
+    raw = sqlite3.connect(settings.sqlite_path)
+    try:
+        # No ``PRAGMA foreign_keys=ON`` here, so the candidate row
+        # survives the run deletion — orphaned.
+        raw.execute("DELETE FROM runs WHERE run_id = ?", (payload["run_id"],))
+        raw.commit()
+    finally:
+        raw.close()
+    r = client.get(
+        "/v1/projects/gold-orphan/golden/candidates?expand=row",
+        headers=auth_headers,
+    )
+    assert r.status_code == 200, r.text
+    cands = r.json()["candidates"]
+    assert len(cands) == 1
+    # The parent run's payload is gone, so the expand lookup found
+    # nothing — row_data is null, not a crash.
+    assert cands[0]["row_data"] is None

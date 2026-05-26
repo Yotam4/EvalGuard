@@ -24,6 +24,8 @@ single 404 with a uniform detail.
 
 from __future__ import annotations
 
+import json
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
@@ -34,6 +36,7 @@ from evalguard_api.db import get_project_by_slug, now_iso
 from evalguard_api.deps import get_conn
 from evalguard_api.models import (
     GoldenCandidate, GoldenCandidateIngest, GoldenCandidateList,
+    GoldenRowData,
 )
 
 
@@ -196,11 +199,28 @@ def promote(
 def list_for_project(
     project_slug: str,
     limit: int = Query(default=100, ge=1, le=500),
+    expand: str | None = Query(default=None,
+        description="``row`` attaches each candidate's input / expected / "
+                    "output content (one extra payload parse per distinct "
+                    "run).  Omit for the lightweight metadata-only list."),
     conn:      Connection = Depends(get_conn),
     principal: Principal  = Depends(require_principal),
 ) -> GoldenCandidateList:
     """List the project's staged candidates, newest-first.  Same
-    project-visibility gate as ``GET /v1/projects/{slug}/calls``."""
+    project-visibility gate as ``GET /v1/projects/{slug}/calls``.
+
+    With ``?expand=row`` each candidate carries a ``row_data`` block
+    (input / expected / output) so the UI can render the curated
+    rows inline and compose a JSONL download without an N+1 fan-out
+    of its own.  The expansion is bounded by the ``limit`` cap and
+    de-duplicates payload parses across candidates that share a run.
+    """
+    if expand is not None and expand != "row":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unknown expand {expand!r}. Allowed: 'row'.",
+        )
+
     project = get_project_by_slug(
         conn, org_id=principal.org_id, slug=project_slug,
     )
@@ -225,9 +245,69 @@ def list_for_project(
                 LIMIT :limit"""),
         {"project_id": project["project_id"], "limit": limit},
     ).mappings().fetchall()
+
+    row_data_by_key: dict[tuple[str, str], GoldenRowData] = {}
+    if expand == "row" and rows:
+        row_data_by_key = _expand_row_content(conn, rows)
+
     return GoldenCandidateList(
-        candidates=[GoldenCandidate(**dict(r)) for r in rows],
+        candidates=[
+            GoldenCandidate(
+                **dict(r),
+                row_data=row_data_by_key.get((r["run_id"], r["row_id"])),
+            )
+            for r in rows
+        ],
     )
+
+
+def _expand_row_content(
+    conn: Connection,
+    candidates,
+) -> dict[tuple[str, str], GoldenRowData]:
+    """Load the input / expected / output for each ``(run_id, row_id)``
+    candidate by parsing the parent run's ``payload_json`` once per
+    distinct run (not once per candidate).  A run that was deleted
+    via CASCADE between promote and list simply has no entry — the
+    caller leaves ``row_data`` as ``None``.
+    """
+    run_ids = sorted({c["run_id"] for c in candidates})
+    if not run_ids:
+        return {}
+
+    # Bind each run_id individually — never f-string user values.
+    keys = [f"r{i}" for i in range(len(run_ids))]
+    placeholders = ", ".join(f":{k}" for k in keys)
+    params = dict(zip(keys, run_ids))
+    payload_rows = conn.execute(
+        text(f"SELECT run_id, payload_json FROM runs "
+             f"WHERE run_id IN ({placeholders})"),
+        params,
+    ).mappings().fetchall()
+
+    # Which row_ids do we actually need per run?  Avoids building
+    # GoldenRowData for every row in a 50k-row run.
+    wanted: dict[str, set[str]] = {}
+    for c in candidates:
+        wanted.setdefault(c["run_id"], set()).add(c["row_id"])
+
+    out: dict[tuple[str, str], GoldenRowData] = {}
+    for pr in payload_rows:
+        try:
+            payload = json.loads(pr["payload_json"])
+        except (TypeError, ValueError):
+            continue
+        need = wanted.get(pr["run_id"], set())
+        for trial in payload.get("trials") or []:
+            for r in trial.get("rows") or []:
+                rid = r.get("row_id")
+                if rid in need:
+                    out[(pr["run_id"], rid)] = GoldenRowData(
+                        input=r.get("input"),
+                        expected=r.get("expected"),
+                        output=r.get("output"),
+                    )
+    return out
 
 
 # ---------------------------------------------------------------------------
