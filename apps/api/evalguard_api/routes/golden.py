@@ -226,7 +226,11 @@ def list_for_project(
     )
     if project is None and principal.is_admin:
         row = conn.execute(
-            text("SELECT * FROM projects WHERE slug = :slug LIMIT 1"),
+            # Deterministic admin-fallback pick when a slug is shared
+            # across orgs (slugs are unique per-org, not globally) —
+            # see the same note in ``routes/calls.py``.
+            text("SELECT * FROM projects WHERE slug = :slug "
+                 "ORDER BY created_at, project_id LIMIT 1"),
             {"slug": project_slug},
         ).mappings().fetchone()
         project = dict(row) if row else None

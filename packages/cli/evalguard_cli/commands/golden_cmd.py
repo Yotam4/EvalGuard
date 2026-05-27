@@ -297,9 +297,20 @@ def export(
         )
         try:
             row = _get(detail_url, token_v)
-        except typer.Exit:
-            # A 404 on one row (e.g., its parent run was deleted)
-            # shouldn't abort the whole export.  Count and continue.
+        except typer.Exit as e:
+            # A per-row 404 / 5xx / network blip (exit 1) shouldn't
+            # abort the whole export — count and continue so one
+            # deleted run doesn't lose 499 good rows.  But an auth
+            # failure (exit 2) means the token is broken for the
+            # detail endpoint; every remaining fetch will fail the
+            # same way, so abort loudly instead of silently masking
+            # it as N "fetch-failures".
+            if e.exit_code == 2:
+                _stderr.print(
+                    "[red]Aborting export[/red] — authentication failed on "
+                    "the per-call detail fetch.  Check the token's scope."
+                )
+                raise
             fetch_failures += 1
             continue
         if row.get("input") is None:

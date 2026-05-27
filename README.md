@@ -322,19 +322,50 @@ separate from the MIT-licensed CLI.
   to the most-recent run that produced each version. Runs list
   now polls every 10s via React Query's `refetchInterval` so
   freshly-pushed runs surface without a manual refresh.
+- **Phase 2.6d (asset detail + e2e)** — `GET /v1/assets/{kind}/{asset_id}/versions`
+  + an `/assets/detail/` page showing every `(version_id, run_id,
+  ingested_at)` for one asset; Playwright e2e harness
+  (`apps/web/e2e/`) + `web-e2e` CI workflow. `evalguard assets
+  versions` CLI wraps the endpoint.
+- **Phase 1.5 (`evalguard/action@v1`)** — the Docker action gains
+  `server` / `token` / `push` / `fail_on` inputs (push the run to a
+  server + gate the workflow on `gate_status`) and `gate_status` /
+  `cost_usd` / `url` outputs. Structured access log fixed to emit
+  under `python -m uvicorn` (SOC 2 audit trail).
+- **Phase 3a (OTLP ingest)** — `POST /v1/otlp/v1/traces` synthesizes
+  runs from OpenTelemetry GenAI spans; `runs.source` = `cli` | `otlp`
+  with a `?source=` filter on `GET /v1/runs` + a UI tab.
+- **Phase 3b (drift detection)** — `GET /v1/runs/{id}/drift?vs=…`
+  runs Welch's t-test across two runs' per-row latency / cost /
+  pass-rate; a drift card on the run-detail page renders the
+  per-metric verdict.
+- **Phase 3c (online sampler)** — `EVALGUARD_OTLP_SAMPLE_RATE`
+  head-based deterministic sampling on OTLP ingest (load-shedding
+  at the API edge; trace-stable, no outbound calls).
+- **Phase 4 (human review queue)** — `row_reviews` table + queue /
+  submit / list endpoints; a `/reviews` page where a reviewer works
+  the failing rows of a run and records `agree` / `override_pass` /
+  `override_fail` / `skip` verdicts (cross-annotator-ready).
+- **Phase OBS (per-call observability + golden DB)** — per-project
+  call stream `GET /v1/projects/{slug}/calls` (cursor-paginated,
+  Recent / Failures tabs) + per-call detail; a virtualized `/calls/`
+  page with a drill-down panel; **promote-to-golden** staging
+  (`golden_candidates` table, `POST /v1/golden/candidates`) and a
+  `/golden/` database view (inline preview, search, sort, bulk
+  select, in-browser JSONL download) + the `evalguard golden`
+  CLI bridge. See [`docs/golden-dataset.md`](docs/golden-dataset.md).
 
 ## Coming next
 
 | Phase | Deliverable |
 |---|---|
-| 1.5 | Published `evalguard/action@v1`; baseline registry polish |
-| 2.6d | Asset detail page (versions over time + runs that used each); Playwright e2e |
-| 3 | OTLP / `gen_ai.*` ingest; online sampler; drift detection |
-| 4 | Argilla-style human review queue; κ tracking; promote-to-golden flow |
+| PROXY | `POST /v1/projects/{slug}/invoke` — EvalGuard as the production LLM gateway (server-side project config + record-as-you-go) |
 | 5 | Enterprise tier (SSO / SCIM / audit / dedicated) under ELv2 in `apps/api/ee/` |
+| charts | Project trends (pass-rate / cost / latency over time) via a charting lib |
 
 The roadmap above summarizes the public milestones; implementation
 details live alongside the shipped packages and tests in this repo.
+Feature-level docs live under [`docs/`](docs/).
 
 ## CLI
 
@@ -351,6 +382,9 @@ details live alongside the shipped packages and tests in this repo.
 | `evalguard view <run_id> --trial T` | Per-trial drill-down |
 | `evalguard view <run_id> --row R [--layer N]` | Per-row drill-down |
 | `evalguard view <run_id> --json [--scores] [--events]` | Stable JSON contract |
+| `evalguard assets versions <kind> <asset_id> --project-id P` | List every `(version, run, ingested)` for one asset on a server |
+| `evalguard golden list --project P` | List server-side golden-candidate promotions |
+| `evalguard golden export --project P --to f.jsonl [--mode merge]` | Materialise promoted candidates into a JSONL dataset |
 | `evalguard audit show <run_id> [--kind K]` | Render the audit timeline |
 | `evalguard audit verify <run_id>` | Walk the per-run hash chain (exit 2 on tamper) |
 | `evalguard audit export <run_id> -f jsonl\|prov-json\|otel-json` | Export for archival / OTel collector |

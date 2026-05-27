@@ -466,3 +466,37 @@ def test_export_jsonl_lines_are_stable_under_sort_keys(tmp_path: Path):
     parsed_line_obj = json.loads(raw)
     expected_key_order = ["_provenance", "expected", "id", "input"]
     assert list(parsed_line_obj.keys()) == expected_key_order
+
+
+def test_export_aborts_on_per_row_auth_failure(tmp_path: Path):
+    """A 401 on a per-row detail fetch means the token is broken for
+    the detail endpoint — every remaining fetch would fail the same
+    way.  The export must abort with exit 2, NOT silently count
+    each as a generic 'fetch-failure' (which would produce a
+    partial file + a misleading summary)."""
+    captured: dict = {}
+    candidates = [
+        {"id": 1, "run_id": "run_a", "row_id": "r-1",
+         "project_id": "proj", "promoted_by": "key_a",
+         "note": None, "created_at": "2026-05-21T07:30:00"},
+    ]
+    routes = {
+        "/v1/projects/demo/golden/candidates": (200, _list_body(candidates)),
+        # The detail fetch 401s.
+        "/v1/projects/demo/calls/run_a/r-1":
+            (401, b'{"detail":"Invalid or revoked API key."}'),
+    }
+    port, stop = _stub_server(_make_routing_handler(routes, captured))
+    out = tmp_path / "golden.jsonl"
+    try:
+        result = _golden(
+            "export", "--project", "demo", "--to", str(out),
+            "--server", f"http://127.0.0.1:{port}",
+            cwd=tmp_path,
+        )
+    finally:
+        stop()
+    assert result.returncode == 2, (result.stdout, result.stderr)
+    assert "authentication failed" in (result.stdout + result.stderr).lower()
+    # No partial file written.
+    assert not out.exists() or out.read_text() == ""

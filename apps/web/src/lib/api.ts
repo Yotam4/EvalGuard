@@ -323,12 +323,20 @@ export const listProjectCalls = (
 
 export const getCallDetail = (
   projectSlug: string, runId: string, rowId: string,
-) =>
-  request<CallDetail>(
+  opts: { trialId?: string | null } = {},
+) => {
+  // ``trial_id`` disambiguates a row_id shared across trials in a
+  // multi-trial comparison run — without it the server returns the
+  // first trial's answer for that row.
+  const qs = opts.trialId
+    ? `?trial_id=${encodeURIComponent(opts.trialId)}`
+    : "";
+  return request<CallDetail>(
     `/v1/projects/${encodeURIComponent(projectSlug)}`
     + `/calls/${encodeURIComponent(runId)}`
-    + `/${encodeURIComponent(rowId)}`,
+    + `/${encodeURIComponent(rowId)}${qs}`,
   );
+};
 
 
 // ---------------------------------------------------------------------------

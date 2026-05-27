@@ -591,3 +591,96 @@ def test_source_filter_case_insensitive(client, auth_headers, tmp_path):
         assert r.status_code == 200, (variant, r.text)
         body = r.json()
         assert len(body["calls"]) >= 1, (variant, body)
+
+
+def _synth_two_trial_run(run_id: str, project: str) -> dict:
+    """A multi-trial comparison run: the SAME ``row_id`` ("shared")
+    evaluated under two providers, each producing a distinct output.
+    Exercises the call-detail ``?trial_id=`` disambiguation."""
+    trials = []
+    for tag, out in (("a", "answer from provider A"), ("b", "answer from provider B")):
+        trials.append({
+            "trial_id":       f"trial_{tag}{'x' * 8}",
+            "provider_id":    f"mock:{tag}",
+            "provider":       "mock",
+            "model":          tag,
+            "row_count":      1,
+            "row_pass_count": 1,
+            "row_fail_count": 0,
+            "rows": [{
+                "row_id":   "shared",
+                "passed":   True,
+                "n_scores": 1,
+                "latency_ms": 100,
+                "cost_usd": 0.001,
+                "input":    "what is the capital of France?",
+                "output":   out,
+            }],
+            "gates": [],
+        })
+    return {
+        "schema_version": "1.0.0",
+        "run_id":  run_id,
+        "project": project,
+        "row_count": 2, "row_pass_count": 2, "row_fail_count": 0,
+        "trials": trials,
+    }
+
+
+def test_call_detail_disambiguates_by_trial_id(client, auth_headers, tmp_path):
+    """A row_id shared across two trials must resolve to the trial
+    the caller names via ``?trial_id=`` — not always trials[0]."""
+    payload = _synth_two_trial_run("run_multitrialx", "multi-trial")
+    _post(client, auth_headers, payload)
+    slug = _project_slug_from_listing(client, auth_headers, "multi-trial")
+
+    # Without trial_id: first match (trial A).
+    r0 = client.get(
+        f"/v1/projects/{slug}/calls/run_multitrialx/shared",
+        headers=auth_headers,
+    )
+    assert r0.status_code == 200, r0.text
+    assert r0.json()["output"] == "answer from provider A"
+
+    # Explicit trial B → provider B's output.
+    rb = client.get(
+        f"/v1/projects/{slug}/calls/run_multitrialx/shared?trial_id=trial_bxxxxxxxx",
+        headers=auth_headers,
+    )
+    assert rb.status_code == 200, rb.text
+    assert rb.json()["output"] == "answer from provider B"
+
+    # Explicit trial A → provider A's output.
+    ra = client.get(
+        f"/v1/projects/{slug}/calls/run_multitrialx/shared?trial_id=trial_axxxxxxxx",
+        headers=auth_headers,
+    )
+    assert ra.status_code == 200
+    assert ra.json()["output"] == "answer from provider A"
+
+    # Unknown trial_id → 404 (the row isn't in that trial).
+    rn = client.get(
+        f"/v1/projects/{slug}/calls/run_multitrialx/shared?trial_id=trial_nope0000",
+        headers=auth_headers,
+    )
+    assert rn.status_code == 404
+
+
+def test_run_rows_ingested_at_is_never_null_after_ingest(client, auth_headers, tmp_path):
+    """Invariant pin: ``_persist_run`` stamps ``run_rows.ingested_at``
+    on every row, so the calls cursor never has to deal with NULL
+    timestamps in practice (the cross-DB NULL-ordering trap is thus
+    unreachable through the ingest path).  A regression that dropped
+    the stamp would surface here."""
+    import sqlite3
+    payload = _synth_run_with_outcomes("run_ingstamp01", "ing-stamp", [True, False, True])
+    _post(client, auth_headers, payload)
+    db = client.app.state.settings.sqlite_path
+    raw = sqlite3.connect(db)
+    try:
+        nulls = raw.execute(
+            "SELECT COUNT(*) FROM run_rows WHERE ingested_at IS NULL",
+        ).fetchone()[0]
+    finally:
+        raw.close()
+    assert nulls == 0
