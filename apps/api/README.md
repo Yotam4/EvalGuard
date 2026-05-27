@@ -45,12 +45,29 @@ curl -s -H "Authorization: Bearer $EVALGUARD_API_KEY" \
 | `POST` | `/v1/projects`       | Member. `?org_id=` admin-only override. 409 on duplicate slug *within same org*. |
 | `GET`  | `/v1/projects`       | Member. Scoped to caller's org by default. |
 | `GET`  | `/v1/projects/{slug}` | Member. 404 (not 403) on cross-org probe. |
-| `POST` | `/v1/runs`           | Member. Ingest under caller's org. 201 + `Location`; 409 on duplicate `run_id`. |
-| `GET`  | `/v1/runs`           | Member. Scoped to caller's org. Query: `project=<slug>&limit=20`. |
+| `POST` | `/v1/runs`           | Member. Ingest under caller's org. 201 + `Location`; 409 on duplicate `run_id` (or 200 + `idempotent_replay` with an `Idempotency-Key`). |
+| `GET`  | `/v1/runs`           | Member. Scoped to caller's org. Query: `project=<slug>&source=cli\|otlp&limit=20`. |
 | `GET`  | `/v1/runs/{run_id}`  | Member. 404 on cross-org access (no info leak). |
+| `GET`  | `/v1/runs/{run_id}/drift` | Member. Welch's t-test vs another run. Query: `vs=<run_id>&alpha=0.05`. 400 if `run_id==vs`; 404 if either is missing/cross-org. |
+| `GET`  | `/v1/runs/{run_id}/reviews` | Member. Every reviewer's verdict on the run. |
+| `POST` | `/v1/otlp/v1/traces` | Member. OTLP/HTTP JSON ingest of GenAI spans → synthetic runs (`source=otlp`). Head-sampled by `EVALGUARD_OTLP_SAMPLE_RATE`. Returns `{partialSuccess:{}, evalguard:{accepted_runs, kept_spans, dropped_spans}}`. |
 | `GET`  | `/v1/assets`         | Member. Cross-run aggregation by `(kind, asset_id)`. Query: `kind=prompt\|dataset\|judge\|heuristic\|metric\|schema\|rubric&project=<slug>&limit=100`. |
+| `GET`  | `/v1/assets/{kind}/{asset_id}/versions` | Member. Every `(version_id, run_id, ingested_at)` for one asset. Query: `project_id=<id>` (required) `&limit=200`. 400 unknown kind; 404 missing/cross-org. |
+| `GET`  | `/v1/reviews/queue`  | Member. Rows of a run that failed + the caller hasn't reviewed. Query: `run_id=<id>&limit=50`. |
+| `POST` | `/v1/reviews`        | Member. Submit `{run_id, row_id, verdict, note?}`; verdict ∈ `agree\|override_pass\|override_fail\|skip`. UPSERT per reviewer. |
+| `GET`  | `/v1/projects/{slug}/calls` | Member. Cursor-paginated call stream. Query: `tab=recent\|failures&cursor=&limit=50&source=`. |
+| `GET`  | `/v1/projects/{slug}/calls/{run_id}/{row_id}` | Member. One call's full input/expected/output/scores/gates. |
+| `POST` | `/v1/golden/candidates` | Member. Promote `{run_id, row_id, note?}` to the golden staging table. Idempotent per reviewer. |
+| `GET`  | `/v1/projects/{slug}/golden/candidates` | Member. Staged candidates. Query: `limit=100&expand=row` (`expand=row` attaches input/expected/output). |
+| `DELETE` | `/v1/golden/candidates/{id}` | Original promoter or admin. 403 for others; 404 unknown. |
 | `GET`  | `/openapi.json`      | OpenAPI 3 spec (auto-generated). |
 | `GET`  | `/docs`              | Swagger UI. |
+
+The endpoint table is the human summary; `/openapi.json` is the
+authoritative generated contract. Feature-level docs:
+[`docs/observability.md`](../../docs/observability.md) (calls / OTLP /
+drift) and [`docs/golden-dataset.md`](../../docs/golden-dataset.md)
+(promote + export).
 
 ## Configuration
 
