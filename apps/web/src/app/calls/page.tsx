@@ -54,11 +54,20 @@ function Inner() {
   const source: RunSource | undefined =
     sourceParam === "cli" || sourceParam === "otlp" ? sourceParam : undefined;
   const selected = params.get("call");  // "run_id:row_id" or null
+  const selectedTrial = params.get("trial");  // trial_id or null
 
   function setParam(name: string, value: string | null) {
+    setParams({ [name]: value });
+  }
+  // Batch setter so selecting a call can update ``call`` + ``trial``
+  // in one ``router.replace`` (two sequential ``setParam`` calls
+  // would race on the stale ``params`` snapshot, dropping one).
+  function setParams(updates: Record<string, string | null>) {
     const qs = new URLSearchParams(params);
-    if (value === null || value === "") qs.delete(name);
-    else qs.set(name, value);
+    for (const [name, value] of Object.entries(updates)) {
+      if (value === null || value === "") qs.delete(name);
+      else qs.set(name, value);
+    }
     router.replace(`/calls/?${qs.toString()}`);
   }
 
@@ -81,12 +90,18 @@ function Inner() {
           tab={tab}
           source={source}
           selected={selected}
-          onSelect={(call) => setParam("call", `${call.run_id}:${call.row_id}`)}
+          onSelect={(call) => setParams({
+            call:  `${call.run_id}:${call.row_id}`,
+            // Carry the trial so the detail panel disambiguates a
+            // row_id shared across trials in a multi-trial run.
+            trial: call.trial_id ?? null,
+          })}
         />
         <DetailSlot
           project={project}
           selected={selected}
-          onClose={() => setParam("call", null)}
+          selectedTrial={selectedTrial}
+          onClose={() => setParams({ call: null, trial: null })}
         />
       </div>
     </div>
@@ -320,10 +335,11 @@ function CallsList({
 
 
 function DetailSlot({
-  project, selected, onClose,
+  project, selected, selectedTrial, onClose,
 }: {
   project: string;
   selected: string | null;
+  selectedTrial: string | null;
   onClose: () => void;
 }) {
   if (!selected) {
@@ -355,21 +371,29 @@ function DetailSlot({
   }
   const runId = selected.slice(0, colon);
   const rowId = selected.slice(colon + 1);
-  return <DetailFetcher project={project} runId={runId} rowId={rowId} onClose={onClose} />;
+  return (
+    <DetailFetcher
+      project={project} runId={runId} rowId={rowId}
+      trialId={selectedTrial} onClose={onClose}
+    />
+  );
 }
 
 
 function DetailFetcher({
-  project, runId, rowId, onClose,
+  project, runId, rowId, trialId, onClose,
 }: {
   project: string;
   runId: string;
   rowId: string;
+  trialId: string | null;
   onClose: () => void;
 }) {
   const q = useQuery({
-    queryKey: ["call-detail", project, runId, rowId],
-    queryFn: () => getCallDetail(project, runId, rowId),
+    // trialId in the key so switching between two trials' cards for
+    // the same row refetches the right content.
+    queryKey: ["call-detail", project, runId, rowId, trialId],
+    queryFn: () => getCallDetail(project, runId, rowId, { trialId }),
     refetchOnWindowFocus: false,
   });
   if (q.isPending) {

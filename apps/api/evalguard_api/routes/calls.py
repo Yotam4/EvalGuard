@@ -128,7 +128,15 @@ def list_project_calls(
         # Admin fallback: search across orgs by slug (we still scope by
         # slug, not by id, to avoid leaking a non-admin's project_id).
         row = conn.execute(
-            text("SELECT * FROM projects WHERE slug = :slug LIMIT 1"),
+            # ``slug`` is unique per-org, NOT globally, so two orgs can
+            # both own a ``demo`` project.  ``ORDER BY created_at,
+            # project_id`` makes the admin-fallback pick deterministic
+            # (oldest first) instead of whatever the planner returns —
+            # an admin hitting an ambiguous slug at least gets a stable,
+            # reproducible result.  (A future admin ``?org_id=`` param
+            # would disambiguate explicitly.)
+            text("SELECT * FROM projects WHERE slug = :slug "
+                 "ORDER BY created_at, project_id LIMIT 1"),
             {"slug": project_slug},
         ).mappings().fetchone()
         project = dict(row) if row else None
@@ -260,6 +268,10 @@ def get_call_detail(
     project_slug: str,
     run_id:       str,
     row_id:       str,
+    trial_id:  str | None = Query(default=None,
+        description="Disambiguate when a multi-trial run evaluates the "
+                    "same row_id under several providers.  Omit for "
+                    "single-trial runs (returns the first match)."),
     conn:      Connection = Depends(get_conn),
     principal: Principal  = Depends(require_principal),
 ) -> CallDetail:
@@ -270,6 +282,13 @@ def get_call_detail(
     time so the heavy fields stay out of the stream paginator's hot
     path.  Cross-org / missing combos all collapse to 404 (anti-
     enumeration shape used elsewhere).
+
+    Multi-trial runs evaluate the SAME dataset ``row_id`` under
+    several providers, so ``(run_id, row_id)`` alone is ambiguous.
+    The stream's ``CallSummary`` carries ``trial_id``; the UI passes
+    it back via ``?trial_id=`` so the detail panel shows the call
+    the user actually clicked.  Without it we fall back to the first
+    matching row (correct for the common single-trial case).
     """
     # Verify project + cross-org gate in one query: the project must
     # exist, the run must belong to it, AND (for non-admin) the
@@ -304,9 +323,15 @@ def get_call_detail(
     # has < 1000 — fine for a single GET.  If this ever becomes hot
     # we'd add (run_id, row_id) → trial_id pre-resolution to
     # ``run_rows`` (the trial_id is already there).
+    #
+    # When ``trial_id`` is supplied (multi-trial run), skip trials
+    # that don't match so we return the specific call the user
+    # clicked, not trials[0]'s answer for the same dataset row.
     target_trial: dict | None = None
     target_row:   dict | None = None
     for trial in payload.get("trials") or []:
+        if trial_id is not None and trial.get("trial_id") != trial_id:
+            continue
         for r in trial.get("rows") or []:
             if r.get("row_id") == row_id:
                 target_trial = trial
