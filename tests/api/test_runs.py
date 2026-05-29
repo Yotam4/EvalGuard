@@ -481,6 +481,41 @@ def test_same_project_name_in_different_orgs_does_not_collide(
     assert ids_a == {p_acme["run_id"]}
 
 
+def test_cross_org_same_run_id_returns_409_not_500(
+    client, make_org, make_member_token, tmp_path,
+):
+    """Regression: two orgs that happen to mint the same ``run_id``
+    must not 500 on the second POST. On SQLite the project-scoped
+    idempotency SELECT misses the cross-org row, the INSERT then
+    raises an IntegrityError on the ``runs.run_id`` PK; on Postgres
+    RLS hides the row from the SELECT and the same PK violation
+    fires. Either way the route must surface a generic 409, never
+    a stack-trace-leaking 500.
+
+    The 409 message is intentionally identical to the in-org
+    duplicate path so the response itself doesn't confirm cross-org
+    existence beyond what the run_id collision already implies.
+    """
+    make_org("acme")
+    member_default = make_member_token("org_default", name="d")
+    member_acme    = make_member_token("org_acme",    name="a")
+
+    payload = _produce_real_run(tmp_path, "p-collide")
+    r1 = client.post(
+        "/v1/runs", json=payload,
+        headers={"Authorization": f"Bearer {member_default}"},
+    )
+    assert r1.status_code == 201
+
+    # Same run_id, different org. Must 409, not 500.
+    r2 = client.post(
+        "/v1/runs", json=payload,
+        headers={"Authorization": f"Bearer {member_acme}"},
+    )
+    assert r2.status_code == 409, r2.text
+    assert "already exists" in r2.json()["detail"]
+
+
 def test_trials_and_rows_are_denormalized(client, auth_headers, tmp_path):
     """Querying the DB beyond payload_json must work — that's why the
     server denormalizes trials / rows / gates / assets at ingest. This

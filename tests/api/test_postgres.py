@@ -154,25 +154,66 @@ def test_postgres_rls_blocks_cross_tenant_select(pg_client, auth_headers):
 
 
 def test_postgres_rls_status_is_enabled(pg_client, auth_headers):
-    """Verify RLS is actually ON (Alembic 0002 ran) by querying
-    pg_class. Without RLS enabled, the test above would still pass
-    on application-layer auth alone — this catches a migration
-    that silently no-op'd."""
+    """Verify RLS is actually ON (Alembic 0002+later migrations ran) by
+    querying ``pg_class``. Without RLS enabled, the per-route 404 tests
+    would still pass on application-layer auth alone — this catches a
+    migration that silently no-op'd.
+
+    The test introspects from ``RLS_TARGET_TABLES`` rather than a
+    hard-coded list so a newly added tenant-scoped table that gets
+    forgotten in a migration is caught here. The original list-based
+    form let ``row_reviews`` and ``golden_candidates`` ship without
+    being checked because the doc list and the test list drifted —
+    binding to the canonical source closes that gap.
+    """
     from sqlalchemy import text
+    from evalguard_api.schema import RLS_TARGET_TABLES
+    expected = set(RLS_TARGET_TABLES)
     with pg_client.app.state.engine.connect() as conn:
         rows = conn.execute(text("""
-            SELECT relname FROM pg_class
-            WHERE relkind = 'r' AND relrowsecurity = true
-            AND relname IN ('runs','projects','api_keys','trials',
-                            'run_rows','gate_results','assets','events')
-        """)).fetchall()
-    rls_tables = {r[0] for r in rows}
-    expected = {
-        "runs", "projects", "api_keys", "trials",
-        "run_rows", "gate_results", "assets", "events",
-    }
-    assert expected <= rls_tables, (
-        f"RLS not enabled on: {expected - rls_tables}"
+            SELECT relname, relrowsecurity, relforcerowsecurity
+            FROM pg_class
+            WHERE relkind = 'r' AND relname = ANY(:names)
+        """), {"names": list(expected)}).fetchall()
+    by_name = {r[0]: (r[1], r[2]) for r in rows}
+    missing_table   = expected - by_name.keys()
+    rls_off         = {n for n, (rls, _force) in by_name.items() if not rls}
+    force_off       = {n for n, (_rls, force) in by_name.items() if not force}
+    assert not missing_table, f"Tables declared but absent in DB: {missing_table}"
+    assert not rls_off, f"RLS not enabled on: {rls_off}"
+    assert not force_off, (
+        f"FORCE ROW LEVEL SECURITY not set on: {force_off} — "
+        f"table-owner role can bypass RLS without it"
+    )
+
+
+def test_postgres_rls_policies_present_on_every_target_table(pg_client):
+    """Defence-in-depth companion to the RLS-on check above: RLS being
+    *enabled* without any policy attached blocks ALL access by default
+    on Postgres — so a missing policy fails closed (good) but also
+    means the application is broken (bad). Either way, the moment a
+    table ends up in ``RLS_TARGET_TABLES`` we want to know that it has
+    at least one policy.
+
+    Bundled with the rls-status test so the canonical list
+    (``RLS_TARGET_TABLES``) is the only thing reviewers need to
+    update — both checks introspect from it.
+    """
+    from sqlalchemy import text
+    from evalguard_api.schema import RLS_TARGET_TABLES
+    with pg_client.app.state.engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT tablename, COUNT(*) FROM pg_policies
+            WHERE schemaname = current_schema()
+              AND tablename = ANY(:names)
+            GROUP BY tablename
+        """), {"names": list(RLS_TARGET_TABLES)}).fetchall()
+    counts = {r[0]: r[1] for r in rows}
+    without_policy = set(RLS_TARGET_TABLES) - counts.keys()
+    assert not without_policy, (
+        f"RLS enabled but no policy attached on: {without_policy}. "
+        "Add a policy in the migration that creates the table (or in "
+        "0002_rls_policies.py for legacy tables)."
     )
 
 

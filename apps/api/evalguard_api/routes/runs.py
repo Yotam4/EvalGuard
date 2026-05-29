@@ -22,6 +22,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
+from sqlalchemy.exc import IntegrityError
 
 from evalguard_api.auth import Principal, require_principal
 from evalguard_api.db import now_iso, upsert_project
@@ -65,10 +66,18 @@ def ingest_run(
     # so the contract is explicit. Without the header, fall back to
     # the previous strict 409 behaviour (a duplicate by accident is
     # likely a bug we want surfaced loudly).
+    #
+    # Scope the existence check to the caller's project — on SQLite
+    # there is no RLS to filter cross-org rows, and an unscoped lookup
+    # would falsely report a cross-org run_id as an idempotent replay
+    # of *this* org's project. Scoping the SELECT means cross-org
+    # collisions instead fall through to the INSERT and hit the PK
+    # violation handler below.
     idem_key = request.headers.get("idempotency-key")
     existing = conn.execute(
-        text("SELECT run_id FROM runs WHERE run_id=:run_id"),
-        {"run_id": body.run_id},
+        text("SELECT run_id FROM runs "
+             "WHERE run_id=:run_id AND project_id=:project_id"),
+        {"run_id": body.run_id, "project_id": project_id},
     ).fetchone()
     if existing:
         if idem_key == body.run_id:
@@ -100,7 +109,22 @@ def ingest_run(
     # GET would return JSON the schema's own validator wouldn't
     # accept.
     payload = body.model_dump(mode="json", exclude_unset=True)
-    _persist_run(conn, payload, project_id, principal)
+    try:
+        _persist_run(conn, payload, project_id, principal)
+    except IntegrityError:
+        # Cross-org run_id collision (the project-scoped SELECT above
+        # didn't see the row, but the global PK on ``runs.run_id`` does)
+        # or a race between two concurrent ingests racing the same id.
+        # Surface as a generic 409 — the message is identical to the
+        # in-org duplicate path so cross-org existence isn't leaked.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Run {body.run_id!r} already exists. Send "
+                f"``Idempotency-Key: {body.run_id}`` if this is a "
+                f"deliberate retry."
+            ),
+        ) from None
 
     return JSONResponse(
         status_code=status.HTTP_201_CREATED,
