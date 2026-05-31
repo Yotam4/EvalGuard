@@ -37,6 +37,7 @@ from evalguard_api.db import (
 from evalguard_api.routes.api_keys import router as api_keys_router
 from evalguard_api.routes.assets import router as assets_router
 from evalguard_api.routes.calls import router as calls_router
+from evalguard_api.routes.configs import router as configs_router
 from evalguard_api.routes.golden import router as golden_router
 from evalguard_api.routes.health import router as health_router
 from evalguard_api.routes.orgs import router as orgs_router
@@ -322,6 +323,7 @@ def build_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(otlp_router)
     app.include_router(reviews_router)
     app.include_router(calls_router)
+    app.include_router(configs_router)
     app.include_router(golden_router)
     return app
 

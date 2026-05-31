@@ -60,6 +60,10 @@ curl -s -H "Authorization: Bearer $EVALGUARD_API_KEY" \
 | `POST` | `/v1/golden/candidates` | Member. Promote `{run_id, row_id, note?}` to the golden staging table. Idempotent per reviewer. |
 | `GET`  | `/v1/projects/{slug}/golden/candidates` | Member. Staged candidates. Query: `limit=100&expand=row` (`expand=row` attaches input/expected/output). |
 | `DELETE` | `/v1/golden/candidates/{id}` | Original promoter or admin. 403 for others; 404 unknown. |
+| `POST` | `/v1/projects/{slug}/config` | Member. Upload an `evalguard.yaml` blob. Content-addressed by SHA-256 → 200 (idempotent) if bytes already stored; 201 for a new revision. |
+| `GET`  | `/v1/projects/{slug}/config` | Member. Latest config revision for the project. 404 if no config has been pushed yet. |
+| `GET`  | `/v1/projects/{slug}/config/history` | Member. Recent revisions newest-first (content omitted). Query: `limit=20`. |
+| `GET`  | `/v1/projects/{slug}/config/{config_id}` | Member. Specific revision verbatim — the pin-to-hash surface the upcoming proxy invoke path uses. |
 | `GET`  | `/openapi.json`      | OpenAPI 3 spec (auto-generated). |
 | `GET`  | `/docs`              | Swagger UI. |
 

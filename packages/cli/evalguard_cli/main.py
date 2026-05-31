@@ -6,7 +6,7 @@ import typer
 
 from evalguard_cli.commands import (
     assets_cmd, audit_cmd, comment_cmd, diff_cmd, golden_cmd, init_cmd,
-    push_cmd, run_cmd, validate_cmd, view_cmd,
+    push_cmd, push_config_cmd, run_cmd, validate_cmd, view_cmd,
 )
 
 app = typer.Typer(
@@ -23,6 +23,7 @@ app.command("view")(view_cmd.view)
 app.command("diff")(diff_cmd.diff)
 app.command("comment")(comment_cmd.comment)
 app.command("push")(push_cmd.push)
+app.command("push-config")(push_config_cmd.push_config)
 app.add_typer(audit_cmd.audit_app, name="audit")
 app.add_typer(assets_cmd.assets_app, name="assets")
 app.add_typer(golden_cmd.golden_app, name="golden")

@@ -122,7 +122,6 @@ def test_alembic_version_recorded(client):
     engine = client.app.state.engine
     with engine.connect() as conn:
         ver = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-    # Head bumps as we ship migrations. ``0008_golden_candidates``
-    # locks the verdict enum at the DB layer + tightens ``row_id`` to
-    # VARCHAR(200); future migrations will keep moving this forward.
-    assert ver == "0009_calls_indexes_desc"
+    # Head bumps as we ship migrations.  ``0010_project_configs``
+    # adds the Phase PROXY-1 server-side config storage table.
+    assert ver == "0010_project_configs"

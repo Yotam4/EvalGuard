@@ -377,6 +377,7 @@ Feature-level docs live under [`docs/`](docs/).
 | `evalguard diff <run_a> <run_b>` | Side-by-side metric Δ between two local runs |
 | `evalguard comment <run_id> [--baseline f.json] [--out file.md]` | Render a sticky PR-comment markdown body |
 | `evalguard push <run_id\|--last> [--server URL] [--token TOK] [--dry-run]` | Upload a run to a remote EvalGuard server (no-op + hint when unconfigured) |
+| `evalguard push-config [--file evalguard.yaml] [--project SLUG] [--server URL] [--token TOK] [--dry-run]` | Upload the local `evalguard.yaml` to the server's `project_configs` store (content-addressed by SHA-256; re-pushing identical bytes is idempotent) |
 | `evalguard view` | List recent runs |
 | `evalguard view <run_id>` | Rows table + per-layer rollup + gates |
 | `evalguard view <run_id> --trial T` | Per-trial drill-down |

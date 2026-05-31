@@ -695,3 +695,53 @@ class ReviewQueueResponse(_Strict):
 
 class ReviewListResponse(_Strict):
     reviews: list[ReviewOut]
+
+
+# ---------------------------------------------------------------------------
+# Phase PROXY-1 — server-side project configs.
+
+
+# Hard cap on the YAML blob a single push can carry.  The default
+# ``evalguard.yaml`` is a few KB; anything past ~512 KB is almost
+# certainly a misuse (a dataset glued into the config, a binary
+# pasted in by accident).  The server's request-body limit catches
+# the truly huge cases; this is the schema-layer wall in front of it.
+_MAX_CONFIG_BYTES = 512 * 1024
+
+
+class ProjectConfigIngest(_Strict):
+    """``POST /v1/projects/{slug}/config`` body.
+
+    ``content`` is the raw ``evalguard.yaml`` bytes decoded as UTF-8.
+    Storing the source text (not a parsed AST) means the server can
+    re-serve byte-for-byte what the operator pushed, which is what
+    matters for audit / reproducibility.  The server computes the
+    SHA-256 itself rather than trusting a client-supplied hash."""
+
+    content: str = Field(min_length=1, max_length=_MAX_CONFIG_BYTES)
+
+
+class ProjectConfig(_Strict):
+    """One stored config revision.  Returned by POST + GET endpoints."""
+
+    id:             int
+    project_id:     str
+    content_sha256: str
+    content:        str
+    pushed_by:      str
+    pushed_at:      str
+
+
+class ProjectConfigSummary(_Strict):
+    """Lightweight history entry — omits ``content`` so a long history
+    listing doesn't pull every revision's bytes into the response."""
+
+    id:             int
+    project_id:     str
+    content_sha256: str
+    pushed_by:      str
+    pushed_at:      str
+
+
+class ProjectConfigHistory(_Strict):
+    configs: list[ProjectConfigSummary]

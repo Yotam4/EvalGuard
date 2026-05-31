@@ -261,6 +261,30 @@ row_reviews = Table(
 )
 
 
+# Phase PROXY-1 — server-side project config storage. Each row is one
+# uploaded ``evalguard.yaml`` blob, addressable by its SHA-256
+# content hash. ``UNIQUE (project_id, content_sha256)`` makes re-pushing
+# the same bytes idempotent (the POST endpoint returns the existing
+# record instead of inserting a duplicate). The latest config for a
+# project is ``ORDER BY pushed_at DESC, id DESC LIMIT 1`` — the index
+# is shaped for that read.
+project_configs = Table(
+    "project_configs", metadata,
+    Column("id",             Integer, primary_key=True, autoincrement=True),
+    Column("project_id",     Text,
+        ForeignKey("projects.project_id", ondelete="CASCADE"),
+        nullable=False),
+    Column("content_sha256", Text, nullable=False),
+    Column("content",        Text, nullable=False),
+    Column("pushed_by",      Text, nullable=False),
+    Column("pushed_at",      Text, nullable=False),
+    UniqueConstraint("project_id", "content_sha256",
+                     name="uq_project_configs_content"),
+    Index("idx_project_configs_latest",
+          "project_id", text("pushed_at DESC"), text("id DESC")),
+)
+
+
 # Tables that carry a ``project_id`` and whose rows are subject to
 # tenant scoping. The RLS migration enables RLS + creates policies on
 # this exact list, and any future table that touches per-org data
@@ -276,4 +300,5 @@ RLS_TARGET_TABLES: tuple[str, ...] = (
     "events",
     "row_reviews",
     "golden_candidates",
+    "project_configs",
 )
