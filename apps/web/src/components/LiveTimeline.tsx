@@ -193,20 +193,28 @@ function TimelineBar({
     synthesise zero-count entries for the gaps so the strip's gap
     semantics is honest.  Synthetic entries carry an empty
     ``run_id`` (no real parent run exists for that day yet — the
-    proxy lazy-creates only on first call). */
-function padToWindow(
+    proxy lazy-creates only on first call).
+
+    Exported for vitest coverage (round-3 review-pass K).  Tests pass
+    a fixed ``today`` so the bucketing is deterministic without
+    mocking the clock; production callers omit it. */
+export function padToWindow(
   entries: LiveTimelineEntry[],
   days: number,
+  today: Date = new Date(),
 ): LiveTimelineEntry[] {
   const byDate = new Map<string, LiveTimelineEntry>();
   for (const e of entries) {
     if (e.started_at) byDate.set(e.started_at.slice(0, 10), e);
   }
   const out: LiveTimelineEntry[] = [];
-  const today = new Date();
-  today.setUTCHours(0, 0, 0, 0);
+  // Clone before mutating so a caller-supplied ``today`` isn't
+  // side-effected.  Floor to UTC midnight so the window math is
+  // day-aligned regardless of when the page renders.
+  const anchor = new Date(today);
+  anchor.setUTCHours(0, 0, 0, 0);
   for (let i = days - 1; i >= 0; i--) {
-    const d = new Date(today);
+    const d = new Date(anchor);
     d.setUTCDate(d.getUTCDate() - i);
     const key = d.toISOString().slice(0, 10);
     const existing = byDate.get(key);

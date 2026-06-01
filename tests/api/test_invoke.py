@@ -298,6 +298,111 @@ def test_invoke_rejects_oversized_input(client, auth_headers):
     assert "too large" in r.text.lower()
 
 
+def test_invoke_rejects_oversized_expected(client, auth_headers):
+    """Round-3 review-pass P: validator sums input + expected + extra;
+    a giant ``expected`` alone must also reject."""
+    _push_default_config_simple(client, auth_headers)
+    r = client.post(
+        "/v1/projects/default/invoke",
+        json={"input": "ok", "expected": "x" * (300 * 1024)},
+        headers=auth_headers,
+    )
+    assert r.status_code == 422, r.text
+    assert "too large" in r.text.lower()
+
+
+def test_invoke_rejects_oversized_extra(client, auth_headers):
+    """Round-3 review-pass P: a giant ``extra`` blob alone rejects."""
+    _push_default_config_simple(client, auth_headers)
+    r = client.post(
+        "/v1/projects/default/invoke",
+        json={"input": "ok", "extra": {"blob": "y" * (300 * 1024)}},
+        headers=auth_headers,
+    )
+    assert r.status_code == 422, r.text
+
+
+def test_invoke_rejects_oversized_combined_three_fields(client, auth_headers):
+    """Round-3 review-pass P: the validator sums ALL three fields.
+    A refactor that accidentally checked each field independently
+    would let three ~100KB fields slip through.  Each individually
+    is under 256KB; combined is over.  Must reject."""
+    _push_default_config_simple(client, auth_headers)
+    r = client.post(
+        "/v1/projects/default/invoke",
+        json={
+            "input":    "a" * (100 * 1024),
+            "expected": "b" * (100 * 1024),
+            "extra":    {"data": "c" * (100 * 1024)},
+        },
+        headers=auth_headers,
+    )
+    assert r.status_code == 422, r.text
+
+
+def test_invoke_accepts_combined_three_fields_just_under_cap(client, auth_headers):
+    """Round-3 review-pass P: positive case for the combined sum —
+    three modest fields summing to <256KB pass."""
+    _push_default_config_simple(client, auth_headers)
+    r = client.post(
+        "/v1/projects/default/invoke",
+        json={
+            "input":    "a" * (60 * 1024),
+            "expected": "b" * (60 * 1024),
+            "extra":    {"data": "c" * (60 * 1024)},
+        },
+        headers=auth_headers,
+    )
+    assert r.status_code == 200, r.text
+
+
+def test_invoke_provider_timeout_returns_502_and_records_row(
+    client, auth_headers, monkeypatch,
+):
+    """Round-3 review-pass O: a hung upstream provider must trip
+    ``asyncio.wait_for`` and surface as 502, with the row persisted
+    under the failures tab and the error message naming the timeout.
+
+    Setup: monkeypatch ``_PROVIDER_CALL_TIMEOUT_S`` to 0.05s and
+    push a config that uses the mock provider's ``never_resolve``
+    behaviour via ``asyncio.sleep`` inside a custom complete().
+    """
+    import asyncio
+    import evalguard_api.routes.invoke as invoke_module
+
+    # Shrink the timeout so the test doesn't burn 60s.
+    monkeypatch.setattr(invoke_module, "_PROVIDER_CALL_TIMEOUT_S", 0.05)
+
+    # Patch the mock provider's ``complete`` so it hangs forever
+    # (until asyncio cancels it).  Direct attribute swap is cheaper
+    # than maintaining a "hang" mode in MockProvider itself.
+    from evalguard_evaluators.providers.mock_provider import MockProvider
+
+    async def _hang(self, prompt, *, model, params=None):
+        await asyncio.sleep(10.0)  # well past the 0.05s cap
+        raise AssertionError("provider should have been cancelled")
+
+    monkeypatch.setattr(MockProvider, "complete", _hang)
+
+    _push_default_config_simple(client, auth_headers)
+    r = client.post(
+        "/v1/projects/default/invoke",
+        json={"input": "x"},
+        headers=auth_headers,
+    )
+    assert r.status_code == 502, r.text
+    body = r.json()
+    assert body["passed"] is False
+    assert "timeout" in (body["error"] or "").lower()
+
+    # Row landed under failures tab.
+    failures = client.get(
+        "/v1/projects/default/calls?tab=failures&limit=5",
+        headers=auth_headers,
+    )
+    assert any(c["row_id"] == body["row_id"] for c in failures.json()["calls"])
+
+
 def test_invoke_redacts_secrets_in_detail_json(client, auth_headers):
     """Defence-in-depth: an ``input`` carrying an accidental
     ``api_key`` field shouldn't surface verbatim in detail_json.

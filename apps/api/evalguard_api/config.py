@@ -170,11 +170,22 @@ def validate_for_startup(settings: Settings) -> None:
     # operator has scoped the listener to loopback.  Operators who
     # need open mode on a non-loopback interface should put a
     # reverse-proxy with auth in front.
-    if settings.is_open_mode and settings.bind_host not in (
-        "127.0.0.1", "localhost", "::1",
+    #
+    # Round-3 review-pass: include bracketed IPv6 loopback
+    # ``[::1]`` — some shell pipelines surface the host in
+    # bracketed form, and silently letting it through would defeat
+    # the refusal.  Whitespace is stripped first so a trailing
+    # newline from a shell capture doesn't sneak past either.
+    # The error message names the EVALGUARD_HOST env var the
+    # loader actually reads (config.py:load_settings reads
+    # ``os.environ.get("EVALGUARD_HOST", ...)``); earlier text
+    # said ``EVALGUARD_BIND_HOST`` which doesn't exist.
+    _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
+    if settings.is_open_mode and (
+        settings.bind_host.strip() not in _LOOPBACK_HOSTS
     ):
         raise StartupRefusal(
-            f"Open mode (no API key) AND EVALGUARD_BIND_HOST="
+            f"Open mode (no API key) AND EVALGUARD_HOST="
             f"{settings.bind_host!r} would expose the proxy invoke "
             f"endpoint to any caller on the network. Bind to 127.0.0.1 "
             f"(default), put auth in front via a reverse proxy, or set "

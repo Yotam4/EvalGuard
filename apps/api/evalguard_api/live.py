@@ -263,13 +263,24 @@ def record_call(
     # response is still available from the upstream API if needed for
     # debugging; the EvalGuard row's job is "operator-readable trace
     # of what happened", not "lossless archive of every LLM byte".
+    #
+    # PROXY review-round-3 (Agent-1 B): truncate by BYTES not chars.
+    # Earlier ``stored_output[:_MAX_OUTPUT_BYTES]`` sliced by Python
+    # str length, which for multi-byte scripts (CJK averages 3 bytes
+    # per char in UTF-8) stored 3× the intended cap — a "512 KiB"
+    # comment with a 1.5 MiB actual limit.  Encode → byte-slice →
+    # decode-with-errors-ignore drops any partial multi-byte
+    # codepoint at the cut and keeps us under the byte budget.  The
+    # marker is appended after the byte cap, so the total stored
+    # form is bounded by ``_MAX_OUTPUT_BYTES + len(_TRUNC_MARKER)``.
     stored_output = rec.output
-    if stored_output and len(stored_output.encode("utf-8")) > _MAX_OUTPUT_BYTES:
-        # Slice by character count first (encoding-safe), then add the
-        # marker.  Conservatively cap chars at _MAX_OUTPUT_BYTES so the
-        # byte budget is respected for ASCII; multibyte chars get
-        # slightly less.
-        stored_output = stored_output[:_MAX_OUTPUT_BYTES] + _TRUNC_MARKER
+    if stored_output:
+        encoded = stored_output.encode("utf-8")
+        if len(encoded) > _MAX_OUTPUT_BYTES:
+            stored_output = (
+                encoded[:_MAX_OUTPUT_BYTES].decode("utf-8", errors="ignore")
+                + _TRUNC_MARKER
+            )
     output_preview = stored_output[:_PREVIEW_CHARS] if stored_output else None
     tags_json = json.dumps(rec.tags) if rec.tags else None
     # Defence-in-depth: a caller that POSTs an ``input`` carrying an
