@@ -1,122 +1,60 @@
 """Hash-chained, append-only audit log for an evalguard run.
 
-Goals:
+Phase PROXY-3 carve-out: the pure-logic core (event vocabulary,
+secret redaction, canonical-JSON hashing, chain verification) moved
+to ``evalguard_evaluators.audit`` so the FastAPI server can use it
+without dragging the CLI in.  This module is now a thin adapter
+that:
 
-- **Provenance** — every state change emits one event recording who did
-  it, when, against which version-pinned asset, with which inputs and
-  outputs. Vocabulary maps to W3C PROV (Activity / Entity / Agent).
-- **Tamper evidence** — events form a per-``run_id`` hash chain. Each
-  event's ``event_hash`` is sha256 of its canonical JSON; events also
-  carry the ``prev_event_hash`` of the chain tip at insert time.
-  ``verify_chain`` walks the chain and checks every link.
-- **Privacy** — ``redact_payload=True`` strips human-visible content
-  (rendered prompts, raw responses, judge reasons) but keeps content
-  hashes so the chain still verifies post-erasure.
-
-This module deliberately stores typed payloads as ``dict``s rather than
-Pydantic models so the OSS tier doesn't take a Pydantic dependency
-inside the hot path. The shape is documented in ``EVENT_KINDS``.
+- Owns the ``AuditLog`` class — the stateful single-writer emitter
+  that knows about ``SqliteStore`` (for chain-tip lookup + event
+  persistence) and ``Actor`` resolution (for CI / GitHub Actions
+  identity attribution).
+- Owns the ``AuditHook`` class — the per-evaluator bound emitter the
+  executor hands to layer-by-layer evaluator invocations.
+- Owns ``verify_chain(store, run_id)`` — the SqliteStore-loading
+  wrapper that calls the shared ``verify_chain_events`` helper.
+- Re-exports every public symbol the CLI / tests historically
+  imported from this module, so the relocation is invisible to
+  existing call sites (``EVENT_KINDS``, ``redact_secrets``, the
+  ContextVar wrappers from ``evalguard_evaluators.audit_hook``).
 """
 
 from __future__ import annotations
 
 import contextvars
-import hashlib
-import json
-import re
-import time
 import uuid
-from datetime import datetime, timezone
 from typing import Any
 
 from evalguard_cli.local.actor import Actor, resolve_actor
 from evalguard_cli.local.sqlite_store import SqliteStore
 
-
-# ---------------------------------------------------------------------------
-# Event vocabulary
-
-# kind → (W3C PROV class, default subject_kind)
-EVENT_KINDS: dict[str, tuple[str, str | None]] = {
-    "run.started":               ("Activity", "run"),
-    "run.finalized":             ("Activity", "run"),
-    "run.cost_capped":           ("Activity", "run"),
-    "asset.resolved":            ("Entity",   "asset"),
-    "trial.started":             ("Activity", "trial"),
-    "trial.finalized":           ("Activity", "trial"),
-    "row.short_circuited":       ("Activity", "row"),
-    "provider.called":           ("Activity", "provider"),
-    "provider.retry":            ("Activity", "provider"),
-    "provider.failed":           ("Activity", "provider"),
-    "evaluator.heuristic.invoked": ("Activity", "heuristic"),
-    "evaluator.metric.invoked":  ("Activity", "metric"),
-    "evaluator.judge.invoked":   ("Activity", "judge"),
-    "gate.evaluated":            ("Activity", "gate"),
-    "gate.custom_check.invoked": ("Activity", "custom_check"),
-}
-
-# Fields that contain raw user/model content. ``redact_payload`` strips
-# these from payload before insert; their hashes remain on the event row.
-_PRIVACY_SENSITIVE_FIELDS: tuple[str, ...] = (
-    "rendered_prompt",
-    "raw_response",
-    "parsed_reason",
-    "input",
-    "output",
-    "expected",
-    "rubric",
+# Pure-logic core lives in evaluators-side now.  Re-export the public
+# names so existing ``from evalguard_cli.local.audit import ...``
+# call sites (executor, tests, audit_cmd) keep working unchanged.
+from evalguard_evaluators.audit import (
+    EVENT_KINDS,
+    PRIVACY_SENSITIVE_FIELDS,
+    build_event,
+    hash_canonical,
+    hash_event,
+    redact_privacy_payload,
+    redact_secrets,
+    verify_chain_events,
 )
-
-# Keys whose values are *always* stripped from every event payload
-# before storage — even when ``redact_payload`` is False. The threat is
-# API keys leaking from provider configs into the audit log: a YAML
-# carrying ``api_key: ${OPENAI_API_KEY}`` would otherwise materialize
-# the resolved secret into events.
-#
-# A substring/regex match generalizes over vendor-specific names so we
-# don't have to maintain a list as new providers are added. Examples
-# that match: ``api_key``, ``apikey``, ``API-KEY``, ``OPENAI_API_KEY``,
-# ``MISTRAL_API_KEY``, ``GOOGLE_TOKEN``, ``my_password``, ``Authorization``,
-# ``client_secret``, ``bearer_token``.
-_SECRET_KEY_RE = re.compile(
-    # Standalone forms (case-insensitive whole-string match).
-    r"^(api[_-]?key|password|passwd|pwd|secret|authorization|credential|token)$"
-    r"|"
-    # Any key whose tail is a secret-shaped suffix. Note ``token`` only
-    # matches when *qualified* (``auth_token``, ``access_token``, …) so
-    # ``tokens`` (LLM usage stats) is NOT redacted.
-    r"(api[_-]?key|password|passwd|pwd|secret|authorization|credential|client[_-]?secret|"
-    r"refresh[_-]?token|access[_-]?token|bearer[_-]?token|auth[_-]?token|"
-    r"id[_-]?token|csrf[_-]?token)$",
-    re.IGNORECASE,
+# Same back-compat re-export pattern audit.py used before PROXY-3 —
+# evaluators never need to import back into the CLI.
+from evalguard_evaluators.audit_hook import (
+    current_audit_hook as _evaluator_current_audit_hook,
+    reset_audit_hook   as _evaluator_reset_audit_hook,
+    set_audit_hook     as _evaluator_set_audit_hook,
 )
 
 
-def _is_secret_key(name: Any) -> bool:
-    if not isinstance(name, str):
-        return False
-    return bool(_SECRET_KEY_RE.search(name))
-
-
-def redact_secrets(value: Any) -> Any:
-    """Recursively replace known-sensitive values with ``"***"``.
-
-    Walks dicts and lists; leaves scalars intact. The match is on key
-    name only — values aren't inspected, so a secret stored under an
-    unexpected key name still leaks. Treat as defense-in-depth, not a
-    substitute for keeping secrets in env vars.
-    """
-    if isinstance(value, dict):
-        out: dict[Any, Any] = {}
-        for k, v in value.items():
-            if _is_secret_key(k) and v is not None:
-                out[k] = "***"
-            else:
-                out[k] = redact_secrets(v)
-        return out
-    if isinstance(value, list):
-        return [redact_secrets(v) for v in value]
-    return value
+# Module-level legacy alias kept for any third-party code that
+# imported the private name.  Internal callers use the public
+# ``PRIVACY_SENSITIVE_FIELDS`` from the evaluators module above.
+_PRIVACY_SENSITIVE_FIELDS = PRIVACY_SENSITIVE_FIELDS
 
 
 # ---------------------------------------------------------------------------
@@ -126,8 +64,12 @@ def redact_secrets(value: Any) -> Any:
 class AuditLog:
     """Single-writer hash-chained event emitter for one run.
 
-    Construct once per run after the run row is started; it caches the
-    chain tip and the actor identity so per-event emission is cheap.
+    Constructed once per run after the run row is created.  Caches
+    the chain tip (from ``SqliteStore.last_event_hash``) and the
+    actor identity so per-event emission is cheap.  Concurrent
+    writers against the same ``run_id`` are unsupported by design —
+    the in-memory ``_tip`` cache and the SQLite ``events`` table's
+    append-only contract assume one writer per run.
     """
 
     def __init__(
@@ -137,7 +79,7 @@ class AuditLog:
         *,
         actor: Actor | None = None,
         redact_payload: bool = False,
-        project_dir: "Any" = None,
+        project_dir: Any = None,
     ) -> None:
         self.store = store
         self.run_id = run_id
@@ -145,8 +87,6 @@ class AuditLog:
         self.redact_payload = redact_payload
         self.trace_id = uuid.uuid4().hex                 # 32 hex
         self._tip: str | None = store.last_event_hash(run_id)
-
-    # -- public ----------------------------------------------------------
 
     def emit(
         self,
@@ -165,70 +105,46 @@ class AuditLog:
         parent_span_id: str | None = None,
         span_id: str | None = None,
     ) -> dict[str, Any]:
-        """Append one event. Returns the event dict (post-hash).
+        """Append one event.  Returns the event dict (post-hash).
 
         ``span_id`` may be pre-allocated by the caller so a sub-event
         (e.g. a judge's nested provider call) can record this event's
         span as its parent before this event is itself emitted.
         """
-        if kind not in EVENT_KINDS:
-            raise ValueError(f"unknown event kind {kind!r}; add it to EVENT_KINDS")
-
-        if subject_kind is None:
-            subject_kind = EVENT_KINDS[kind][1]
-
-        # Strip API keys / tokens / passwords from payload + actor_meta
-        # *before* hashing, so the chain commits to the redacted form.
-        actor_meta = redact_secrets(self.actor.actor_meta)
-        sanitized_payload = self._sanitize(redact_secrets(dict(payload or {})))
-
-        now_iso = _now_iso()
-        event_id = _ulid()
-        if span_id is None:
-            span_id = uuid.uuid4().hex[:16]                  # 16 hex
-        record: dict[str, Any] = {
-            "event_id":        event_id,
-            "kind":            kind,
-            "run_id":          self.run_id,
-            "trial_id":        trial_id,
-            "row_id":          row_id,
-            "actor_id":        self.actor.actor_id,
-            "actor_type":      self.actor.actor_type,
-            "actor_meta":      actor_meta,
-            "subject_kind":    subject_kind,
-            "subject_id":      subject_id,
-            "subject_version": subject_version,
-            "inputs_hash":     _hash_canonical(inputs) if inputs is not None else None,
-            "outputs_hash":    _hash_canonical(outputs) if outputs is not None else None,
-            "payload":         sanitized_payload,
-            "cost_usd":        cost_usd,
-            "started_at":      now_iso,
-            "finished_at":     now_iso if duration_ms is not None else None,
-            "duration_ms":     duration_ms,
-            "trace_id":        self.trace_id,
-            "span_id":         span_id,
-            "parent_span_id":  parent_span_id,
-            "prev_event_hash": self._tip,
-        }
-        record["event_hash"] = _hash_event(record)
+        record = build_event(
+            kind=kind,
+            run_id=self.run_id,
+            prev_event_hash=self._tip,
+            actor_id=self.actor.actor_id,
+            actor_type=self.actor.actor_type,
+            actor_meta=self.actor.actor_meta,
+            trial_id=trial_id,
+            row_id=row_id,
+            subject_kind=subject_kind,
+            subject_id=subject_id,
+            subject_version=subject_version,
+            inputs=inputs,
+            outputs=outputs,
+            payload=payload,
+            cost_usd=cost_usd,
+            duration_ms=duration_ms,
+            parent_span_id=parent_span_id,
+            span_id=span_id,
+            trace_id=self.trace_id,
+            redact_payload=self.redact_payload,
+        )
         self.store.insert_event(record)
         self._tip = record["event_hash"]
         return record
 
-    # -- internals -------------------------------------------------------
-
     def _sanitize(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Back-compat shim — internal callers may have used this
+        method directly.  Mirrors the legacy behaviour: only the
+        privacy-field replacement (secret redaction now runs
+        unconditionally inside ``build_event``)."""
         if not self.redact_payload:
             return payload
-        out = dict(payload)
-        for field in _PRIVACY_SENSITIVE_FIELDS:
-            if field in out and out[field] is not None:
-                out[field] = {
-                    "redacted": True,
-                    "sha256":   _sha256_text(_to_text(out[field])),
-                    "length":   len(_to_text(out[field])),
-                }
-        return out
+        return redact_privacy_payload(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -239,7 +155,7 @@ class AuditHook:
     """Bound emitter handed to an evaluator before its invocation.
 
     The executor pre-allocates the evaluator's span_id and constructs
-    an AuditHook bound to that span. The evaluator can then emit
+    an AuditHook bound to that span.  The evaluator can then emit
     nested events (e.g. a judge's own LLM call) with
     ``parent_span_id`` already set correctly, without needing to know
     the chain tip or actor identity.
@@ -305,19 +221,13 @@ class AuditHook:
 # When the executor invokes an evaluator under ``asyncio.gather`` with
 # concurrency > 1, every coroutine shares the *same* evaluator instance.
 # Storing the hook on ``ev._audit_hook`` would let one task's hook leak
-# into another task's emit_provider_call. ``ContextVar`` is task-local in
-# asyncio, so each ``process_row`` coroutine gets its own view.
+# into another task's emit_provider_call.  ``ContextVar`` is task-local
+# in asyncio, so each ``process_row`` coroutine gets its own view.
 #
-# The actual ContextVar lives in the evaluators package
-# (``evalguard_evaluators.audit_hook``) so the dependency points cli →
-# evaluators only — judges never need to import back into the CLI.
-# These wrappers preserve the original CLI-side names so the executor
-# and tests don't have to change.
-from evalguard_evaluators.audit_hook import (
-    current_audit_hook as _evaluator_current_audit_hook,
-    reset_audit_hook   as _evaluator_reset_audit_hook,
-    set_audit_hook     as _evaluator_set_audit_hook,
-)
+# The actual ContextVar lives in ``evalguard_evaluators.audit_hook`` so
+# the dependency points cli → evaluators only — judges never need to
+# import back into the CLI.  These wrappers preserve the original
+# CLI-side names so the executor and tests don't have to change.
 
 
 def current_audit_hook() -> "AuditHook | None":
@@ -341,99 +251,17 @@ def reset_audit_hook(token: "contextvars.Token[AuditHook | None]") -> None:
 def verify_chain(store: SqliteStore, run_id: str) -> dict[str, Any]:
     """Walk the per-run hash chain and verify every link.
 
-    Returns a dict with:
-        ok (bool)        — whether every link verified
-        events (int)     — number of events visited
-        broken_at (str)  — event_id of the first failure (or None)
-        reason (str)     — human-readable explanation
+    Loads events from the SqliteStore and delegates to the shared
+    ``verify_chain_events`` helper.  Returns the same dict shape
+    (``ok``, ``events``, ``broken_at``, ``reason``) callers have
+    always relied on.
     """
-    events = store.list_events(run_id)
-    expected_prev: str | None = None
-    for ev in events:
-        # 1. prev pointer matches the chain so far
-        if ev["prev_event_hash"] != expected_prev:
-            return {
-                "ok": False, "events": len(events),
-                "broken_at": ev["event_id"],
-                "reason": (
-                    f"prev_event_hash mismatch at event {ev['event_id']}: "
-                    f"expected {expected_prev!r}, got {ev['prev_event_hash']!r}"
-                ),
-            }
-        # 2. event_hash matches recomputed canonical
-        recomputed = _hash_event(ev)
-        if recomputed != ev["event_hash"]:
-            return {
-                "ok": False, "events": len(events),
-                "broken_at": ev["event_id"],
-                "reason": (
-                    f"event_hash mismatch at event {ev['event_id']}: "
-                    f"recomputed {recomputed[:12]}…, stored {ev['event_hash'][:12]}…"
-                ),
-            }
-        expected_prev = ev["event_hash"]
-    return {"ok": True, "events": len(events), "broken_at": None, "reason": "chain intact"}
+    return verify_chain_events(store.list_events(run_id))
 
 
 # ---------------------------------------------------------------------------
-# Hashing
+# Back-compat private aliases — legacy callers that imported the
+# private names directly stay working.
 
-
-def _hash_event(event: dict[str, Any]) -> str:
-    """sha256 of the canonical-JSON event excluding ``event_hash``.
-
-    The canonicalization is ``json.dumps(sort_keys=True, separators=(',', ':'))``
-    over the event's other fields. This is deterministic across Python
-    versions and across implementations that sort string keys.
-    """
-    body = {k: v for k, v in event.items() if k != "event_hash"}
-    return _hash_canonical(body)
-
-
-def _hash_canonical(value: Any) -> str:
-    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
-
-
-def _canonical_json(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
-
-
-def _sha256_text(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
-
-
-def _to_text(value: Any) -> str:
-    if isinstance(value, str):
-        return value
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
-
-
-# ---------------------------------------------------------------------------
-# IDs
-
-
-def _ulid() -> str:
-    """Time-prefixed ULID-style id (sortable by emission time).
-
-    26-char Crockford-base32. We don't use the ``ulid-py`` package to
-    keep the OSS dep surface small.
-    """
-    ms = int(time.time() * 1000)
-    rand_bits = uuid.uuid4().int & ((1 << 80) - 1)
-    value = (ms << 80) | rand_bits
-    return _crockford32(value, 26)
-
-
-_C32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
-
-
-def _crockford32(value: int, length: int) -> str:
-    out = []
-    for _ in range(length):
-        out.append(_C32[value & 0x1F])
-        value >>= 5
-    return "".join(reversed(out))
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+_hash_event     = hash_event
+_hash_canonical = hash_canonical
