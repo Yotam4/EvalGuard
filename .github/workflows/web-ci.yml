@@ -1,0 +1,61 @@
+# Web CI — fast unit checks for the Next.js UI.
+#
+# Sibling of ``web-e2e.yml``: that workflow boots Chromium and runs
+# Playwright (slow), this one does the cheap regression gates (tsc +
+# vitest + the static-export build).  Both run in parallel on PRs;
+# this one is the leading-edge signal because it finishes in ~90s.
+#
+# The static-export build is included here (not just in web-e2e)
+# because a Next.js config that builds locally but breaks under CI's
+# stricter "no .next cache" path has burned us before — catching it
+# at the cheap job means web-e2e's Chromium install isn't wasted.
+
+name: web-ci
+
+on:
+  pull_request:
+    paths:
+      - 'apps/web/**'
+      - '.github/workflows/web-ci.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'apps/web/**'
+
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    defaults:
+      run:
+        working-directory: apps/web
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Type-check (tsc --noEmit)
+        # A drift between Pydantic models and TS interfaces would
+        # surface here as a type error on the next CallSummary / CallDetail
+        # fixture build, not as a runtime "missing field" silently.
+        run: npm run type-check
+
+      - name: Vitest
+        run: npm run test
+
+      - name: Next build (static export)
+        # The web app is deployed as a static export; building here
+        # confirms ``output: 'export'`` succeeds with the current
+        # component graph.  Same step web-e2e runs before its
+        # Playwright phase, but here we gate it independently so a
+        # build break doesn't cascade into a Chromium-install wait.
+        run: npm run build

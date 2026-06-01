@@ -1,0 +1,112 @@
+# API CI — pytest on SQLite (default backend) and Postgres (service
+# container).  Catches regressions across the migration, RLS, and
+# tenancy surface before they ship.
+#
+# The two test jobs run in parallel: SQLite catches portability
+# regressions cheaply (no service container, no apt install); Postgres
+# is the production target and exercises the RLS policies that SQLite
+# can't (RLS is a no-op on SQLite).
+#
+# Triggers on changes that touch the API or shared evaluator package
+# so a UI-only PR doesn't pay the cost.
+
+name: api-ci
+
+on:
+  pull_request:
+    paths:
+      - 'apps/api/**'
+      - 'packages/evaluators/**'
+      - 'packages/cli/**'
+      - 'tests/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.github/workflows/api-ci.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'apps/api/**'
+      - 'packages/evaluators/**'
+      - 'packages/cli/**'
+      - 'tests/**'
+
+
+jobs:
+  pytest-sqlite:
+    name: pytest (sqlite)
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: latest
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install workspace
+        # ``uv sync`` installs the workspace members (cli, evaluators,
+        # api) in dev mode + every dev / test dep declared in the root
+        # ``pyproject.toml``.  Same one-shot setup the local dev loop
+        # uses.
+        run: uv sync --all-extras
+
+      - name: Run pytest
+        # Postgres-only tests skip cleanly when ``EVALGUARD_TEST_POSTGRES_URL``
+        # is unset, so this job covers the SQLite path of the full
+        # suite without extra filter flags.
+        run: uv run pytest -q
+
+  pytest-postgres:
+    name: pytest (postgres)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # Postgres service container — the test fixtures connect via
+    # ``EVALGUARD_TEST_POSTGRES_URL`` and create + drop their own
+    # tenant rows under RLS so the DB stays usable across tests.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER:     test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB:       eg_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U test -d eg_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      EVALGUARD_TEST_POSTGRES_URL: postgresql+psycopg://test:test@localhost:5432/eg_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: latest
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install workspace (with postgres extra)
+        # ``--all-extras`` includes the ``[postgres]`` extra which
+        # pulls in psycopg3.  Without it the Postgres fixture would
+        # skip at import time and the job would green-pass with zero
+        # tests run — silently masking RLS regressions.
+        run: uv sync --all-extras
+
+      - name: Run pytest (full suite — Postgres path executes)
+        run: uv run pytest -q
