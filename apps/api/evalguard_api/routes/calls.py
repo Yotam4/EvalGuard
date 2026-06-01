@@ -47,8 +47,11 @@ router = APIRouter()
 
 
 # Same whitelist the runs filter uses.  Inlined rather than imported
-# to avoid a circular import — both files are routes.
-_KNOWN_SOURCES: frozenset[str] = frozenset({"cli", "otlp"})
+# to avoid a circular import — both files are routes.  ``live`` is
+# the Phase PROXY-2 ingest path (proxied production calls), surfaced
+# alongside the batch sources so the operator can filter the stream
+# to "just what production hit today" with one click.
+_KNOWN_SOURCES: frozenset[str] = frozenset({"cli", "otlp", "live"})
 
 
 def _encode_cursor(ingested_at: str | None, row_id: int) -> str:
@@ -95,17 +98,36 @@ def _decode_cursor(cursor: str) -> tuple[str | None, int]:
 )
 def list_project_calls(
     project_slug: str,
-    tab:    Literal["recent", "failures"] = Query("recent"),
+    tab:    Literal["recent", "failures", "passed"] = Query("recent"),
     cursor: str | None = Query(default=None,
         description="Opaque cursor from the previous page's ``next_cursor``.  Omit for the first page."),
     limit:  int = Query(default=50, ge=1, le=200),
     source: str | None = Query(default=None,
-        description="Optional filter: ``cli`` (pushed via ``evalguard push``) "
-                    "or ``otlp`` (synthesised from a posted OTLP trace)."),
+        description="Optional filter: ``cli`` (pushed via ``evalguard push``), "
+                    "``otlp`` (synthesised from a posted OTLP trace), or "
+                    "``live`` (Phase PROXY-2 proxied production calls)."),
+    # Phase PROXY-2.5: time-range filters for the live-run timeline
+    # UI.  Both bounds are optional and combine cleanly with ``tab``
+    # + ``source`` + ``cursor``.  The composite index
+    # ``idx_run_rows_calls(project_id, ingested_at DESC, id DESC)``
+    # already covers ``ingested_at`` range scans — no schema change.
+    # ``to`` is exclusive (matches half-open ``[from, to)`` intervals
+    # so a click-and-drag selection on the timeline doesn't
+    # double-count the boundary minute on adjacent days).
+    from_: str | None = Query(default=None, alias="from",
+        description="Inclusive lower bound on ``ingested_at`` (ISO-8601)."),
+    to:    str | None = Query(default=None,
+        description="Exclusive upper bound on ``ingested_at`` (ISO-8601)."),
     conn:      Connection = Depends(get_conn),
     principal: Principal  = Depends(require_principal),
 ) -> CallListResponse:
-    """Cursor-paginated stream of one project's calls, newest-first."""
+    """Cursor-paginated stream of one project's calls, newest-first.
+
+    Time filtering: ``?from=&to=`` narrow to a half-open
+    ``[from, to)`` window.  Used by the live-run timeline UI to drill
+    into one day / one week / a custom range without abandoning the
+    cursor-paginated stream contract.
+    """
     if source is not None:
         # Normalise to lowercase + trim BEFORE the whitelist check so
         # ``?source=CLI`` matches ``?source=cli``.  The sibling
@@ -157,6 +179,18 @@ def list_project_calls(
 
     if tab == "failures":
         clauses.append("passed = 0")
+    elif tab == "passed":
+        # PROXY-2.5: the "what was classified as successful?" pane —
+        # the natural surface for hunting golden-promotion candidates
+        # in a live-run window without scrolling past failures.
+        clauses.append("passed = 1")
+
+    if from_ is not None:
+        clauses.append("ingested_at >= :from_ts")
+        params["from_ts"] = from_
+    if to is not None:
+        clauses.append("ingested_at < :to_ts")
+        params["to_ts"] = to
 
     if source is not None:
         # ``run_rows`` doesn't carry ``source``; join through ``runs``.
@@ -299,6 +333,7 @@ def get_call_detail(
         text("""SELECT runs.payload_json,
                        runs.ingested_at,
                        runs.project_id,
+                       runs.source     AS run_source,
                        projects.slug   AS project_slug,
                        projects.org_id AS owning_org_id
                 FROM runs
@@ -315,6 +350,40 @@ def get_call_detail(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Call {run_id}/{row_id!r} not found in project {project_slug!r}.",
+        )
+
+    # Phase PROXY-2.5: live calls store their per-row detail on
+    # ``run_rows.detail_json`` (NOT in ``runs.payload_json``, which is
+    # header-only for live runs).  Try the row table first so live
+    # calls drill down correctly; batch runs (CLI/OTLP) have
+    # ``detail_json`` NULL and fall through to the payload_json path.
+    live_detail = _try_live_detail(
+        conn, run_id=run_id, row_id=row_id, trial_id=trial_id,
+    )
+    if live_detail is not None:
+        return CallDetail(
+            run_id=run_id,
+            row_id=row_id,
+            trial_id=live_detail["trial_id"],
+            project_id=row["project_id"],
+            project=json.loads(row["payload_json"]).get("project", "") if row["payload_json"] else "",
+            ingested_at=live_detail["ingested_at"] or row["ingested_at"],
+            provider=live_detail["detail"].get("provider"),
+            model=live_detail["detail"].get("model"),
+            passed=bool(live_detail["passed"]),
+            n_scores=int(live_detail["n_scores"] or 0),
+            cost_usd=float(live_detail["cost_usd"] or 0.0),
+            latency_ms=int(live_detail["latency_ms"] or 0),
+            cache_hit=bool(live_detail["cache_hit"]),
+            tags=_safe_json_list(live_detail["tags_json"]),
+            input=live_detail["detail"].get("input"),
+            expected=live_detail["detail"].get("expected"),
+            output=live_detail["detail"].get("output"),
+            scores=live_detail["detail"].get("scores") or [],
+            # Live calls don't accumulate trial-level gate verdicts —
+            # gates are a batch / threshold concept evaluated at trial
+            # finish, not per-call.
+            trial_gates=[],
         )
 
     payload = json.loads(row["payload_json"])
@@ -368,3 +437,39 @@ def get_call_detail(
         scores=target_row.get("scores") or [],
         trial_gates=(target_trial or {}).get("gates") or [],
     )
+
+
+def _try_live_detail(
+    conn: Connection,
+    *,
+    run_id: str,
+    row_id: str,
+    trial_id: str | None,
+) -> dict | None:
+    """Phase PROXY-2.5: pull a live call's full detail from
+    ``run_rows.detail_json``.  Returns ``None`` when no row exists
+    OR the row's ``detail_json`` is NULL (batch-ingested row, fall
+    through to the payload_json walk in the caller).
+
+    Multi-trial disambiguation: live runs ship one trial per
+    provider+model so a same-row collision across trials is rare,
+    but we honour the optional ``trial_id`` filter for parity with
+    the batch path."""
+    clauses = ["run_id = :run_id", "row_id = :row_id"]
+    params: dict = {"run_id": run_id, "row_id": row_id}
+    if trial_id is not None:
+        clauses.append("trial_id = :trial_id")
+        params["trial_id"] = trial_id
+    sql = text(
+        "SELECT trial_id, detail_json, ingested_at, passed, n_scores, "
+        "       cost_usd, latency_ms, cache_hit, tags_json "
+        f"FROM run_rows WHERE {' AND '.join(clauses)} LIMIT 1"
+    )
+    row = conn.execute(sql, params).mappings().fetchone()
+    if row is None or row["detail_json"] is None:
+        return None
+    try:
+        detail = json.loads(row["detail_json"])
+    except (TypeError, ValueError):
+        return None
+    return {**dict(row), "detail": detail}

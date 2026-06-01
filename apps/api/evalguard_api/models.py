@@ -808,3 +808,41 @@ class InvokeResponse(_Loose):
     row_id:     str
     scores:     list[InvokeScoreOut]
     error:      str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Phase PROXY-2.5 — live-run timeline + aggregate views.
+
+
+class LiveTimelineEntry(_Strict):
+    """One day's live run summary — the unit the timeline UI renders
+    as one horizontal bar.  Aggregates come straight from
+    ``runs.row_count / row_pass_count / row_fail_count / cost_usd``
+    which the proxy increments inside each call's transaction (PROXY-2),
+    so a SUM here matches the live ground truth without extra work."""
+
+    run_id:         str
+    started_at:     str | None
+    finished_at:    str | None
+    row_count:      int
+    row_pass_count: int
+    row_fail_count: int
+    cost_usd:       float
+
+
+class LiveTimelineResponse(_Strict):
+    """List of daily live runs for one project, newest-first."""
+
+    entries: list[LiveTimelineEntry]
+
+
+class LiveAggregate(_Strict):
+    """Roll-up SUMs over an arbitrary ``[from, to)`` window.  Powers
+    the timeline header banner ("29,455 calls · 97.5% pass · $71.00")
+    and the drag-select range aggregate."""
+
+    row_count:      int
+    row_pass_count: int
+    row_fail_count: int
+    cost_usd:       float
+    run_count:      int     # how many daily runs the window covers

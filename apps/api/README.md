@@ -55,7 +55,9 @@ curl -s -H "Authorization: Bearer $EVALGUARD_API_KEY" \
 | `GET`  | `/v1/assets/{kind}/{asset_id}/versions` | Member. Every `(version_id, run_id, ingested_at)` for one asset. Query: `project_id=<id>` (required) `&limit=200`. 400 unknown kind; 404 missing/cross-org. |
 | `GET`  | `/v1/reviews/queue`  | Member. Rows of a run that failed + the caller hasn't reviewed. Query: `run_id=<id>&limit=50`. |
 | `POST` | `/v1/reviews`        | Member. Submit `{run_id, row_id, verdict, note?}`; verdict ∈ `agree\|override_pass\|override_fail\|skip`. UPSERT per reviewer. |
-| `GET`  | `/v1/projects/{slug}/calls` | Member. Cursor-paginated call stream. Query: `tab=recent\|failures&cursor=&limit=50&source=`. |
+| `GET`  | `/v1/projects/{slug}/calls` | Member. Cursor-paginated call stream. Query: `tab=recent\|failures\|passed&cursor=&limit=50&source=cli\|otlp\|live&from=&to=`. `from`/`to` is half-open `[from, to)` on `ingested_at` (PROXY-2.5). |
+| `GET`  | `/v1/projects/{slug}/live/timeline` | Member. **PROXY-2.5.** Daily live runs newest-first, one entry per `run_live_*`. Query: `days=30` (max 90). |
+| `GET`  | `/v1/projects/{slug}/live/aggregate` | Member. **PROXY-2.5.** SUM of pass / fail / cost / run count across `[from, to)`. Omit bounds for all-time. |
 | `GET`  | `/v1/projects/{slug}/calls/{run_id}/{row_id}` | Member. One call's full input/expected/output/scores/gates. |
 | `POST` | `/v1/golden/candidates` | Member. Promote `{run_id, row_id, note?}` to the golden staging table. Idempotent per reviewer. |
 | `GET`  | `/v1/projects/{slug}/golden/candidates` | Member. Staged candidates. Query: `limit=100&expand=row` (`expand=row` attaches input/expected/output). |
