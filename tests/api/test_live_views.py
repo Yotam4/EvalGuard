@@ -288,10 +288,16 @@ def test_live_timeline_respects_days_cap(client, auth_headers):
 
 
 def test_live_aggregate_sums_across_runs(client, auth_headers):
-    """SUM(row_*) + COUNT(runs) across the window."""
+    """SUM over per-row data across the window — review-pass: the
+    aggregate now sums from ``run_rows`` (same source as /calls) so
+    non-day-aligned windows agree banner-vs-list.  This test inserts
+    matching ``run_rows`` entries for each synthetic live run."""
     from sqlalchemy import text
     engine = client.app.state.engine
     with engine.begin() as conn:
+        # Three live parent runs, each with their row counters AND
+        # a matching set of per-row entries (the new aggregate sums
+        # from these, not from the parent's row_* columns).
         for run_id, started, rc, rp in [
             ("run_livea", "2026-05-27T00:00:00+00:00", 100, 95),
             ("run_liveb", "2026-05-28T00:00:00+00:00", 200, 195),
@@ -313,6 +319,23 @@ def test_live_aggregate_sums_across_runs(client, auth_headers):
                 {"rid": run_id, "s": started, "c": 2.0,
                  "rc": rc, "rp": rp, "rf": rc - rp},
             )
+            # Synthesise per-row rows so the new aggregate
+            # (SUM over run_rows) has data to count.  All rows
+            # share the parent's ``started_at`` as ``ingested_at``
+            # so the day-aligned window tests below still partition
+            # them correctly.
+            for i in range(rc):
+                conn.execute(
+                    text("""INSERT INTO run_rows(
+                              run_id, trial_id, project_id, row_id,
+                              passed, n_scores, cost_usd, ingested_at)
+                            VALUES (
+                              :rid, 'trial_t', (SELECT project_id FROM projects WHERE slug='default'),
+                              :row_id, :p, 0, :c, :s)"""),
+                    {"rid": run_id, "row_id": f"r-{run_id}-{i}",
+                     "p": 1 if i < rp else 0,
+                     "c": 2.0 / rc, "s": started},
+                )
 
     # All-time aggregate covers all 3 runs.
     all_time = client.get(
@@ -348,6 +371,49 @@ def test_live_aggregate_empty_window_returns_zero(client, auth_headers):
     a = r.json()
     assert a == {"row_count": 0, "row_pass_count": 0, "row_fail_count": 0,
                  "cost_usd": 0.0, "run_count": 0}
+
+
+def test_live_aggregate_agrees_with_calls_list_on_non_day_aligned_window(
+    client, auth_headers,
+):
+    """Review-pass regression: /live/aggregate must filter by
+    per-row ``ingested_at`` (same column /calls uses), not by
+    daily-bucket ``started_at``.  Earlier implementation would
+    EXCLUDE a daily run whose ``started_at`` fell before a
+    non-midnight ``from=``, producing banner-says-zero while the
+    list shows real calls.  Repro the bug shape: drop one call at
+    12:00 on May 28 (under the May-28 daily run with
+    started_at=28T00) and query with from=28T08."""
+    _push_default_config(client, auth_headers)
+    inv = _invoke(client, auth_headers, input="x")
+    row_id = inv.json()["row_id"]
+    # Pin the row to a known mid-day time so the test isn't wall-clock
+    # dependent.  The parent run keeps its synthetic started_at=28T00.
+    _set_row_ingested_at(client, row_id, "2026-05-28T12:00:00+00:00")
+    run_id = inv.json()["run_id"]
+    _set_run_started_at(client, run_id, "2026-05-28T00:00:00+00:00")
+
+    # Non-day-aligned window covering 28T08:00 → 29T08:00.
+    agg = client.get(
+        "/v1/projects/default/live/aggregate"
+        "?from=2026-05-28T08:00:00+00:00&to=2026-05-29T08:00:00+00:00",
+        headers=auth_headers,
+    )
+    assert agg.status_code == 200
+    a = agg.json()
+    # The 12:00 call IS inside the window — aggregate must see it.
+    assert a["row_count"] == 1, (
+        f"aggregate should count the row at 12:00, got {a}"
+    )
+
+    # /calls with the same bounds should agree.
+    calls = client.get(
+        "/v1/projects/default/calls"
+        "?tab=recent&from=2026-05-28T08:00:00+00:00&to=2026-05-29T08:00:00+00:00",
+        headers=auth_headers,
+    )
+    assert len(calls.json()["calls"]) == 1
+    assert calls.json()["calls"][0]["row_id"] == row_id
 
 
 # ---------------------------------------------------------------------------

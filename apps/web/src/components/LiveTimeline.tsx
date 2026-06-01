@@ -28,15 +28,24 @@ export function LiveTimeline({
   activeTo:   string | undefined;
   onPick: (window: { from: string; to: string } | null) => void;
 }) {
+  // Live traffic mutates the underlying data continuously, so the
+  // timeline + aggregate are auto-refreshed every 30s.  Without this
+  // an operator watching incoming production calls would see stale
+  // bars until a route change — exactly the wrong UX for the
+  // "verbose inspection" surface this view is built for.  30s
+  // balances freshness against API load: the timeline endpoint is
+  // a cheap aggregate, but a 1s refetch on a busy dashboard would
+  // still add real cost.
+  const _REFRESH_MS = 30_000;
   const timeline = useQuery({
     queryKey: ["live-timeline", project],
     queryFn: () => listProjectLiveTimeline(project, { days: 30 }),
+    refetchInterval: _REFRESH_MS,
   });
-  // Aggregate covers the whole 30-day horizon when no window is
-  // active; narrows when the user picks one.
   const agg = useQuery({
     queryKey: ["live-aggregate", project, activeFrom ?? null, activeTo ?? null],
     queryFn: () => getLiveAggregate(project, { from: activeFrom, to: activeTo }),
+    refetchInterval: _REFRESH_MS,
   });
 
   if (timeline.isPending) return null;   // silent on first paint
@@ -167,7 +176,17 @@ function isActive(
   activeFrom: string | undefined,
   activeTo:   string | undefined,
 ): boolean {
+  // Compare by epoch milliseconds rather than raw strings.  The
+  // server may stamp ``started_at`` as ``2026-05-29T00:00:00+00:00``
+  // but a future schema bump or a hand-crafted URL could send
+  // ``2026-05-29T00:00:00.000+00:00`` or ``...Z``; ``===`` on the
+  // raw strings would silently miss the highlight.  ``new Date(x)
+  // .getTime()`` normalises every reasonable ISO-8601 form.
   if (!activeFrom || !activeTo || !entry.started_at) return false;
-  return entry.started_at === activeFrom &&
-         plusOneDay(entry.started_at) === activeTo;
+  const entryFrom = new Date(entry.started_at).getTime();
+  const entryTo   = new Date(plusOneDay(entry.started_at)).getTime();
+  const wantFrom  = new Date(activeFrom).getTime();
+  const wantTo    = new Date(activeTo).getTime();
+  if ([entryFrom, entryTo, wantFrom, wantTo].some(Number.isNaN)) return false;
+  return entryFrom === wantFrom && entryTo === wantTo;
 }

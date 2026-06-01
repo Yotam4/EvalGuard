@@ -134,42 +134,59 @@ def get_live_timeline(
 def get_live_aggregate(
     project_slug: str,
     from_: str | None = Query(default=None, alias="from",
-        description="Inclusive lower bound on ``runs.started_at`` (ISO-8601)."),
+        description="Inclusive lower bound on ``run_rows.ingested_at`` (ISO-8601)."),
     to:    str | None = Query(default=None,
-        description="Exclusive upper bound on ``runs.started_at`` (ISO-8601)."),
+        description="Exclusive upper bound on ``run_rows.ingested_at`` (ISO-8601)."),
     conn:      Connection = Depends(get_conn),
     principal: Principal  = Depends(require_principal),
 ) -> LiveAggregate:
-    """SUM of pass / fail / cost across the live runs that fall in
+    """SUM of pass / fail / cost across the proxied calls that fall in
     ``[from, to)``.  Omit both bounds for "all-time" (the project's
     full live history).
 
     Half-open interval so a drag-select across adjacent days doesn't
     double-count the boundary minute — matches the calls list's
-    ``?from=&to=`` contract.
+    ``?from=&to=`` contract on **the same column** (per-row
+    ``ingested_at``).  An earlier implementation filtered the daily
+    ``runs.started_at`` buckets, which produced disagreeing
+    banner-vs-list counts for non-day-aligned windows: a window like
+    ``28T12 → 29T12`` excluded the May-28 daily run (its
+    ``started_at = 28T00 < from``) even though calls between
+    ``28T12`` and ``29T00`` were inside the window.  Summing
+    ``run_rows`` directly keeps the banner exactly consistent with
+    what the list shows; the composite ``idx_run_rows_calls``
+    already covers the range scan.
     """
     project = _resolve_project(conn, principal, project_slug)
 
-    clauses = ["project_id = :pid", "source = 'live'"]
+    # Sum directly from ``run_rows`` (the same source-of-truth the
+    # /calls list reads from).  Live rows are identified by their
+    # parent run's ``source = 'live'``; the IN subquery short-
+    # circuits because ``runs.run_id`` is the PK.
+    clauses = ["rr.project_id = :pid",
+               "EXISTS (SELECT 1 FROM runs r "
+               "        WHERE r.run_id = rr.run_id AND r.source = 'live')"]
     params: dict = {"pid": project["project_id"]}
     if from_ is not None:
-        clauses.append("started_at >= :from_ts")
+        clauses.append("rr.ingested_at >= :from_ts")
         params["from_ts"] = from_
     if to is not None:
-        clauses.append("started_at < :to_ts")
+        clauses.append("rr.ingested_at < :to_ts")
         params["to_ts"] = to
     where = " AND ".join(clauses)
 
     # ``COALESCE`` so an empty window returns zero counters rather
     # than NULL — the UI's header banner divides by row_count to get
-    # the pass-rate and the zero-call case shows "—" cleanly.
+    # the pass-rate and the zero-call case shows "—" cleanly.  The
+    # ``passed`` column is 0|1 so SUM(passed) is row_pass_count.
     row = conn.execute(
-        text(f"""SELECT COALESCE(SUM(row_count), 0)      AS row_count,
-                        COALESCE(SUM(row_pass_count), 0) AS row_pass_count,
-                        COALESCE(SUM(row_fail_count), 0) AS row_fail_count,
-                        COALESCE(SUM(cost_usd), 0)       AS cost_usd,
-                        COUNT(*)                          AS run_count
-                 FROM runs WHERE {where}"""),
+        text(f"""SELECT COUNT(*)                            AS row_count,
+                        COALESCE(SUM(rr.passed), 0)         AS row_pass_count,
+                        COALESCE(SUM(1 - rr.passed), 0)     AS row_fail_count,
+                        COALESCE(SUM(rr.cost_usd), 0)       AS cost_usd,
+                        COUNT(DISTINCT rr.run_id)           AS run_count
+                 FROM run_rows AS rr
+                 WHERE {where}"""),
         params,
     ).mappings().fetchone()
 

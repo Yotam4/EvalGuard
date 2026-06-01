@@ -358,7 +358,8 @@ def get_call_detail(
     # calls drill down correctly; batch runs (CLI/OTLP) have
     # ``detail_json`` NULL and fall through to the payload_json path.
     live_detail = _try_live_detail(
-        conn, run_id=run_id, row_id=row_id, trial_id=trial_id,
+        conn, run_id=run_id, row_id=row_id,
+        project_id=row["project_id"], trial_id=trial_id,
     )
     if live_detail is not None:
         return CallDetail(
@@ -444,6 +445,7 @@ def _try_live_detail(
     *,
     run_id: str,
     row_id: str,
+    project_id: str,
     trial_id: str | None,
 ) -> dict | None:
     """Phase PROXY-2.5: pull a live call's full detail from
@@ -454,9 +456,18 @@ def _try_live_detail(
     Multi-trial disambiguation: live runs ship one trial per
     provider+model so a same-row collision across trials is rare,
     but we honour the optional ``trial_id`` filter for parity with
-    the batch path."""
-    clauses = ["run_id = :run_id", "row_id = :row_id"]
-    params: dict = {"run_id": run_id, "row_id": row_id}
+    the batch path.
+
+    Defence-in-depth: the caller (``get_call_detail``) has already
+    verified project visibility before reaching this helper, but we
+    AND the ``project_id`` into the WHERE clause anyway so a future
+    refactor that exposes this helper more broadly can't accidentally
+    cross-project leak.  Cheap — ``project_id`` is on the row already
+    via OBS-1's denormalisation."""
+    clauses = ["run_id = :run_id", "row_id = :row_id",
+               "project_id = :project_id"]
+    params: dict = {"run_id": run_id, "row_id": row_id,
+                    "project_id": project_id}
     if trial_id is not None:
         clauses.append("trial_id = :trial_id")
         params["trial_id"] = trial_id

@@ -39,6 +39,7 @@ Failure modes (recorded as rows even when 502):
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from typing import Any
@@ -59,6 +60,13 @@ from evalguard_api.models import InvokeRequest, InvokeResponse
 
 
 router = APIRouter()
+
+
+# Hard ceiling on one proxied call's provider latency.  An upstream
+# LLM that hangs forever would otherwise pin a worker; 60s is generous
+# for a single completion while still catching real outages.  A future
+# slice can make this per-project via the stored config.
+_PROVIDER_CALL_TIMEOUT_S: float = 60.0
 
 
 def _resolve_project(
@@ -180,10 +188,24 @@ async def invoke(
     latency_ms = 0
     t0 = time.monotonic()
     try:
-        result = await provider.complete(prompt, model=model)
+        # ``asyncio.wait_for`` so a hung provider can't pin the worker
+        # forever — the proxy is on the production hot path and
+        # surviving upstream outages is part of the contract.  On
+        # timeout we still persist the row (under the failures tab)
+        # so the operator sees the regression in /calls/.
+        result = await asyncio.wait_for(
+            provider.complete(prompt, model=model),
+            timeout=_PROVIDER_CALL_TIMEOUT_S,
+        )
         output     = result.output
         cost_usd   = float(result.cost_usd)
         latency_ms = int(result.latency_ms)
+    except asyncio.TimeoutError:
+        error = (
+            f"TimeoutError: provider {provider_id!r} did not respond "
+            f"within {_PROVIDER_CALL_TIMEOUT_S:.0f}s"
+        )
+        latency_ms = int((time.monotonic() - t0) * 1000)
     except Exception as e:
         error = f"{type(e).__name__}: {e}"
         latency_ms = int((time.monotonic() - t0) * 1000)

@@ -237,9 +237,22 @@ def record_call(
     passed_int = 1 if rec.passed else 0
     output_preview = rec.output[:_PREVIEW_CHARS] if rec.output else None
     tags_json = json.dumps(rec.tags) if rec.tags else None
+    # Defence-in-depth: a caller that POSTs an ``input`` carrying an
+    # accidental ``api_key`` / ``password`` / ``authorization`` field
+    # nested in a JSON dict shouldn't leak it via ``/calls/`` to anyone
+    # with project read access.  ``redact_secrets`` is the same key-
+    # name-based stripper the CLI audit chain uses (relocated to
+    # evaluators by PROXY-3); it walks dicts + lists, leaves scalars
+    # untouched, and is a no-op for the common case where ``input``
+    # is just a string.  Operator-defined secrets are still their
+    # responsibility (we can't infer "this string is sensitive"
+    # without keying), but key-shaped leaks are caught.
+    from evalguard_evaluators.audit import redact_secrets
+    safe_input    = redact_secrets(rec.raw_input)
+    safe_expected = redact_secrets(rec.raw_expected)
     detail_json = json.dumps({
-        "input":    rec.raw_input,
-        "expected": rec.raw_expected,
+        "input":    safe_input,
+        "expected": safe_expected,
         "output":   rec.output,
         "scores":   rec.scores,
         "provider": rec.provider,

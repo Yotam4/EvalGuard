@@ -280,6 +280,67 @@ def test_invoke_unauthenticated_returns_401(client):
 
 
 # ---------------------------------------------------------------------------
+# Review-pass: post-PROXY-2.5 hardening
+
+
+def test_invoke_rejects_oversized_input(client, auth_headers):
+    """A multi-MB ``input`` blob would otherwise bloat ``detail_json``
+    indefinitely and DoS the row table.  The ``_MAX_INPUT_BYTES``
+    cap (256 KB) rejects with a 422 before any provider call."""
+    _push_default_config_simple(client, auth_headers)
+    huge = "a" * (300 * 1024)
+    r = client.post(
+        "/v1/projects/default/invoke",
+        json={"input": huge},
+        headers=auth_headers,
+    )
+    assert r.status_code == 422, r.text
+    assert "too large" in r.text.lower()
+
+
+def test_invoke_redacts_secrets_in_detail_json(client, auth_headers):
+    """Defence-in-depth: an ``input`` carrying an accidental
+    ``api_key`` field shouldn't surface verbatim in detail_json.
+    Operators inspecting /calls/ shouldn't see leaked secrets."""
+    import json as _json
+    from sqlalchemy import text as _text
+    _push_default_config_simple(client, auth_headers)
+    inv = client.post(
+        "/v1/projects/default/invoke",
+        json={"input": {"prompt": "ok", "api_key": "evk_should_not_leak"}},
+        headers=auth_headers,
+    )
+    assert inv.status_code == 200
+    row_id = inv.json()["row_id"]
+
+    engine = client.app.state.engine
+    with engine.connect() as conn:
+        rec = conn.execute(
+            _text("SELECT detail_json FROM run_rows WHERE row_id = :rid"),
+            {"rid": row_id},
+        ).mappings().fetchone()
+    detail = _json.loads(rec["detail_json"])
+    assert detail["input"]["api_key"] == "***"
+    assert detail["input"]["prompt"]  == "ok"
+
+
+def _push_default_config_simple(client, headers):
+    """Echo-mode config without a length heuristic — keeps these
+    review-pass tests independent of evaluator details."""
+    yaml_blob = (
+        "version: 1\n"
+        "project: default\n"
+        "providers: [{ id: 'mock:m', config: { mode: echo, latency_ms: 0 } }]\n"
+    )
+    r = client.post(
+        "/v1/projects/default/config",
+        json={"content": yaml_blob},
+        headers=headers,
+    )
+    assert r.status_code in (200, 201), r.text
+
+
+# ---------------------------------------------------------------------------
 # live.py id determinism
 
 

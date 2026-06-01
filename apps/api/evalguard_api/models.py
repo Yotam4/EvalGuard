@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -776,9 +776,36 @@ class InvokeRequest(_Strict):
     extra:    dict[str, Any] | None = Field(default=None)
     row_id:   str | None = Field(default=None, min_length=1, max_length=200)
 
-    @classmethod
-    def __get_validators__(cls):  # pragma: no cover — pydantic v1 shim, unused in v2
-        return ()
+    @model_validator(mode="after")
+    def _enforce_size_bounds(self) -> "InvokeRequest":
+        """Server-side wall against a multi-MB ``input`` / ``expected``
+        / ``extra`` blob.  Pydantic's ``max_length`` only works on
+        sequences; ``Any`` fields need a custom check.  Sum of the
+        JSON-serialised forms (deterministic) is what we'd write to
+        ``detail_json`` anyway, so the cap is on the same shape that
+        actually lands on disk."""
+        import json as _json
+        total = 0
+        for field, value in (("input", self.input),
+                              ("expected", self.expected),
+                              ("extra", self.extra)):
+            if value is None:
+                continue
+            try:
+                total += len(_json.dumps(value, default=str).encode("utf-8"))
+            except (TypeError, ValueError):
+                # Non-serialisable values fail later in detail_json
+                # encoding too — surface here so the caller gets a
+                # 422 instead of a 500.
+                raise ValueError(
+                    f"{field!r} must be JSON-serialisable"
+                ) from None
+        if total > _MAX_INPUT_BYTES:
+            raise ValueError(
+                f"invoke body too large: input + expected + extra is "
+                f"{total} bytes, max is {_MAX_INPUT_BYTES}"
+            )
+        return self
 
 
 class InvokeScoreOut(_Loose):
