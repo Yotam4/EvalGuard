@@ -35,9 +35,33 @@ export function CallDetailPanel({
       className="space-y-4 rounded border border-[var(--color-border)] bg-[var(--color-bg-card)] p-4"
     >
       <Header data={data} onClose={onClose} projectSlug={projectSlug} />
+      {/* PROXY-2.5 review-pass: live calls that failed (provider error,
+          timeout, evaluator crash) carry the reason on ``data.error``.
+          Surface it in a red banner ABOVE the content grid so the
+          operator sees the failure cause before drilling into the
+          null-output / no-scores body. */}
+      {data.error && <ErrorBanner message={data.error} />}
       <ContentGrid data={data} />
       {data.scores.length > 0 && <ScoresTable scores={data.scores} />}
       {data.trial_gates.length > 0 && <TrialGates gates={data.trial_gates} />}
+    </div>
+  );
+}
+
+
+function ErrorBanner({ message }: { message: string }) {
+  return (
+    <div
+      data-testid="call-detail-error"
+      role="alert"
+      className="rounded border border-[var(--color-fail)] bg-[var(--color-bg-row)] p-3 text-sm"
+    >
+      <div className="mb-1 text-xs font-semibold uppercase tracking-wide text-[var(--color-fail)]">
+        Failure reason
+      </div>
+      <pre className="whitespace-pre-wrap break-words font-mono text-xs text-[var(--color-fg)]">
+        {message}
+      </pre>
     </div>
   );
 }

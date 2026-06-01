@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -43,9 +44,23 @@ from sqlalchemy.exc import IntegrityError
 from evalguard_api.db import now_iso
 
 
+logger = logging.getLogger("evalguard.api.live")
+
+
 # Mirror routes/runs.py:_PREVIEW_CHARS so live + batch rows truncate
 # identically in the OBS-1 stream view.
 _PREVIEW_CHARS: int = 240
+
+
+# PROXY-2.5 review-pass: provider responses are uncapped by the LLM
+# provider itself.  A chatty model can emit 100K+ characters per
+# call; without a cap this lands in ``run_rows.detail_json`` verbatim
+# and bloats the row table over time.  512 KiB is generous (most
+# completions are ≪ 50 KiB) while still bounding the worst case.
+# Larger outputs get truncated with a trailing marker so the operator
+# can tell at a glance the row was clipped.
+_MAX_OUTPUT_BYTES: int = 512 * 1024
+_TRUNC_MARKER:    str = "\n…[truncated by EvalGuard proxy]"
 
 
 def utc_date_str(now: datetime | None = None) -> str:
@@ -162,6 +177,14 @@ def ensure_live_run(
                     "now":          now_iso(),
                 },
             )
+        # Log the lazy-create at INFO so an operator debugging "why
+        # is there a new run row?" can correlate it with the day's
+        # first proxy call.  Skipped on race-loss (we didn't actually
+        # create it; the other request did and already logged).
+        logger.info(
+            "live run lazy-created run_id=%s project=%s date=%s",
+            run_id, project_id, date_str,
+        )
     except IntegrityError:
         # Concurrent first-call won the race — the row exists.
         pass
@@ -235,7 +258,19 @@ def record_call(
     row whose aggregate counters disagree.
     """
     passed_int = 1 if rec.passed else 0
-    output_preview = rec.output[:_PREVIEW_CHARS] if rec.output else None
+    # Cap the stored output BEFORE generating the preview so both
+    # surfaces reference the same truncated bytes.  The full provider
+    # response is still available from the upstream API if needed for
+    # debugging; the EvalGuard row's job is "operator-readable trace
+    # of what happened", not "lossless archive of every LLM byte".
+    stored_output = rec.output
+    if stored_output and len(stored_output.encode("utf-8")) > _MAX_OUTPUT_BYTES:
+        # Slice by character count first (encoding-safe), then add the
+        # marker.  Conservatively cap chars at _MAX_OUTPUT_BYTES so the
+        # byte budget is respected for ASCII; multibyte chars get
+        # slightly less.
+        stored_output = stored_output[:_MAX_OUTPUT_BYTES] + _TRUNC_MARKER
+    output_preview = stored_output[:_PREVIEW_CHARS] if stored_output else None
     tags_json = json.dumps(rec.tags) if rec.tags else None
     # Defence-in-depth: a caller that POSTs an ``input`` carrying an
     # accidental ``api_key`` / ``password`` / ``authorization`` field
@@ -253,7 +288,10 @@ def record_call(
     detail_json = json.dumps({
         "input":    safe_input,
         "expected": safe_expected,
-        "output":   rec.output,
+        # Use the truncated form so detail_json + output_preview
+        # never disagree.  A 502'd call with no output still records
+        # the empty string here, matching the read-side contract.
+        "output":   stored_output,
         "scores":   rec.scores,
         "provider": rec.provider,
         "model":    rec.model,

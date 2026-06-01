@@ -255,9 +255,19 @@ function Tabs<V extends string>({
   onChange: (v: V) => void;
   options: { value: V; label: string }[];
 }) {
+  // ARIA: this is a single-selection filter group, NOT a tablist
+  // (the active selection doesn't reveal an adjacent panel — it
+  // narrows the same list).  ``role="radiogroup"`` + ``role="radio"``
+  // is the correct semantic: AT announces "Recent, radio button,
+  // selected" / "Failures, radio button, not selected" with
+  // ``aria-checked`` driving the state.  Replaces the earlier
+  // ``aria-pressed`` toggle-button pattern that confused screen
+  // readers (PROXY-2.5 review-pass).
   return (
     <div
       data-testid={`${name}-tabs`}
+      role="radiogroup"
+      aria-label={name}
       className="flex flex-wrap gap-1 rounded border border-[var(--color-border)] bg-[var(--color-bg-card)] p-1"
     >
       {options.map((o) => {
@@ -266,11 +276,13 @@ function Tabs<V extends string>({
           <button
             key={o.value}
             type="button"
+            role="radio"
             data-tab={o.value}
-            aria-pressed={active}
+            aria-checked={active}
             onClick={() => onChange(o.value)}
             className={
               "rounded px-3 py-1 text-xs transition " +
+              "focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--color-accent)] " +
               (active
                 ? "bg-[var(--color-bg-row)] text-[var(--color-fg)]"
                 : "text-[var(--color-fg-muted)] hover:bg-[var(--color-bg-row)] hover:text-[var(--color-fg)]")

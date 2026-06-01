@@ -277,6 +277,11 @@ export interface CallSummary {
   tags: string[];
   ingested_at: string | null;
   output_preview: string | null;
+  // PROXY-2.5 review-pass — surfaced by the server's correlated
+  // ``runs.source`` subquery so the CallCard can show a "live" /
+  // "cli" / "otlp" badge without a second fetch.  ``null`` for
+  // legacy rows where the join missed (treated as unknown).
+  source: RunSource | null;
 }
 
 
@@ -301,6 +306,12 @@ export interface CallDetail {
   latency_ms: number;
   cache_hit: boolean;
   tags: string[];
+  // PROXY-2.5 review-pass: live calls that failed (provider error,
+  // timeout, evaluator crash) record their failure reason here so
+  // the drill-down panel can explain what went wrong instead of
+  // silently showing null output.  ``null`` for batch rows and for
+  // successful proxy calls.
+  error: string | null;
   // The "actual answer" surface — these can all be null when:
   //  - ``include_scores=False`` push omits them
   //  - cache hits / errors have no output

@@ -51,12 +51,6 @@ from evalguard_evaluators.audit_hook import (
 )
 
 
-# Module-level legacy alias kept for any third-party code that
-# imported the private name.  Internal callers use the public
-# ``PRIVACY_SENSITIVE_FIELDS`` from the evaluators module above.
-_PRIVACY_SENSITIVE_FIELDS = PRIVACY_SENSITIVE_FIELDS
-
-
 # ---------------------------------------------------------------------------
 # Emitter
 
@@ -259,9 +253,3 @@ def verify_chain(store: SqliteStore, run_id: str) -> dict[str, Any]:
     return verify_chain_events(store.list_events(run_id))
 
 
-# ---------------------------------------------------------------------------
-# Back-compat private aliases — legacy callers that imported the
-# private names directly stay working.
-
-_hash_event     = hash_event
-_hash_canonical = hash_canonical

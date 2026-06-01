@@ -33,7 +33,7 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.exc import IntegrityError
 
 from evalguard_api.auth import Principal, require_principal
-from evalguard_api.db import get_project_by_slug, now_iso
+from evalguard_api.db import now_iso, resolve_project_or_404
 from evalguard_api.deps import get_conn
 from evalguard_api.models import (
     ProjectConfig, ProjectConfigHistory, ProjectConfigIngest,
@@ -49,31 +49,10 @@ router = APIRouter()
 _HISTORY_MAX = 500
 
 
-def _resolve_project(
-    conn: Connection, principal: Principal, slug: str,
-) -> dict:
-    """Same project-resolution pattern as ``routes/golden.py`` /
-    ``routes/calls.py``: org-scoped lookup, with an admin slug-fallback
-    that picks deterministically when the same slug exists across
-    orgs (slugs are unique per-org, not globally).  Cross-org and
-    missing both surface as 404 with the same detail — anti-
-    enumeration."""
-    project = get_project_by_slug(
-        conn, org_id=principal.org_id, slug=slug,
-    )
-    if project is None and principal.is_admin:
-        row = conn.execute(
-            text("SELECT * FROM projects WHERE slug = :slug "
-                 "ORDER BY created_at, project_id LIMIT 1"),
-            {"slug": slug},
-        ).mappings().fetchone()
-        project = dict(row) if row else None
-    if project is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Project {slug!r} not found.",
-        )
-    return project
+# Project-resolution + cross-org 404 lives in ``db.py:resolve_project_or_404``
+# so all four route files share one implementation.  See that
+# function's docstring for the anti-enumeration semantics.
+_resolve_project = resolve_project_or_404
 
 
 # ---------------------------------------------------------------------------

@@ -163,6 +163,23 @@ def validate_for_startup(settings: Settings) -> None:
             "the API. Set EVALGUARD_CORS_ORIGINS to an explicit allowlist or "
             "configure EVALGUARD_API_KEY."
         )
+    # PROXY-2.5 review-pass: open mode + network-exposed bind is
+    # particularly dangerous now that ``/v1/projects/{slug}/invoke``
+    # fires real (paid) LLM calls.  Anyone on the network could
+    # burn provider credit at line rate.  Refuse to boot unless the
+    # operator has scoped the listener to loopback.  Operators who
+    # need open mode on a non-loopback interface should put a
+    # reverse-proxy with auth in front.
+    if settings.is_open_mode and settings.bind_host not in (
+        "127.0.0.1", "localhost", "::1",
+    ):
+        raise StartupRefusal(
+            f"Open mode (no API key) AND EVALGUARD_BIND_HOST="
+            f"{settings.bind_host!r} would expose the proxy invoke "
+            f"endpoint to any caller on the network. Bind to 127.0.0.1 "
+            f"(default), put auth in front via a reverse proxy, or set "
+            f"EVALGUARD_API_KEY to secure the server."
+        )
     if "*" in settings.cors_origins and not settings.is_open_mode:
         # Token-bearing requests from arbitrary origins are still
         # risky; we *warn* but allow because some users genuinely

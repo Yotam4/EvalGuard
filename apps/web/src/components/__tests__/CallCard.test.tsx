@@ -18,6 +18,7 @@ function makeCall(overrides: Partial<CallSummary> = {}): CallSummary {
     tags: [],
     ingested_at: "2026-05-15T07:30:00",
     output_preview: "the configured LLM said the request was handled.",
+    source: null,
     ...overrides,
   };
 }
@@ -31,6 +32,18 @@ describe("<CallCard>", () => {
     expect(screen.getByText("PASS")).toBeInTheDocument();
     rerender(<CallCard call={makeCall({ passed: false })} onSelect={() => {}} />);
     expect(screen.getByText("FAIL")).toBeInTheDocument();
+  });
+
+
+  it("renders ``live`` badge for source=live (PROXY-2.5 review-pass)", () => {
+    render(<CallCard call={makeCall({ source: "live" })} onSelect={() => {}} />);
+    expect(screen.getByText("live")).toBeInTheDocument();
+  });
+
+
+  it("omits the ``live`` badge for non-live sources", () => {
+    render(<CallCard call={makeCall({ source: "cli" })} onSelect={() => {}} />);
+    expect(screen.queryByText("live")).not.toBeInTheDocument();
   });
 
 

@@ -25,7 +25,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
 from evalguard_api.auth import Principal, require_principal
-from evalguard_api.db import get_project_by_slug
+from evalguard_api.db import resolve_project_or_404
 from evalguard_api.deps import get_conn
 from evalguard_api.models import (
     LiveAggregate, LiveTimelineEntry, LiveTimelineResponse,
@@ -42,27 +42,8 @@ router = APIRouter()
 _TIMELINE_MAX_DAYS = 90
 
 
-def _resolve_project(
-    conn: Connection, principal: Principal, slug: str,
-) -> dict:
-    """Same project-resolution + anti-enumeration shape used in
-    ``routes/configs.py`` / ``routes/golden.py`` / ``routes/calls.py``."""
-    project = get_project_by_slug(
-        conn, org_id=principal.org_id, slug=slug,
-    )
-    if project is None and principal.is_admin:
-        row = conn.execute(
-            text("SELECT * FROM projects WHERE slug = :slug "
-                 "ORDER BY created_at, project_id LIMIT 1"),
-            {"slug": slug},
-        ).mappings().fetchone()
-        project = dict(row) if row else None
-    if project is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Project {slug!r} not found.",
-        )
-    return project
+# Project-resolution + cross-org 404 — see ``db.py:resolve_project_or_404``.
+_resolve_project = resolve_project_or_404
 
 
 # ---------------------------------------------------------------------------

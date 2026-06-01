@@ -308,6 +308,13 @@ class CallSummary(_Strict):
     # rows (backfill is deferred — see migration 0007 docstring) or
     # for rows that legitimately had no output (cache hits, errors).
     output_preview: str | None = None
+    # PROXY-2.5 review-pass: denormalised from the parent ``runs.source``
+    # so the stream UI can tag each card with where the call came from
+    # (``cli`` push, ``otlp`` trace, ``live`` proxy).  Operators
+    # scanning /calls/ after enabling the proxy need to tell live
+    # production calls apart from CI evaluation rows at a glance.
+    # ``None`` for legacy rows the join couldn't resolve.
+    source:         str | None = None
 
 
 class CallListResponse(_Strict):
@@ -417,6 +424,14 @@ class CallDetail(_Loose):
     # "the gates that ran around this row" — useful for triage
     # without claiming the gates apply per-row.
     trial_gates:   list[Gate] = Field(default_factory=list)
+    # PROXY-2.5 review-pass: live calls that failed (provider error,
+    # timeout, evaluator exception) record their failure reason on
+    # ``run_rows.detail_json``.  Without exposing it the drill-down
+    # panel would be silent about what went wrong — a 502'd call
+    # would show null input / null output / no scores with no
+    # explanation.  ``None`` for batch rows (errors live in events
+    # there) and for successful proxy calls.
+    error:         str | None = None
 
 
 # ---------------------------------------------------------------------------

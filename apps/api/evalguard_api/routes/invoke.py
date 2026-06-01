@@ -40,6 +40,8 @@ Failure modes (recorded as rows even when 502):
 from __future__ import annotations
 
 import asyncio
+import functools
+import logging
 import time
 import uuid
 from typing import Any
@@ -49,8 +51,11 @@ from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
+
+logger = logging.getLogger("evalguard.api.invoke")
+
 from evalguard_api.auth import Principal, require_principal
-from evalguard_api.db import get_project_by_slug
+from evalguard_api.db import resolve_project_or_404
 from evalguard_api.deps import get_conn
 from evalguard_api.live import (
     LiveCallRecord, ensure_live_run, ensure_live_trial,
@@ -69,34 +74,25 @@ router = APIRouter()
 _PROVIDER_CALL_TIMEOUT_S: float = 60.0
 
 
-def _resolve_project(
-    conn: Connection, principal: Principal, slug: str,
-) -> dict:
-    """Same project-resolution pattern as ``routes/configs.py``."""
-    project = get_project_by_slug(
-        conn, org_id=principal.org_id, slug=slug,
-    )
-    if project is None and principal.is_admin:
-        row = conn.execute(
-            text("SELECT * FROM projects WHERE slug = :slug "
-                 "ORDER BY created_at, project_id LIMIT 1"),
-            {"slug": slug},
-        ).mappings().fetchone()
-        project = dict(row) if row else None
-    if project is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Project {slug!r} not found.",
-        )
-    return project
+# Project-resolution + cross-org 404 — see ``db.py:resolve_project_or_404``.
+_resolve_project = resolve_project_or_404
 
 
 def _load_latest_config(conn: Connection, project_id: str) -> dict:
     """Fetch + parse the project's latest stored config.  422s if no
     config has been pushed or the bytes don't parse as YAML — there's
-    nothing to invoke against."""
+    nothing to invoke against.
+
+    PROXY-2.5 review-pass D4: parsing happens once per content hash,
+    not once per call.  A high-traffic project (100 req/s) was
+    re-parsing the same YAML 100× per second; the in-process cache
+    keyed on ``content_sha256`` cuts that to 1 parse per push.  The
+    cache invalidates naturally when ``evalguard push-config`` lands
+    a new revision (different hash → cache miss → re-parse).
+    """
     row = conn.execute(
-        text("""SELECT content FROM project_configs
+        text("""SELECT content_sha256, content
+                FROM project_configs
                 WHERE project_id = :pid
                 ORDER BY pushed_at DESC, id DESC
                 LIMIT 1"""),
@@ -107,8 +103,24 @@ def _load_latest_config(conn: Connection, project_id: str) -> dict:
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="No project config pushed.  Run `evalguard push-config` first.",
         )
+    cached = _parse_config_cached(row["content_sha256"], row["content"])
+    return cached
+
+
+# Bounded LRU keyed on ``content_sha256``.  64 entries is plenty —
+# typical deployments serve a handful of projects, each with maybe
+# a few config revisions in active use; a project with hundreds of
+# distinct configs would still keep its hottest in cache.  Memory
+# bound: ~64 × max-config-size ≈ 32 MiB worst-case (configs are
+# capped at 512 KiB at push time).
+@functools.lru_cache(maxsize=64)
+def _parse_config_cached(content_sha256: str, content: str) -> dict:
+    """Hashing the content as the cache key means a push of new
+    bytes (different SHA) cleanly invalidates the entry; we don't
+    have to remember to clear anything on a push.  Returns the
+    parsed dict; raises a 422 on malformed YAML."""
     try:
-        cfg = yaml.safe_load(row["content"])
+        cfg = yaml.safe_load(content)
     except yaml.YAMLError as e:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -161,9 +173,12 @@ async def invoke(
     provider_name, model = parse_provider_id(provider_id)
     provider_cfg = provider_spec.get("config") or {}
 
-    # Import lazily so test environments that don't install
-    # ``evalguard-evaluators`` (or that mock the registry) don't
-    # explode at module-load time — invoke is the only consumer.
+    # Deferred to call time so a misconfigured venv (missing
+    # ``evalguard-evaluators`` dep, broken entry-point registration)
+    # surfaces as a 422 on /invoke rather than killing the whole
+    # server at startup.  The dep IS hard-required now (PROXY-2
+    # added it to ``apps/api/pyproject.toml``); the laziness is
+    # purely a graceful-degradation choice.
     from evalguard_evaluators.base import EvalContext
     from evalguard_evaluators.registry import load_evaluator, load_provider
 

@@ -578,6 +578,42 @@ def get_project_by_slug(
     return dict(row) if row else None
 
 
+def resolve_project_or_404(conn: Connection, principal, slug: str) -> dict:
+    """Project resolution with the same anti-enumeration shape every
+    project-scoped route uses.
+
+    - Member: looks up the project in the caller's org.  Cross-org
+      slug → 404 (never 403, never the bytes).
+    - Admin: same lookup; on miss, falls back to a deterministic pick
+      across orgs (slugs are unique per-org, not globally; the
+      ``ORDER BY created_at, project_id LIMIT 1`` ensures the
+      ambiguous-slug case picks the same row every time rather than
+      whatever the planner returns).
+
+    Raises ``HTTPException(404)`` on miss.  Inlined into four route
+    files before PROXY-2.5 review-pass; extracted here so adding
+    e.g. project-level suspension or read-only mode is one edit, not
+    four.  Keep this helper as the only ``_resolve_project`` body in
+    the codebase — when in doubt, call this.
+    """
+    from fastapi import HTTPException, status
+
+    project = get_project_by_slug(conn, org_id=principal.org_id, slug=slug)
+    if project is None and principal.is_admin:
+        row = conn.execute(
+            text("SELECT * FROM projects WHERE slug = :slug "
+                 "ORDER BY created_at, project_id LIMIT 1"),
+            {"slug": slug},
+        ).mappings().fetchone()
+        project = dict(row) if row else None
+    if project is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project {slug!r} not found.",
+        )
+    return project
+
+
 def list_projects_for_org(conn: Connection, org_id: str) -> list[dict]:
     rows = conn.execute(
         text("SELECT * FROM projects WHERE org_id=:org ORDER BY created_at"),

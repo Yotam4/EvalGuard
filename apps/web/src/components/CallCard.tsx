@@ -46,6 +46,12 @@ export function CallCard({
         <span className="font-mono text-xs text-[var(--color-fg-muted)]">
           {call.row_id}
         </span>
+        {/* PROXY-2.5 review-pass: a "live" badge on proxied rows so
+            operators scanning /calls/ can tell production traffic
+            apart from CI-pushed batch rows at a glance.  Batch
+            sources (cli / otlp) stay unbadged — they were the
+            default before the proxy shipped. */}
+        {call.source === "live" && <Badge tone="info">live</Badge>}
         {call.cache_hit && <Badge tone="muted">cache</Badge>}
         {call.tags.slice(0, 3).map((t) => (
           <Badge key={t} tone="info">{t}</Badge>

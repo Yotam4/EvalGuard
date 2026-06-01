@@ -26,6 +26,7 @@ function makeDetail(overrides: Partial<CallDetail> = {}): CallDetail {
     output: "X is …",
     scores: [],
     trial_gates: [],
+    error: null,
     ...overrides,
   };
 }
@@ -62,6 +63,23 @@ describe("<CallDetailPanel>", () => {
     expect(screen.getByRole("heading", { name: "r-1" })).toBeInTheDocument();
     expect(screen.getByText("FAIL")).toBeInTheDocument();
     expect(screen.getByText(/mock:m/)).toBeInTheDocument();
+  });
+
+
+  it("renders the error banner when ``error`` is populated (PROXY-2.5 review-pass)", () => {
+    render(<CallDetailPanel data={makeDetail({
+      passed: false,
+      error: "TimeoutError: provider 'openai:gpt-4o' did not respond within 60s",
+    })} />);
+    const banner = screen.getByTestId("call-detail-error");
+    expect(banner).toBeInTheDocument();
+    expect(banner).toHaveTextContent(/timeouterror/i);
+  });
+
+
+  it("omits the error banner when ``error`` is null", () => {
+    render(<CallDetailPanel data={makeDetail({ error: null })} />);
+    expect(screen.queryByTestId("call-detail-error")).not.toBeInTheDocument();
   });
 
 

@@ -872,7 +872,7 @@ class SqliteStore:
 def _event_row_to_dict(r: Any) -> dict[str, Any]:
     """Lossless round-trip: a NULL column comes back as ``None``, never 0/0.0.
 
-    The hash chain depends on this — ``_hash_event`` will recompute over
+    The hash chain depends on this — ``hash_event`` will recompute over
     the read-back dict, and any normalization (e.g. ``None`` → ``0.0``)
     silently invalidates every event past it.
     """

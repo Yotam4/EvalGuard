@@ -229,10 +229,17 @@ def list_project_calls(
     # ``LIMIT N + 1`` so we can tell whether a next page exists
     # without a second COUNT(*) query.  If we get N+1 rows back, the
     # next page starts after row N; otherwise the next_cursor is None.
+    #
+    # ``source`` comes via a correlated subquery rather than a JOIN so
+    # the existing ``run_rows``-column WHERE clauses don't need
+    # qualification.  Cost is one PK lookup per page row (~50 by
+    # default); the planner uses the ``runs.run_id`` PK index.
     sql = text(f"""
         SELECT id, run_id, row_id, trial_id, project_id,
                passed, n_scores, cost_usd, latency_ms, cache_hit,
-               tags_json, ingested_at, output_preview
+               tags_json, ingested_at, output_preview,
+               (SELECT source FROM runs r WHERE r.run_id = run_rows.run_id)
+                   AS run_source
         FROM run_rows
         WHERE {where}
         ORDER BY ingested_at DESC, id DESC
@@ -258,6 +265,7 @@ def list_project_calls(
             tags=_safe_json_list(r["tags_json"]),
             ingested_at=r["ingested_at"],
             output_preview=r["output_preview"],
+            source=r["run_source"],
         )
         for r in page
     ]
@@ -385,6 +393,11 @@ def get_call_detail(
             # gates are a batch / threshold concept evaluated at trial
             # finish, not per-call.
             trial_gates=[],
+            # Surface the proxy's recorded failure reason (provider
+            # exception, asyncio timeout, evaluator crash) so the
+            # detail panel can explain a 502'd call instead of
+            # rendering "null output, no scores" silently.
+            error=live_detail["detail"].get("error"),
         )
 
     payload = json.loads(row["payload_json"])
