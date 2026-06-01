@@ -181,25 +181,36 @@ def test_invoke_without_config_returns_422(client, auth_headers):
     assert "push-config" in r.json()["detail"].lower()
 
 
-def test_invoke_with_no_providers_returns_422(client, auth_headers):
-    """Config exists but lists no providers — nothing to invoke."""
+def test_push_config_with_no_providers_rejected_at_push(client, auth_headers):
+    """Round-4 review-pass: empty ``providers:`` is now caught at
+    PUSH time (not at first invoke).  Operators get the validation
+    error immediately instead of after their first proxied call.
+
+    The invoke endpoint still has its own ``providers`` check as
+    defence-in-depth in case a historical config slipped past
+    push validation, but the happy-path failure is here at push."""
     bad = (
         "version: 1\n"
         "project: default\n"
         "providers: []\n"
     )
-    client.post(
+    push = client.post(
         "/v1/projects/default/config",
         json={"content": bad},
         headers=auth_headers,
     )
+    assert push.status_code == 422, push.text
+    assert "providers" in push.text.lower()
+
+    # Sanity: with no config pushed, invoke also 422s — exercises
+    # the "config absent" branch in invoke._load_latest_config.
     r = client.post(
         "/v1/projects/default/invoke",
         json={"input": "x"},
         headers=auth_headers,
     )
     assert r.status_code == 422
-    assert "providers" in r.json()["detail"].lower()
+    assert "push-config" in r.json()["detail"].lower()
 
 
 def test_invoke_provider_failure_returns_502_and_records_row(client, auth_headers):
@@ -354,6 +365,60 @@ def test_invoke_accepts_combined_three_fields_just_under_cap(client, auth_header
         headers=auth_headers,
     )
     assert r.status_code == 200, r.text
+
+
+def test_invoke_provider_429_returns_429_with_retry_after(client, auth_headers):
+    """Round-4 review-pass: upstream rate-limit (e.g. OpenAI's
+    ``RateLimitError: 429``) must surface as a real 429 + Retry-After
+    so the caller's back-off fires correctly.  A generic 502 would
+    leave the caller hammering the proxy."""
+    cfg = (
+        "version: 1\n"
+        "project: default\n"
+        "providers:\n"
+        "  - id: 'mock:m'\n"
+        "    config: { mode: echo, latency_ms: 0, fail_with: '429 Rate limit reached' }\n"
+    )
+    client.post(
+        "/v1/projects/default/config",
+        json={"content": cfg},
+        headers=auth_headers,
+    )
+    r = client.post(
+        "/v1/projects/default/invoke",
+        json={"input": "x"},
+        headers=auth_headers,
+    )
+    assert r.status_code == 429, r.text
+    assert r.headers.get("Retry-After") == "60"
+    body = r.json()
+    assert body["passed"] is False
+    assert "429" in (body["error"] or "")
+
+
+def test_invoke_provider_500_still_returns_502(client, auth_headers):
+    """Non-rate-limit upstream errors continue to surface as 502.
+    Verifies the detector doesn't over-trigger and mark every
+    failure as rate-limited."""
+    cfg = (
+        "version: 1\n"
+        "project: default\n"
+        "providers:\n"
+        "  - id: 'mock:m'\n"
+        "    config: { mode: echo, latency_ms: 0, fail_with: 'InternalServerError 500' }\n"
+    )
+    client.post(
+        "/v1/projects/default/config",
+        json={"content": cfg},
+        headers=auth_headers,
+    )
+    r = client.post(
+        "/v1/projects/default/invoke",
+        json={"input": "x"},
+        headers=auth_headers,
+    )
+    assert r.status_code == 502
+    assert "Retry-After" not in r.headers
 
 
 def test_invoke_provider_timeout_returns_502_and_records_row(

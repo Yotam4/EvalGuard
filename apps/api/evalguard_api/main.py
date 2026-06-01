@@ -184,6 +184,71 @@ async def lifespan(app: FastAPI):
         engine.dispose()
 
 
+class _JsonAwareFormatter(logging.Formatter):
+    """Formatter that emits structured (JSON-object) log messages
+    verbatim and wraps free-text messages in the standard human
+    prefix.
+
+    Why: the access-log middleware logs ``logger.info(json.dumps({...}))``;
+    a uniform ``"%(asctime)s %(levelname)s %(name)s %(message)s"`` format
+    embeds that JSON inside a plain-text outer line, so downstream log
+    shippers (Fluentd, Loki, CloudWatch Logs Insights) that parse each
+    line as JSON fail to ingest the structured fields.  This formatter
+    detects a JSON-object message (starts with ``{``, parseable as
+    ``dict``) and emits it raw — the structured entry already carries
+    every field a shipper needs (``evt``, ``key_id``, ``org_id``, …).
+    Non-JSON messages (alembic upgrade notices, the bootstrap-key
+    log, uvicorn's startup banner) keep the timestamped prefix so
+    humans tailing the file still get a readable form.
+    """
+
+    _PLAIN_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
+
+    def __init__(self) -> None:
+        super().__init__(fmt=self._PLAIN_FORMAT)
+
+    def format(self, record: logging.LogRecord) -> str:
+        msg = record.getMessage()
+        if msg.startswith("{") and msg.endswith("}"):
+            try:
+                import json as _json
+                parsed = _json.loads(msg)
+            except (TypeError, ValueError):
+                parsed = None
+            if isinstance(parsed, dict):
+                # Inject the log level so a shipper can filter by it
+                # without parsing the surrounding plain-text wrapper.
+                # ``ts`` is added only when absent — access-log lines
+                # don't carry one today; future structured emitters
+                # that provide their own are respected.
+                if "level" not in parsed:
+                    parsed["level"] = record.levelname.lower()
+                if "ts" not in parsed:
+                    import datetime
+                    parsed["ts"] = datetime.datetime.fromtimestamp(
+                        record.created, tz=datetime.timezone.utc,
+                    ).isoformat(timespec="milliseconds")
+                import json as _json
+                return _json.dumps(parsed, default=str)
+        # Plain-text path — alembic, uvicorn, free-text logger calls.
+        return super().format(record)
+
+
+def _install_json_aware_logging() -> None:
+    """Install the JSON-aware formatter on a single stderr handler.
+
+    Idempotent at the handler level — checks the root logger and only
+    attaches if it has no handlers (matches the prior ``basicConfig``
+    no-op-when-configured contract)."""
+    root = logging.getLogger()
+    if root.handlers:
+        return
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(_JsonAwareFormatter())
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+
+
 def build_app(settings: Settings | None = None) -> FastAPI:
     """Build the FastAPI app. Tests pass an explicit ``settings``
     (with a tmp-path sqlite DB and a known API key) so they don't
@@ -198,11 +263,7 @@ def build_app(settings: Settings | None = None) -> FastAPI:
     # (pytest configures them, ``main.run()`` configures them, gunicorn
     # configures them) so this is safe to call unconditionally.
     if not logging.getLogger().handlers:
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s %(levelname)s %(name)s %(message)s",
-            stream=sys.stderr,
-        )
+        _install_json_aware_logging()
     app = FastAPI(
         title="EvalGuard API",
         version=__import__("evalguard_api").__version__,
@@ -341,11 +402,7 @@ def run() -> None:  # pragma: no cover — convenience CLI entry
     import uvicorn
 
     settings = load_settings()
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-        stream=sys.stderr,
-    )
+    _install_json_aware_logging()
     uvicorn.run(
         "evalguard_api.main:app",
         host=settings.bind_host,

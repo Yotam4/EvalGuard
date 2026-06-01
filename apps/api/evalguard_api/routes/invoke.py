@@ -198,6 +198,15 @@ async def invoke(
 
     # --- provider call --------------------------------------------------------
     error: str | None = None
+    # Round-4 review-pass: differentiate upstream throttling from
+    # generic upstream errors so the caller's retry logic does the
+    # right thing.  ``True`` here forces a 429 + Retry-After in the
+    # response below; otherwise a generic 502 fires.  Detection is
+    # by string match against the exception message — providers
+    # vary in exception class names (httpx.HTTPStatusError,
+    # openai.RateLimitError, anthropic.RateLimitError, …) so a
+    # text-based test is the portable choice.
+    is_rate_limited = False
     output = ""
     cost_usd = 0.0
     latency_ms = 0
@@ -224,6 +233,7 @@ async def invoke(
     except Exception as e:
         error = f"{type(e).__name__}: {e}"
         latency_ms = int((time.monotonic() - t0) * 1000)
+        is_rate_limited = _looks_like_rate_limit(e)
 
     # --- evaluators -----------------------------------------------------------
     scores_payload: list[dict[str, Any]] = []
@@ -310,11 +320,17 @@ async def invoke(
         project_id=project["project_id"], rec=rec,
     )
 
-    # Provider-failed calls return 502 so the caller's retry logic
-    # fires; the row is already persisted (the operator sees it in
-    # /calls/ under the failures tab).
+    # Provider-failed calls surface as the most useful status for
+    # the caller's retry logic.  Rate-limit errors get 429 + a
+    # conservative Retry-After so a polite client backs off cleanly
+    # (and a misbehaving one is at least labeled correctly in
+    # ``/calls/?tab=failures``).  Everything else stays 502.
     if error is not None:
-        response.status_code = status.HTTP_502_BAD_GATEWAY
+        if is_rate_limited:
+            response.status_code = status.HTTP_429_TOO_MANY_REQUESTS
+            response.headers["Retry-After"] = "60"
+        else:
+            response.status_code = status.HTTP_502_BAD_GATEWAY
 
     return InvokeResponse(
         output=output, passed=passed and error is None,
@@ -333,3 +349,38 @@ def _to_prompt(value: Any) -> str:
         return json.dumps(value, default=str)
     except (TypeError, ValueError):
         return str(value)
+
+
+# ---------------------------------------------------------------------------
+# Round-4 review-pass: upstream-rate-limit detection.
+
+
+# Provider SDKs raise rate-limit errors with varying class names
+# (``openai.RateLimitError``, ``anthropic.RateLimitError``,
+# ``httpx.HTTPStatusError``).  Detecting by exception class would
+# require an import-per-provider hard-link the proxy doesn't want
+# to carry.  Detecting by message substring is portable across
+# providers and resilient to SDK version bumps.  The patterns are
+# conservative — false negatives (treating a true 429 as 5xx) are
+# acceptable; false positives (treating a 5xx as 429) would mislead
+# the caller's back-off and are explicitly avoided.
+_RATE_LIMIT_PATTERNS: tuple[str, ...] = (
+    "rate limit",          # OpenAI: "Rate limit reached"
+    "rate_limit",          # JSON-encoded error.code
+    "ratelimit",           # Anthropic: "RateLimitError"
+    "429",                 # raw status code from httpx / requests
+    "too many requests",   # HTTP 429 reason phrase
+    "quota",               # Google AI Studio: "Quota exceeded"
+    "throttl",             # AWS Bedrock: "ThrottlingException"
+)
+
+
+def _looks_like_rate_limit(exc: Exception) -> bool:
+    """Heuristic rate-limit detection from a provider exception.
+
+    Falsely-positive on a benign 5xx whose message happens to
+    contain "429" would be worse than falsely-negative on an
+    obscure rate-limit format, so the patterns are kept narrow.
+    """
+    msg = f"{type(exc).__name__} {exc}".lower()
+    return any(p in msg for p in _RATE_LIMIT_PATTERNS)

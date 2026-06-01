@@ -102,6 +102,87 @@ def test_post_rejects_extra_fields_422(client, auth_headers):
 
 
 # ---------------------------------------------------------------------------
+# Round-4 review-pass: push-time proxy-essential shape validation
+
+
+def test_post_rejects_yaml_without_version(client, auth_headers):
+    bad = "project: default\nproviders: [{ id: 'mock:m' }]\n"
+    r = client.post(
+        "/v1/projects/default/config",
+        json={"content": bad},
+        headers=auth_headers,
+    )
+    assert r.status_code == 422, r.text
+    assert "version" in r.text.lower()
+
+
+def test_post_rejects_yaml_without_project(client, auth_headers):
+    bad = "version: 1\nproviders: [{ id: 'mock:m' }]\n"
+    r = client.post(
+        "/v1/projects/default/config",
+        json={"content": bad},
+        headers=auth_headers,
+    )
+    assert r.status_code == 422
+    assert "project" in r.text.lower()
+
+
+def test_post_rejects_yaml_with_empty_providers(client, auth_headers):
+    bad = "version: 1\nproject: default\nproviders: []\n"
+    r = client.post(
+        "/v1/projects/default/config",
+        json={"content": bad},
+        headers=auth_headers,
+    )
+    assert r.status_code == 422
+    assert "providers" in r.text.lower()
+
+
+def test_post_rejects_yaml_with_provider_missing_id(client, auth_headers):
+    bad = (
+        "version: 1\n"
+        "project: default\n"
+        "providers:\n  - config: { mode: echo }\n"
+    )
+    r = client.post(
+        "/v1/projects/default/config",
+        json={"content": bad},
+        headers=auth_headers,
+    )
+    assert r.status_code == 422
+    assert "id" in r.text.lower()
+
+
+def test_post_rejects_malformed_yaml(client, auth_headers):
+    """Tab-indented YAML is a classic operator footgun — must 422
+    at push, not at first invoke."""
+    bad = "version: 1\n\tproject: default\n"   # tab indent
+    r = client.post(
+        "/v1/projects/default/config",
+        json={"content": bad},
+        headers=auth_headers,
+    )
+    assert r.status_code == 422
+    assert "valid yaml" in r.text.lower()
+
+
+def test_post_accepts_proxy_config_without_datasets(client, auth_headers):
+    """A pure-proxy config has no datasets — the lighter validation
+    (vs the full evalguard.schema.json) must accept it."""
+    proxy_only = (
+        "version: 1\n"
+        "project: default\n"
+        "providers: [{ id: 'mock:m', config: { mode: echo } }]\n"
+    )
+    r = client.post(
+        "/v1/projects/default/config",
+        json={"content": proxy_only},
+        headers=auth_headers,
+    )
+    assert r.status_code == 201, r.text
+
+
+# ---------------------------------------------------------------------------
 # GET latest
 
 

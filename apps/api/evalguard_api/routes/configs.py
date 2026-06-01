@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 
+import yaml
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
@@ -80,9 +81,22 @@ def push_config(
 
     Returns the canonical record (id + computed hash + stored pushed_at)
     so the client can pin to a specific revision later without
-    re-uploading."""
+    re-uploading.
+
+    Round-4 review-pass: validate the YAML's proxy-essential shape
+    at push time (must parse, must have ``version``, ``project``,
+    ``providers`` with at least one entry carrying a string ``id``).
+    Without this, malformed configs land in the store and surface
+    only at the first ``/invoke`` call — too late for the operator
+    to know their push was broken.  Deliberately a lighter check
+    than the full ``packages/schemas/evalguard.schema.json``
+    validation: that schema requires ``datasets`` which a pure
+    proxy config legitimately doesn't carry.
+    """
     project = _resolve_project(conn, principal, project_slug)
     project_id = project["project_id"]
+
+    _validate_proxy_essential_shape(body.content)
 
     sha = hashlib.sha256(body.content.encode("utf-8")).hexdigest()
 
@@ -266,3 +280,69 @@ def get_config_revision(
             detail=f"Config revision {config_id} not found for project {project_slug!r}.",
         )
     return ProjectConfig(**dict(row))
+
+
+# ---------------------------------------------------------------------------
+# Push-time validation (round-4 review-pass — fail fast at push, not
+# at first invoke).
+
+
+def _validate_proxy_essential_shape(content: str) -> None:
+    """Raise ``HTTPException(422)`` if the YAML is unparseable or
+    missing the fields the proxy will read at ``/invoke`` time.
+
+    Lighter than full ``evalguard.schema.json`` validation: the
+    schema requires ``datasets``, but a pure-proxy config has no
+    dataset (production traffic is the input).  We check only what
+    the proxy actually consumes:
+
+    - parses as YAML mapping (the existing 422 at ``_load_latest_config``
+      would also catch this, but we move it earlier so the OPERATOR
+      knows their push was broken)
+    - ``version`` is set (drift canary — schema bumps would tighten this)
+    - ``project`` is a non-empty string (matches the slug semantic)
+    - ``providers`` is a non-empty list, each entry has a string ``id``
+      (the proxy picks ``providers[0]``; an empty list or a malformed
+      entry would 422 at invoke time forever).
+    """
+    try:
+        cfg = yaml.safe_load(content)
+    except yaml.YAMLError as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Config is not valid YAML: {e}",
+        ) from None
+    if not isinstance(cfg, dict):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Config must be a YAML mapping at the top level.",
+        )
+    if "version" not in cfg:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Config must declare a top-level ``version`` field.",
+        )
+    project = cfg.get("project")
+    if not isinstance(project, str) or not project.strip():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Config must declare a non-empty string ``project`` field.",
+        )
+    providers = cfg.get("providers")
+    if not isinstance(providers, list) or not providers:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Config must declare a non-empty ``providers`` list.",
+        )
+    for i, entry in enumerate(providers):
+        if not isinstance(entry, dict):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"providers[{i}] must be a mapping (got {type(entry).__name__}).",
+            )
+        pid = entry.get("id")
+        if not isinstance(pid, str) or not pid.strip():
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"providers[{i}] must carry a non-empty string ``id``.",
+            )
