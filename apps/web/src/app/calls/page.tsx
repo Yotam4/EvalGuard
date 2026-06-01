@@ -10,6 +10,7 @@ import { Card } from "@/components/Card";
 import { CallCard } from "@/components/CallCard";
 import { CallDetailPanel } from "@/components/CallDetailPanel";
 import { ConnectionGate } from "@/components/ConnectionGate";
+import { LiveTimeline } from "@/components/LiveTimeline";
 import {
   getCallDetail, listProjectCalls,
   type CallSummary, type CallsTab, type RunSource,
@@ -19,11 +20,14 @@ import {
 /**
  * /calls/ — per-call observability stream.
  *
- * URL: ``/calls/?project=customer-service&tab=recent|failures&source=&call=run_x:r-1``
+ * URL: ``/calls/?project=customer-service&tab=recent|failures|passed&source=&from=&to=&call=run_x:r-1``
  *
  * - ``project`` (required) — which project's calls to stream
- * - ``tab``      — recent (default) or failures
- * - ``source``   — optional cli / otlp narrowing
+ * - ``tab``      — recent (default), failures, or passed (PROXY-2.5)
+ * - ``source``   — optional cli / otlp / live narrowing
+ * - ``from`` / ``to`` (PROXY-2.5) — half-open ``[from, to)`` window
+ *   on ``ingested_at``. Set automatically when the operator clicks a
+ *   day in the live-timeline strip.
  * - ``call``     — selected call as ``run_id:row_id``, opens the
  *                  side panel.  All on the URL so back-button works
  *                  and the link is shareable.
@@ -48,11 +52,19 @@ function Inner() {
   const router  = useRouter();
   const params  = useSearchParams();
   const project = params.get("project") ?? "";
+  const tabParam = params.get("tab");
   const tab: CallsTab =
-    params.get("tab") === "failures" ? "failures" : "recent";
+    tabParam === "failures" || tabParam === "passed" ? tabParam : "recent";
   const sourceParam = params.get("source");
   const source: RunSource | undefined =
-    sourceParam === "cli" || sourceParam === "otlp" ? sourceParam : undefined;
+    sourceParam === "cli" || sourceParam === "otlp" || sourceParam === "live"
+      ? sourceParam
+      : undefined;
+  // PROXY-2.5: optional ``from`` / ``to`` window on ``ingested_at``.
+  // The server treats them as a half-open ``[from, to)`` interval,
+  // which is what the timeline-day-click + drag-select land on.
+  const from = params.get("from") ?? undefined;
+  const to   = params.get("to")   ?? undefined;
   const selected = params.get("call");  // "run_id:row_id" or null
   const selectedTrial = params.get("trial");  // trial_id or null
 
@@ -81,14 +93,32 @@ function Inner() {
         project={project}
         tab={tab}
         source={source}
+        from={from}
+        to={to}
         onTab={(t)   => setParam("tab",    t === "recent" ? null : t)}
         onSource={(s) => setParam("source", s ?? null)}
+        onClearWindow={() => setParams({ from: null, to: null })}
+      />
+      {/* PROXY-2.5: timeline strip — clicking a daily bar sets the
+          ``[from, to)`` window so the list below narrows to that
+          day's calls.  Hidden when the project has no live runs to
+          avoid taking up space for batch-only projects. */}
+      <LiveTimeline
+        project={project}
+        activeFrom={from}
+        activeTo={to}
+        onPick={(window) => setParams({
+          from:   window?.from ?? null,
+          to:     window?.to   ?? null,
+        })}
       />
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-[1fr_2fr]">
         <CallsList
           project={project}
           tab={tab}
           source={source}
+          from={from}
+          to={to}
           selected={selected}
           onSelect={(call) => setParams({
             call:  `${call.run_id}:${call.row_id}`,
@@ -131,14 +161,18 @@ function ProjectPicker() {
 
 
 function Header({
-  project, tab, source, onTab, onSource,
+  project, tab, source, from, to, onTab, onSource, onClearWindow,
 }: {
   project: string;
   tab: CallsTab;
   source: RunSource | undefined;
+  from: string | undefined;
+  to:   string | undefined;
   onTab: (t: CallsTab) => void;
   onSource: (s: RunSource | null) => void;
+  onClearWindow: () => void;
 }) {
+  const windowActive = from || to;
   return (
     <div className="space-y-3">
       <div className="flex flex-wrap items-baseline gap-3">
@@ -146,6 +180,22 @@ function Header({
         <span className="text-sm text-[var(--color-fg-muted)]">
           project <span className="text-[var(--color-fg)]">{project}</span>
         </span>
+        {windowActive && (
+          <span
+            data-testid="window-chip"
+            className="inline-flex items-center gap-2 rounded border border-[var(--color-border)] bg-[var(--color-bg-row)] px-2 py-0.5 text-xs"
+          >
+            {formatWindow(from, to)}
+            <button
+              type="button"
+              onClick={onClearWindow}
+              className="text-[var(--color-fg-muted)] hover:text-[var(--color-fg)]"
+              aria-label="Clear time window"
+            >
+              ×
+            </button>
+          </span>
+        )}
       </div>
       <div className="flex flex-wrap items-center gap-3">
         <Tabs<CallsTab>
@@ -154,7 +204,8 @@ function Header({
           onChange={onTab}
           options={[
             { value: "recent",   label: "Recent" },
-            { value: "failures", label: "Failures only" },
+            { value: "passed",   label: "Passed" },
+            { value: "failures", label: "Failures" },
           ]}
         />
         <Tabs<RunSource | "all">
@@ -165,11 +216,34 @@ function Header({
             { value: "all",  label: "All sources" },
             { value: "cli",  label: "CLI" },
             { value: "otlp", label: "OTLP" },
+            { value: "live", label: "Live (proxy)" },
           ]}
         />
       </div>
     </div>
   );
+}
+
+
+/** Render the active ``[from, to)`` window as a human chip label.
+    Shows just the date when both bounds align to UTC midnight (the
+    common "click a day" case); otherwise shows both ISO timestamps. */
+function formatWindow(from: string | undefined, to: string | undefined): string {
+  if (from && to && isUtcMidnight(from) && isUtcMidnight(to)) {
+    const d1 = from.slice(0, 10);
+    const d2 = isOneDayAfter(from, to) ? null : to.slice(0, 10);
+    return d2 ? `${d1} → ${d2}` : d1;
+  }
+  return [from, to].filter(Boolean).join(" → ") || "—";
+}
+function isUtcMidnight(iso: string): boolean {
+  return /T00:00:00(\.0+)?(\+00:00|Z)?$/.test(iso);
+}
+function isOneDayAfter(a: string, b: string): boolean {
+  // Cheap test: same prefix except the day digit incremented by 1.
+  const da = new Date(a).getTime();
+  const db = new Date(b).getTime();
+  return db - da === 86400000;
 }
 
 
@@ -212,20 +286,27 @@ function Tabs<V extends string>({
 
 
 function CallsList({
-  project, tab, source, selected, onSelect,
+  project, tab, source, from, to, selected, onSelect,
 }: {
   project: string;
   tab: CallsTab;
   source: RunSource | undefined;
+  from: string | undefined;
+  to:   string | undefined;
   selected: string | null;
   onSelect: (call: CallSummary) => void;
 }) {
   const q = useInfiniteQuery({
-    queryKey: ["calls", project, tab, source ?? null],
+    // Include from/to in the key so changing the timeline window
+    // refetches from page 1 rather than concatenating pages from
+    // different windows.
+    queryKey: ["calls", project, tab, source ?? null, from ?? null, to ?? null],
     queryFn: ({ pageParam }) => listProjectCalls(project, {
       tab,
       cursor: pageParam as string | undefined,
       source,
+      from,
+      to,
       limit: 50,
     }),
     initialPageParam: undefined as string | undefined,

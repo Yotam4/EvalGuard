@@ -235,7 +235,11 @@ export interface RunOut {
   };
 }
 
-export type RunSource = "cli" | "otlp";
+// PROXY-2 added ``live`` for proxied production calls.  Keeping
+// the union open here means the tab strip / source filter can light
+// up the new third source as soon as a project receives its first
+// proxied call.
+export type RunSource = "cli" | "otlp" | "live";
 
 
 export const listRuns = (
@@ -255,7 +259,10 @@ export const listRuns = (
 // ``CallListResponse`` / ``CallDetail`` in ``apps/api/evalguard_api/models.py``.
 
 
-export type CallsTab = "recent" | "failures";
+// PROXY-2.5 added ``passed`` — the "find golden candidates" surface.
+// ``passed`` + ``failures`` partition ``recent``; the UI tab strip
+// enforces single-selection so they never combine.
+export type CallsTab = "recent" | "failures" | "passed";
 
 
 export interface CallSummary {
@@ -308,15 +315,76 @@ export interface CallDetail {
 
 export const listProjectCalls = (
   projectSlug: string,
-  opts: { tab?: CallsTab; cursor?: string; limit?: number; source?: RunSource } = {},
+  opts: {
+    tab?:    CallsTab;
+    cursor?: string;
+    limit?:  number;
+    source?: RunSource;
+    // PROXY-2.5: half-open ``[from, to)`` window on
+    // ``ingested_at``.  Both are optional and combine cleanly with
+    // ``tab`` / ``source`` / ``cursor``.
+    from?:   string;
+    to?:     string;
+  } = {},
 ) => {
   const qs = new URLSearchParams();
   qs.set("tab", opts.tab ?? "recent");
   if (opts.cursor) qs.set("cursor", opts.cursor);
   if (opts.limit)  qs.set("limit",  String(opts.limit));
   if (opts.source) qs.set("source", opts.source);
+  if (opts.from)   qs.set("from",   opts.from);
+  if (opts.to)     qs.set("to",     opts.to);
   return request<CallListResponse>(
     `/v1/projects/${encodeURIComponent(projectSlug)}/calls?${qs.toString()}`,
+  );
+};
+
+
+// PROXY-2.5 — live-run timeline + range aggregate.
+
+export interface LiveTimelineEntry {
+  run_id:         string;
+  started_at:     string | null;
+  finished_at:    string | null;
+  row_count:      number;
+  row_pass_count: number;
+  row_fail_count: number;
+  cost_usd:       number;
+}
+export interface LiveTimelineResponse {
+  entries: LiveTimelineEntry[];
+}
+
+export interface LiveAggregate {
+  row_count:      number;
+  row_pass_count: number;
+  row_fail_count: number;
+  cost_usd:       number;
+  run_count:      number;
+}
+
+export const listProjectLiveTimeline = (
+  projectSlug: string, opts: { days?: number } = {},
+) => {
+  const qs = new URLSearchParams();
+  if (opts.days) qs.set("days", String(opts.days));
+  const tail = qs.toString();
+  return request<LiveTimelineResponse>(
+    `/v1/projects/${encodeURIComponent(projectSlug)}/live/timeline`
+    + (tail ? `?${tail}` : ""),
+  );
+};
+
+export const getLiveAggregate = (
+  projectSlug: string, opts: { from?: string; to?: string } = {},
+) => {
+  const qs = new URLSearchParams();
+  if (opts.from) qs.set("from", opts.from);
+  if (opts.to)   qs.set("to",   opts.to);
+  const tail = qs.toString();
+  return request<LiveAggregate>(
+    `/v1/projects/${encodeURIComponent(projectSlug)}/live/aggregate`
+    + (tail ? `?${tail}` : ""),
   );
 };
 

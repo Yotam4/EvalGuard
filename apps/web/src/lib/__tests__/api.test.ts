@@ -5,7 +5,8 @@ import {
   ApiError, NotConfiguredError,
   createApiKey, createOrg, getCallDetail, getRun, getReviewQueue, getRunDrift,
   health, listAssets, listAssetVersions, listGoldenCandidates,
-  listProjectCalls, listRunReviews, listRuns,
+  getLiveAggregate, listProjectCalls, listProjectLiveTimeline,
+  listRunReviews, listRuns,
   promoteToGolden, revokeApiKey, submitReview, unPromoteGolden,
 } from "../api";
 
@@ -542,5 +543,104 @@ describe("api client", () => {
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe("https://api.example.com/v1/golden/candidates/42");
     expect(init.method).toBe("DELETE");
+  });
+
+
+  // ---------------------------------------------------------------------
+  // PROXY-2.5 — extended calls filters + live timeline / aggregate
+
+
+  it("listProjectCalls threads tab=passed + from/to into the query string", async () => {
+    setServerUrl("https://api.example.com");
+    setToken("evk_x");
+    fetchMock.mockResolvedValueOnce({
+      ok: true, status: 200,
+      json: async () => ({ calls: [], next_cursor: null }),
+    });
+    await listProjectCalls("demo", {
+      tab: "passed",
+      from: "2026-05-28T00:00:00+00:00",
+      to:   "2026-05-29T00:00:00+00:00",
+    });
+    const [url] = fetchMock.mock.calls[0];
+    expect(url).toBe(
+      "https://api.example.com/v1/projects/demo/calls"
+      + "?tab=passed"
+      + "&from=2026-05-28T00%3A00%3A00%2B00%3A00"
+      + "&to=2026-05-29T00%3A00%3A00%2B00%3A00",
+    );
+  });
+
+
+  it("listProjectLiveTimeline composes the days param", async () => {
+    setServerUrl("https://api.example.com");
+    setToken("evk_x");
+    fetchMock.mockResolvedValueOnce({
+      ok: true, status: 200,
+      json: async () => ({ entries: [] }),
+    });
+    await listProjectLiveTimeline("demo", { days: 7 });
+    const [url] = fetchMock.mock.calls[0];
+    expect(url).toBe(
+      "https://api.example.com/v1/projects/demo/live/timeline?days=7",
+    );
+  });
+
+
+  it("listProjectLiveTimeline omits the days param when not supplied", async () => {
+    setServerUrl("https://api.example.com");
+    setToken("evk_x");
+    fetchMock.mockResolvedValueOnce({
+      ok: true, status: 200,
+      json: async () => ({ entries: [] }),
+    });
+    await listProjectLiveTimeline("demo");
+    const [url] = fetchMock.mock.calls[0];
+    // No trailing ``?`` when there's nothing to encode — keeps the
+    // URL clean and matches the server's default-days path.
+    expect(url).toBe(
+      "https://api.example.com/v1/projects/demo/live/timeline",
+    );
+  });
+
+
+  it("getLiveAggregate threads from / to into the query string", async () => {
+    setServerUrl("https://api.example.com");
+    setToken("evk_x");
+    fetchMock.mockResolvedValueOnce({
+      ok: true, status: 200,
+      json: async () => ({
+        row_count: 0, row_pass_count: 0, row_fail_count: 0,
+        cost_usd: 0, run_count: 0,
+      }),
+    });
+    await getLiveAggregate("demo", {
+      from: "2026-05-28T00:00:00+00:00",
+      to:   "2026-05-29T00:00:00+00:00",
+    });
+    const [url] = fetchMock.mock.calls[0];
+    expect(url).toBe(
+      "https://api.example.com/v1/projects/demo/live/aggregate"
+      + "?from=2026-05-28T00%3A00%3A00%2B00%3A00"
+      + "&to=2026-05-29T00%3A00%3A00%2B00%3A00",
+    );
+  });
+
+
+  it("getLiveAggregate without bounds hits the all-time path", async () => {
+    setServerUrl("https://api.example.com");
+    setToken("evk_x");
+    fetchMock.mockResolvedValueOnce({
+      ok: true, status: 200,
+      json: async () => ({
+        row_count: 0, row_pass_count: 0, row_fail_count: 0,
+        cost_usd: 0, run_count: 0,
+      }),
+    });
+    await getLiveAggregate("demo");
+    const [url] = fetchMock.mock.calls[0];
+    expect(url).toBe(
+      "https://api.example.com/v1/projects/demo/live/aggregate",
+    );
   });
 });
