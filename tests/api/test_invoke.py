@@ -421,6 +421,144 @@ def test_invoke_provider_500_still_returns_502(client, auth_headers):
     assert "Retry-After" not in r.headers
 
 
+def test_invoke_rate_limit_returns_429_with_retry_after(client, auth_headers):
+    """Round-4 #7: per-key rate limit caps requests/minute.  Below
+    the cap → 200; above → 429 + Retry-After.  Override the
+    config's cap to a tiny value so the test is fast."""
+    cfg = (
+        "version: 1\n"
+        "project: default\n"
+        "providers: [{ id: 'mock:m', config: { mode: echo, latency_ms: 0 } }]\n"
+        "rate_limit_per_minute: 2\n"
+    )
+    client.post(
+        "/v1/projects/default/config",
+        json={"content": cfg},
+        headers=auth_headers,
+    )
+    # Two requests under the cap.
+    for _ in range(2):
+        r = client.post(
+            "/v1/projects/default/invoke",
+            json={"input": "x"},
+            headers=auth_headers,
+        )
+        assert r.status_code == 200, r.text
+    # Third trips the limit.
+    r = client.post(
+        "/v1/projects/default/invoke",
+        json={"input": "x"},
+        headers=auth_headers,
+    )
+    assert r.status_code == 429
+    assert r.headers.get("Retry-After") == "60"
+    body = r.json()
+    assert "rate limit exceeded" in body["detail"].lower()
+
+
+def test_invoke_rate_limit_is_per_key(
+    client, auth_headers, make_org, make_member_token,
+):
+    """Two distinct keys hitting the same project have INDEPENDENT
+    counters — one keyfilling the bucket doesn't throttle the other."""
+    cfg = (
+        "version: 1\n"
+        "project: default\n"
+        "providers: [{ id: 'mock:m', config: { mode: echo, latency_ms: 0 } }]\n"
+        "rate_limit_per_minute: 1\n"
+    )
+    client.post(
+        "/v1/projects/default/config",
+        json={"content": cfg},
+        headers=auth_headers,
+    )
+    member_a = make_member_token("org_default", name="alice")
+    member_b = make_member_token("org_default", name="bob")
+    # Alice fills her bucket.
+    r1 = client.post("/v1/projects/default/invoke",
+                     json={"input": "x"},
+                     headers={"Authorization": f"Bearer {member_a}"})
+    assert r1.status_code == 200
+    r2 = client.post("/v1/projects/default/invoke",
+                     json={"input": "x"},
+                     headers={"Authorization": f"Bearer {member_a}"})
+    assert r2.status_code == 429
+    # Bob is unaffected.
+    r3 = client.post("/v1/projects/default/invoke",
+                     json={"input": "x"},
+                     headers={"Authorization": f"Bearer {member_b}"})
+    assert r3.status_code == 200, r3.text
+
+
+def test_invoke_cost_cap_returns_402_and_records_row(client, auth_headers):
+    """Round-4 #7: per-project daily cost cap.  After the cap is
+    reached the proxy refuses further calls with 402 Payment
+    Required AND records the rejection in /calls/ for operator
+    visibility (cost-cap events are rare and important)."""
+    import json as _json
+    from sqlalchemy import text as _text
+
+    cfg = (
+        "version: 1\n"
+        "project: default\n"
+        "providers: [{ id: 'mock:m', config: { mode: echo, latency_ms: 0, cost_per_call: 0.50 } }]\n"
+        "cost_cap_usd_daily: 1.00\n"
+    )
+    client.post(
+        "/v1/projects/default/config",
+        json={"content": cfg},
+        headers=auth_headers,
+    )
+    # Two paid calls bring cumulative cost to $1.00 == cap.
+    for _ in range(2):
+        r = client.post(
+            "/v1/projects/default/invoke",
+            json={"input": "x"},
+            headers=auth_headers,
+        )
+        assert r.status_code == 200, r.text
+    # Third trips the cap.  402 Payment Required.
+    r = client.post(
+        "/v1/projects/default/invoke",
+        json={"input": "x"},
+        headers=auth_headers,
+    )
+    assert r.status_code == 402, r.text
+    body = r.json()
+    assert body["passed"] is False
+    assert "cost_cap_exceeded" in body["error"]
+    # The rejected row IS persisted with the cap reason — operator
+    # sees "cost_cap_exceeded" in /calls/?tab=failures.
+    failures = client.get(
+        "/v1/projects/default/calls?tab=failures&limit=5",
+        headers=auth_headers,
+    )
+    assert any(c["row_id"] == body["row_id"] for c in failures.json()["calls"])
+
+
+def test_invoke_cost_cap_disabled_when_unset(client, auth_headers):
+    """No ``cost_cap_usd_daily`` in config → unlimited spending
+    (back to the pre-#7 behaviour).  Required for backward compat:
+    existing configs that don't know about the field continue to
+    work without surprise refusals."""
+    cfg = (
+        "version: 1\n"
+        "project: default\n"
+        "providers: [{ id: 'mock:m', config: { mode: echo, latency_ms: 0, cost_per_call: 99.0 } }]\n"
+    )
+    client.post(
+        "/v1/projects/default/config",
+        json={"content": cfg},
+        headers=auth_headers,
+    )
+    r = client.post(
+        "/v1/projects/default/invoke",
+        json={"input": "x"},
+        headers=auth_headers,
+    )
+    assert r.status_code == 200, r.text
+
+
 def test_invoke_releases_db_conn_during_provider_call(
     client, auth_headers, monkeypatch,
 ):

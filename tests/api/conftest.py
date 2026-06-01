@@ -53,7 +53,15 @@ def client(settings: Settings) -> TestClient:
     """TestClient wired to a per-test app instance.
 
     Using ``with`` triggers FastAPI's lifespan, which initializes
-    the schema and provisions the default org/project."""
+    the schema and provisions the default org/project.
+
+    Per-test rate-limiter reset (round-4 #7): the in-memory sliding
+    window counter on ``apps/api/evalguard_api/quotas.py`` is module-
+    state and would otherwise persist across tests, so a test that
+    spams 60 invokes leaves the next test starting at the cap.
+    Clearing here keeps each test isolated."""
+    from evalguard_api.quotas import reset_rate_limiter
+    reset_rate_limiter()
     app = build_app(settings=settings)
     with TestClient(app) as c:
         yield c

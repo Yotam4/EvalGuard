@@ -61,6 +61,9 @@ from evalguard_api.live import (
     parse_provider_id, record_call,
 )
 from evalguard_api.models import InvokeRequest, InvokeResponse
+from evalguard_api.quotas import (
+    DEFAULT_RATE_LIMIT_PER_MINUTE, rate_limit_check, todays_live_run_cost,
+)
 
 
 router = APIRouter()
@@ -167,7 +170,13 @@ async def invoke(
     """
     engine = request.app.state.engine
 
-    # --- Phase 1: resolve project + load config (short transaction) ---
+    # --- Phase 1: resolve project + load config + check cost cap ---
+    #
+    # Short transaction.  Folds three reads into one round-trip so the
+    # provider call can run in Phase 2 with no DB conn held (the
+    # whole point of the round-4 #6 refactor).  Cost-cap check lives
+    # here so we never start a provider call we'd refuse to record;
+    # rate-limit lives BELOW (memory-only, no DB needed).
     with engine.begin() as conn:
         apply_rls_context(
             conn, org_id=principal.org_id, is_admin=principal.is_admin,
@@ -176,7 +185,43 @@ async def invoke(
         project_id   = project["project_id"]
         project_name = project["name"]
         cfg = _load_latest_config(conn, project_id)
+        # Read today's accumulated cost while the conn is still open;
+        # the cost-cap branch below compares it without a second
+        # round-trip.
+        today_cost_usd = todays_live_run_cost(conn, project_id)
     # ``conn`` is returned to the pool here.
+
+    # --- Quota gate: per-key rate limit (round-4 big-ticket #7) ---
+    #
+    # Cheap in-memory sliding window per ``key_id``.  Refuses the
+    # provider call (and explicitly does NOT persist a row — under
+    # sustained abuse a hammering client would flood ``run_rows`` and
+    # the operator's /calls/ view).  The structured access-log line
+    # the middleware emits captures the rejection for audit.
+    rate_limit_rpm = int(cfg.get("rate_limit_per_minute") or DEFAULT_RATE_LIMIT_PER_MINUTE)
+    if not rate_limit_check(principal.key_id, limit_per_minute=rate_limit_rpm):
+        response.headers["Retry-After"] = "60"
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=(
+                f"Rate limit exceeded: {rate_limit_rpm} requests/minute per API key. "
+                f"Tune ``rate_limit_per_minute`` in the project config to raise the cap, "
+                f"or back off and retry."
+            ),
+            headers={"Retry-After": "60"},
+        )
+
+    # --- Quota gate: per-project daily cost cap ---
+    #
+    # Compared against today's accumulated ``runs.cost_usd`` which
+    # the proxy increments atomically inside ``record_call`` (PROXY-2).
+    # 402 Payment Required is the semantically correct status; the
+    # row IS persisted (Phase 3 below) so the operator sees the
+    # rejection in /calls/?tab=failures with the cap-exceeded
+    # reason — cost-cap events are rare and important, unlike rate-
+    # limit events which would flood the table.
+    cost_cap_usd = float(cfg.get("cost_cap_usd_daily") or 0.0)
+    cost_cap_exceeded = cost_cap_usd > 0 and today_cost_usd >= cost_cap_usd
 
     providers = cfg.get("providers") or []
     if not providers:
@@ -218,7 +263,6 @@ async def invoke(
     row_id = body.row_id or f"r-{uuid.uuid4().hex[:12]}"
 
     # --- provider call --------------------------------------------------------
-    error: str | None = None
     # Round-4 review-pass: differentiate upstream throttling from
     # generic upstream errors so the caller's retry logic does the
     # right thing.  ``True`` here forces a 429 + Retry-After in the
@@ -228,33 +272,46 @@ async def invoke(
     # openai.RateLimitError, anthropic.RateLimitError, …) so a
     # text-based test is the portable choice.
     is_rate_limited = False
+    # Cost-cap short-circuit (round-4 big-ticket #7).  When today's
+    # accumulated cost already meets / exceeds the cap we pre-set
+    # ``error`` so the provider-call block below skips cleanly;
+    # the row still gets persisted (Phase 3) so /calls/ shows the
+    # rejection.  Returns 402 Payment Required via the status-code
+    # branch at the end of the handler.
+    is_cost_capped = cost_cap_exceeded
+    error: str | None = (
+        f"cost_cap_exceeded: today's spend ${today_cost_usd:.4f} "
+        f"meets/exceeds project daily cap ${cost_cap_usd:.2f}"
+        if is_cost_capped else None
+    )
     output = ""
     cost_usd = 0.0
     latency_ms = 0
     t0 = time.monotonic()
-    try:
-        # ``asyncio.wait_for`` so a hung provider can't pin the worker
-        # forever — the proxy is on the production hot path and
-        # surviving upstream outages is part of the contract.  On
-        # timeout we still persist the row (under the failures tab)
-        # so the operator sees the regression in /calls/.
-        result = await asyncio.wait_for(
-            provider.complete(prompt, model=model),
-            timeout=_PROVIDER_CALL_TIMEOUT_S,
-        )
-        output     = result.output
-        cost_usd   = float(result.cost_usd)
-        latency_ms = int(result.latency_ms)
-    except asyncio.TimeoutError:
-        error = (
-            f"TimeoutError: provider {provider_id!r} did not respond "
-            f"within {_PROVIDER_CALL_TIMEOUT_S:.0f}s"
-        )
-        latency_ms = int((time.monotonic() - t0) * 1000)
-    except Exception as e:
-        error = f"{type(e).__name__}: {e}"
-        latency_ms = int((time.monotonic() - t0) * 1000)
-        is_rate_limited = _looks_like_rate_limit(e)
+    if error is None:
+        try:
+            # ``asyncio.wait_for`` so a hung provider can't pin the worker
+            # forever — the proxy is on the production hot path and
+            # surviving upstream outages is part of the contract.  On
+            # timeout we still persist the row (under the failures tab)
+            # so the operator sees the regression in /calls/.
+            result = await asyncio.wait_for(
+                provider.complete(prompt, model=model),
+                timeout=_PROVIDER_CALL_TIMEOUT_S,
+            )
+            output     = result.output
+            cost_usd   = float(result.cost_usd)
+            latency_ms = int(result.latency_ms)
+        except asyncio.TimeoutError:
+            error = (
+                f"TimeoutError: provider {provider_id!r} did not respond "
+                f"within {_PROVIDER_CALL_TIMEOUT_S:.0f}s"
+            )
+            latency_ms = int((time.monotonic() - t0) * 1000)
+        except Exception as e:
+            error = f"{type(e).__name__}: {e}"
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            is_rate_limited = _looks_like_rate_limit(e)
 
     # --- evaluators -----------------------------------------------------------
     scores_payload: list[dict[str, Any]] = []
@@ -351,7 +408,13 @@ async def invoke(
     # (and a misbehaving one is at least labeled correctly in
     # ``/calls/?tab=failures``).  Everything else stays 502.
     if error is not None:
-        if is_rate_limited:
+        if is_cost_capped:
+            # 402 Payment Required is the semantically correct status —
+            # the caller's request is well-formed but the project's
+            # budget is exhausted.  No Retry-After (the cap resets at
+            # UTC midnight when the next day's live run lazy-creates).
+            response.status_code = status.HTTP_402_PAYMENT_REQUIRED
+        elif is_rate_limited:
             response.status_code = status.HTTP_429_TOO_MANY_REQUESTS
             response.headers["Retry-After"] = "60"
         else:
