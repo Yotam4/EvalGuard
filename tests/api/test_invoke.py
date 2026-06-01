@@ -421,6 +421,58 @@ def test_invoke_provider_500_still_returns_502(client, auth_headers):
     assert "Retry-After" not in r.headers
 
 
+def test_invoke_releases_db_conn_during_provider_call(
+    client, auth_headers, monkeypatch,
+):
+    """Round-4 review-pass #6: the DB connection MUST be released
+    back to the pool before the provider call runs, otherwise a
+    pool of size 10 + 10 slow providers = pool exhaustion + every
+    other endpoint blocks.
+
+    The test stalls the provider for 100ms and asserts that during
+    the stall the pool's checked-out count is 0 (or at most reflects
+    other in-flight requests).  Without the refactor this would
+    show ``checked_out == 1`` for the duration of the provider call.
+    """
+    import asyncio
+    from evalguard_evaluators.providers.mock_provider import MockProvider
+
+    engine = client.app.state.engine
+    checked_out_during_provider: list[int] = []
+
+    async def _slow_complete(self, prompt, *, model, params=None):
+        # Capture the pool state mid-call.  Sleep is short enough
+        # not to slow the suite, long enough that the sample is
+        # taken after Phase-1 commits and before Phase-3 starts.
+        await asyncio.sleep(0.05)
+        checked_out_during_provider.append(engine.pool.checkedout())
+        from evalguard_evaluators.base import ProviderResult
+        return ProviderResult(
+            output=prompt, cost_usd=0.0, latency_ms=50, raw={},
+        )
+
+    monkeypatch.setattr(MockProvider, "complete", _slow_complete)
+
+    _push_default_config_simple(client, auth_headers)
+    r = client.post(
+        "/v1/projects/default/invoke",
+        json={"input": "x"},
+        headers=auth_headers,
+    )
+    assert r.status_code == 200, r.text
+    assert len(checked_out_during_provider) == 1
+    # The invoke route's own conn must not be holding a slot.  Other
+    # requests in flight from the same TestClient are theoretically
+    # possible but the sync TestClient is single-threaded per call,
+    # so the only conn that could be checked out is the invoke
+    # request's — which the refactor releases before the provider
+    # call.  Strict equality is the right assertion.
+    assert checked_out_during_provider[0] == 0, (
+        f"expected pool slot released during provider call, "
+        f"got checkedout={checked_out_during_provider[0]}"
+    )
+
+
 def test_invoke_provider_timeout_returns_502_and_records_row(
     client, auth_headers, monkeypatch,
 ):

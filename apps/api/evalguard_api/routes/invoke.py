@@ -47,7 +47,7 @@ import uuid
 from typing import Any
 
 import yaml
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
@@ -55,8 +55,7 @@ from sqlalchemy.engine import Connection
 logger = logging.getLogger("evalguard.api.invoke")
 
 from evalguard_api.auth import Principal, require_principal
-from evalguard_api.db import resolve_project_or_404
-from evalguard_api.deps import get_conn
+from evalguard_api.db import apply_rls_context, resolve_project_or_404
 from evalguard_api.live import (
     LiveCallRecord, ensure_live_run, ensure_live_trial,
     parse_provider_id, record_call,
@@ -143,7 +142,7 @@ async def invoke(
     project_slug: str,
     body: InvokeRequest,
     response: Response,
-    conn: Connection = Depends(get_conn),
+    request: Request,
     principal: Principal = Depends(require_principal),
 ) -> InvokeResponse:
     """Forward one call to the project's configured provider, score
@@ -153,9 +152,31 @@ async def invoke(
     The first provider listed in the stored config drives the call;
     multi-provider routing is a separate slice (the proxy is the
     gateway, not the A/B harness).
+
+    **Connection lifecycle** — round-4 review-pass #6.  Earlier the
+    handler took ``conn: Connection = Depends(get_conn)``, which
+    held a pool connection open for the entire request (including
+    the up-to-60s provider call).  Under modest load (10 concurrent
+    slow providers, default ``pool_size=10``) that exhausted the
+    pool and stalled cheap reads like ``/v1/health``.  Now we
+    explicitly open two SHORT transactions — one to resolve the
+    project + load the config, one to write the row — and the
+    provider call runs in between holding no DB connection.  Auth
+    (``require_principal``) already opens + closes its own tx, so
+    we don't pay a fourth conn for it.
     """
-    project = _resolve_project(conn, principal, project_slug)
-    cfg = _load_latest_config(conn, project["project_id"])
+    engine = request.app.state.engine
+
+    # --- Phase 1: resolve project + load config (short transaction) ---
+    with engine.begin() as conn:
+        apply_rls_context(
+            conn, org_id=principal.org_id, is_admin=principal.is_admin,
+        )
+        project = _resolve_project(conn, principal, project_slug)
+        project_id   = project["project_id"]
+        project_name = project["name"]
+        cfg = _load_latest_config(conn, project_id)
+    # ``conn`` is returned to the pool here.
 
     providers = cfg.get("providers") or []
     if not providers:
@@ -298,15 +319,8 @@ async def invoke(
         # of local_executor.py).  Empty score set = vacuous pass.
         passed = all(all_scores) if all_scores else True
 
-    # --- persist --------------------------------------------------------------
-    run_id   = ensure_live_run(
-        conn, project_id=project["project_id"],
-        project_name=project["name"],
-    )
-    trial_id = ensure_live_trial(
-        conn, run_id=run_id, project_id=project["project_id"],
-        provider_id=provider_id, provider=provider_name, model=model,
-    )
+    # --- Phase 3: persist (short transaction) ------------------------
+    # Conn re-acquired here; provider call ran with no pool slot held.
     rec = LiveCallRecord(
         row_id=row_id, raw_input=body.input, raw_expected=body.expected,
         output=output, passed=passed and error is None,
@@ -315,10 +329,21 @@ async def invoke(
         tags=body.tags, scores=scores_payload,
         provider=provider_name, model=model, error=error,
     )
-    record_call(
-        conn, run_id=run_id, trial_id=trial_id,
-        project_id=project["project_id"], rec=rec,
-    )
+    with engine.begin() as conn:
+        apply_rls_context(
+            conn, org_id=principal.org_id, is_admin=principal.is_admin,
+        )
+        run_id   = ensure_live_run(
+            conn, project_id=project_id, project_name=project_name,
+        )
+        trial_id = ensure_live_trial(
+            conn, run_id=run_id, project_id=project_id,
+            provider_id=provider_id, provider=provider_name, model=model,
+        )
+        record_call(
+            conn, run_id=run_id, trial_id=trial_id,
+            project_id=project_id, rec=rec,
+        )
 
     # Provider-failed calls surface as the most useful status for
     # the caller's retry logic.  Rate-limit errors get 429 + a
