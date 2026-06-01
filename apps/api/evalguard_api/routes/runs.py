@@ -145,9 +145,9 @@ def ingest_run(
 # column itself accepts any string (server_default=``'cli'``), but
 # the public surface is constrained so an unknown value 400s rather
 # than silently returning zero rows.  Matches the ingest paths the
-# server actually understands today: ``cli`` (push) and ``otlp``
-# (traces).
-_KNOWN_SOURCES: frozenset[str] = frozenset({"cli", "otlp"})
+# server actually understands today: ``cli`` (push), ``otlp``
+# (traces), and ``live`` (Phase PROXY-2 ``POST /v1/projects/{slug}/invoke``).
+_KNOWN_SOURCES: frozenset[str] = frozenset({"cli", "otlp", "live"})
 
 
 @router.get("/v1/runs", response_model=RunList, tags=["runs"])

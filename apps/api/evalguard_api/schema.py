@@ -150,6 +150,15 @@ run_rows = Table(
     # Nullable because (a) backfill leaves older rows blank and
     # (b) some rows legitimately have no output (cache hits, errors).
     Column("output_preview", Text),
+    # Phase PROXY-2: per-row detail blob for live (proxy) calls.
+    # Batch-ingested runs leave this NULL — their per-row detail still
+    # lives in ``runs.payload_json`` and is parsed on demand by the
+    # OBS-2 detail endpoint.  Live runs do the opposite: their parent
+    # ``runs.payload_json`` is header-only (no inline rows, by design,
+    # so a million-call live run doesn't materialise as one giant
+    # JSON blob), and the per-call input / output / scores live here.
+    # The detail endpoint prefers ``detail_json`` when present.
+    Column("detail_json",    Text),
     Index("idx_run_rows_run",   "run_id"),
     Index("idx_run_rows_trial", "trial_id"),
     # Composite index that drives the calls stream's two tabs:

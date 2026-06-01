@@ -122,6 +122,8 @@ def test_alembic_version_recorded(client):
     engine = client.app.state.engine
     with engine.connect() as conn:
         ver = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-    # Head bumps as we ship migrations.  ``0010_project_configs``
-    # adds the Phase PROXY-1 server-side config storage table.
-    assert ver == "0010_project_configs"
+    # Head bumps as we ship migrations.  ``0011_run_rows_detail_json``
+    # adds the per-row detail blob for live (proxy) calls so the OBS-2
+    # detail endpoint can drill down on live calls without parsing a
+    # giant header-only ``runs.payload_json``.
+    assert ver == "0011_run_rows_detail_json"

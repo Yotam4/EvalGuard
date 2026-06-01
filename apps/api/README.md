@@ -63,7 +63,8 @@ curl -s -H "Authorization: Bearer $EVALGUARD_API_KEY" \
 | `POST` | `/v1/projects/{slug}/config` | Member. Upload an `evalguard.yaml` blob. Content-addressed by SHA-256 → 200 (idempotent) if bytes already stored; 201 for a new revision. |
 | `GET`  | `/v1/projects/{slug}/config` | Member. Latest config revision for the project. 404 if no config has been pushed yet. |
 | `GET`  | `/v1/projects/{slug}/config/history` | Member. Recent revisions newest-first (content omitted). Query: `limit=20`. |
-| `GET`  | `/v1/projects/{slug}/config/{config_id}` | Member. Specific revision verbatim — the pin-to-hash surface the upcoming proxy invoke path uses. |
+| `GET`  | `/v1/projects/{slug}/config/{config_id}` | Member. Specific revision verbatim — the pin-to-hash surface the proxy invoke path uses. |
+| `POST` | `/v1/projects/{slug}/invoke` | Member. **Phase PROXY-2.** Forward one LLM call through the project's stored provider, score against the configured evaluators, record under the day's live run (`source='live'`), return the model's output. 502 on provider failure (row still recorded). 422 if no config / no providers. |
 | `GET`  | `/openapi.json`      | OpenAPI 3 spec (auto-generated). |
 | `GET`  | `/docs`              | Swagger UI. |
 

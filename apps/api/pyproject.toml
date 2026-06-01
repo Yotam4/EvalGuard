@@ -11,6 +11,12 @@ dependencies = [
   "pydantic>=2.7",
   "sqlalchemy>=2.0",
   "alembic>=1.13",
+  # PROXY-2: the invoke endpoint loads the project's stored
+  # ``evalguard.yaml`` and resolves providers / evaluators via the
+  # same registry the CLI uses, so a config that ran in CI runs the
+  # same way through the proxy. ``pyyaml`` parses the stored blob.
+  "evalguard-evaluators",
+  "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]

@@ -745,3 +745,66 @@ class ProjectConfigSummary(_Strict):
 
 class ProjectConfigHistory(_Strict):
     configs: list[ProjectConfigSummary]
+
+
+# ---------------------------------------------------------------------------
+# Phase PROXY-2 — invoke endpoint.
+
+
+# Bounds on the per-call input.  The provider itself almost always
+# has a tighter prompt-token limit; this is the *server* wall in
+# front of an accidental gigabyte.
+_MAX_INPUT_BYTES = 256 * 1024
+
+
+class InvokeRequest(_Strict):
+    """``POST /v1/projects/{slug}/invoke`` body.
+
+    ``input`` is the prompt the model sees.  A dict is rendered as
+    JSON so non-string inputs stay deterministic across Python
+    versions.  ``expected`` is the reference answer (used by judges
+    / metrics that compare).  ``tags`` end up on the row card in
+    ``/calls/`` for filtering.  ``row_id`` lets the caller supply a
+    stable id (eg. their conversation turn id); omitted → a uuid
+    is minted.  ``extra`` rides through to ``EvalContext.extra`` so
+    evaluators with custom dependencies can pull what they need.
+    """
+
+    input:    Any = Field(..., description="Prompt the model sees (str or JSON-serialisable).")
+    expected: Any = Field(default=None)
+    tags:     list[str] | None = Field(default=None, max_length=32)
+    extra:    dict[str, Any] | None = Field(default=None)
+    row_id:   str | None = Field(default=None, min_length=1, max_length=200)
+
+    @classmethod
+    def __get_validators__(cls):  # pragma: no cover — pydantic v1 shim, unused in v2
+        return ()
+
+
+class InvokeScoreOut(_Loose):
+    """One evaluator's verdict on the call.  Loose because evaluator
+    ``raw`` blobs vary by evaluator and we don't want to spec every
+    shape into the wire schema."""
+
+    evaluator_id:   str
+    evaluator_kind: str
+    layer:          int
+    value:          float
+    passed:         bool
+    raw:            dict[str, Any]
+
+
+class InvokeResponse(_Loose):
+    """Result of one proxied call.  Loose to give the proxy room to
+    add forward-compatible fields (audit chain pointers, cache
+    indicators) without bumping a schema version."""
+
+    output:     str
+    passed:     bool
+    cost_usd:   float
+    latency_ms: int
+    run_id:     str
+    trial_id:   str
+    row_id:     str
+    scores:     list[InvokeScoreOut]
+    error:      str | None = None
