@@ -362,6 +362,21 @@ event_rows = Table(
     Column("ingested_at",     Text, nullable=False),
     UniqueConstraint("run_id", "prev_event_hash",
                      name="uq_event_rows_chain"),
+    # Round-5 ultra-review (Agent-1 D + G): the composite UNIQUE
+    # above doesn't catch the chain-root case.  ANSI SQL says NULLs
+    # are distinct in UNIQUE — Postgres + SQLite both allow MULTIPLE
+    # ``(run_id, NULL)`` rows in the same constraint.  Two concurrent
+    # first-of-day calls would each insert with ``prev_event_hash =
+    # NULL``, both succeed, and fork the chain silently — the retry
+    # loop never fires because no IntegrityError is raised.  Partial
+    # unique index ``WHERE prev_event_hash IS NULL`` is the
+    # portable fix: it forces uniqueness on the chain root
+    # specifically.  ``Index(..., unique=True, *_where)`` works on
+    # SQLite 3.8+ and every Postgres version we support.
+    Index("uq_event_rows_chain_root",
+          "run_id", unique=True,
+          sqlite_where=text("prev_event_hash IS NULL"),
+          postgresql_where=text("prev_event_hash IS NULL")),
     Index("idx_event_rows_run",  "run_id", "id"),
     Index("idx_event_rows_proj", "project_id", "ingested_at", "id"),
 )

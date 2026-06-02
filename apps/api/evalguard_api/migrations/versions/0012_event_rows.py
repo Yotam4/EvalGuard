@@ -84,6 +84,23 @@ def upgrade() -> None:
             "idx_event_rows_proj",
             "event_rows", ["project_id", "ingested_at", "id"],
         )
+        # Round-5 ultra-review fix: the composite UNIQUE above
+        # doesn't catch chain forks at the root because ANSI SQL
+        # treats NULLs as distinct in UNIQUE — two concurrent
+        # first-of-day inserts both with ``prev_event_hash = NULL``
+        # would both succeed silently.  Partial unique index forces
+        # only ONE NULL-prev row per run.  SQLite 3.8+ and every
+        # supported Postgres version honour ``WHERE``.
+        if _is_postgres():
+            op.execute(
+                "CREATE UNIQUE INDEX uq_event_rows_chain_root "
+                "ON event_rows (run_id) WHERE prev_event_hash IS NULL"
+            )
+        else:
+            op.execute(
+                "CREATE UNIQUE INDEX uq_event_rows_chain_root "
+                "ON event_rows (run_id) WHERE prev_event_hash IS NULL"
+            )
 
     if not _is_postgres():
         return
@@ -113,7 +130,11 @@ def downgrade() -> None:
     insp = sa.inspect(bind)
     if "event_rows" in set(insp.get_table_names()):
         existing_indexes = {ix["name"] for ix in insp.get_indexes("event_rows")}
-        for idx in ("idx_event_rows_proj", "idx_event_rows_run"):
+        for idx in (
+            "uq_event_rows_chain_root",   # round-5 chain-root fix
+            "idx_event_rows_proj",
+            "idx_event_rows_run",
+        ):
             if idx in existing_indexes:
                 op.drop_index(idx, table_name="event_rows")
         op.drop_table("event_rows")

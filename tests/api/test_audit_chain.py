@@ -291,3 +291,64 @@ def test_audit_events_unauth_returns_401(client):
     assert r.status_code == 401
     v = client.get("/v1/projects/default/audit/verify?run_id=run_anything")
     assert v.status_code == 401
+
+
+def test_chain_root_partial_unique_index_blocks_double_first_event(client, auth_headers):
+    """Round-5 ultra-review (Agent-1 D + G): the original
+    ``UNIQUE (run_id, prev_event_hash)`` constraint did NOT prevent
+    two events from sharing ``(run_id, NULL)`` — ANSI SQL treats
+    NULLs as distinct in UNIQUE constraints, so Postgres + SQLite
+    both accepted a forked chain root.  The partial unique index
+    added in this round (``WHERE prev_event_hash IS NULL``) closes
+    the hole.
+
+    Reproduce the race directly: emit one real event via /invoke
+    (which lands the first NULL-prev row), then attempt to insert
+    a SECOND row with the same run_id + prev_event_hash=NULL via
+    raw SQL.  The second INSERT must fail with IntegrityError; the
+    fact that it would have succeeded before is the bug this fix
+    closes."""
+    from sqlalchemy import text as _text
+    from sqlalchemy.exc import IntegrityError
+
+    _push_paid_config(client, auth_headers)
+    r = _invoke(client, auth_headers, "first")
+    run_id = r.json()["run_id"]
+
+    engine = client.app.state.engine
+    raised = False
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                _text("""INSERT INTO event_rows(
+                          event_id, run_id, project_id,
+                          kind, actor_id, actor_type,
+                          prev_event_hash, event_hash,
+                          event_json, ingested_at)
+                        VALUES (
+                          'rogue_root_event_x', :rid,
+                          (SELECT project_id FROM projects WHERE slug='default'),
+                          'provider.called', 'attacker', 'api_key',
+                          NULL, 'rogue_hash_y',
+                          '{}', '2026-06-02T05:00:00')"""),
+                {"rid": run_id},
+            )
+    except IntegrityError:
+        raised = True
+
+    assert raised, (
+        "partial UNIQUE INDEX on (run_id) WHERE prev_event_hash IS NULL "
+        "did not fire — chain-fork at the root is possible"
+    )
+    # Sanity: the legitimate first event is still present.  Only ONE
+    # NULL-prev row exists for this run after the test.
+    with engine.connect() as conn:
+        null_prev_count = conn.execute(
+            _text("SELECT COUNT(*) FROM event_rows "
+                  "WHERE run_id = :rid AND prev_event_hash IS NULL"),
+            {"rid": run_id},
+        ).scalar_one()
+    assert null_prev_count == 1, (
+        f"expected exactly one chain root after the rogue insert; "
+        f"got {null_prev_count}"
+    )
