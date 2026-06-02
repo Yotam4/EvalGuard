@@ -904,10 +904,23 @@ class AuditEventList(_Loose):
     ``payload`` blob the proxy attached.  Loose-shape so future
     additions to the canonical event (new PROV term, new payload
     key) don't break clients pinned to a Pydantic version.
+
+    Round-5 ultra-review (Correctness G + H): surface
+    ``corrupt_rows`` + ``truncated`` so a caller can detect both
+    integrity gaps and page truncation without re-querying:
+    - ``corrupt_rows`` is the count of event_json blobs that
+      failed JSON decode (silent drops would otherwise hide
+      chain corruption).
+    - ``truncated`` is True when ``total > count`` — the response
+      is a prefix of the full chain and the operator needs cursor
+      pagination (TODO) to see the rest.
     """
 
-    events: list[dict[str, Any]]
-    count:  int
+    events:       list[dict[str, Any]]
+    count:        int
+    corrupt_rows: int = 0
+    total:        int = 0
+    truncated:    bool = False
 
 
 class AuditVerifyResponse(_Strict):

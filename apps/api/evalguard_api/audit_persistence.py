@@ -89,7 +89,36 @@ def emit_event(
     to think about chain serialisation.  This is the single
     write-site for the proxy's audit trail — invoke.py emits per
     call, no other route writes here.
+
+    Round-5 ultra-review (Correctness J + Security G): assert the
+    caller-supplied ``project_id`` matches the run's actual
+    ``runs.project_id``.  Without this guard, a bug in the call
+    site (or a future second writer) could insert events with a
+    mismatched scope — RLS on event_rows would then grant the
+    WRONG tenant visibility while hiding the events from the
+    rightful owner.  The check is one PK-indexed SELECT and
+    fail-closed: mismatch raises ValueError before any chain row
+    lands.  No DB constraint exists today because the schema
+    lacks a UNIQUE on ``(runs.run_id, runs.project_id)`` that a
+    composite FK would need.
     """
+    actual = conn.execute(
+        text("SELECT project_id FROM runs WHERE run_id = :rid"),
+        {"rid": run_id},
+    ).first()
+    if actual is None:
+        raise ValueError(
+            f"emit_event: run {run_id!r} does not exist; "
+            "ensure the run row is created before emitting events"
+        )
+    if actual[0] != project_id:
+        raise ValueError(
+            f"emit_event: project_id mismatch — caller passed "
+            f"{project_id!r} but run {run_id!r} belongs to "
+            f"{actual[0]!r}.  Refusing to write a cross-scope "
+            "audit row; the chain would mis-attribute the call."
+        )
+
     last_err: Exception | None = None
     for attempt in range(_MAX_CHAIN_RETRIES):
         prev_hash = chain_tip_for_run(conn, run_id)
@@ -166,22 +195,47 @@ def emit_event(
 
 def list_events_for_run(
     conn: Connection, run_id: str, limit: int = 500,
-) -> list[dict[str, Any]]:
-    """Return events for the given run in chain order (insertion order
-    is the chain order — id ASC).  ``limit`` caps the read to keep
-    the response bounded; chains beyond the cap need pagination on a
-    future endpoint."""
+) -> tuple[list[dict[str, Any]], int]:
+    """Return ``(events, corrupt_count)`` for the given run in chain
+    order (id ASC = insertion order = chain order).
+
+    Round-5 ultra-review (Correctness G): the previous version
+    silently dropped JSON-decode failures with no signal to the
+    caller — a corrupt event_json row vanished from the list and
+    ``verify_chain_events`` on the partial list might still report
+    ``ok=True`` for the visible prefix.  Returning the corrupt-row
+    count lets the endpoint surface a ``corrupt_rows`` field so
+    operators KNOW the chain has integrity gaps even when
+    ``ok=True``.
+
+    ``limit`` caps the read.  Chains beyond the cap need cursor
+    pagination on a future endpoint; the cap is intentionally
+    silent at this layer so the caller (audit.py) can decide
+    whether to surface a truncation warning or refuse the
+    request — verify does the latter (round-5 Correctness H).
+    """
     rows = conn.execute(
         text("SELECT event_json FROM event_rows "
              "WHERE run_id = :rid ORDER BY id ASC LIMIT :lim"),
         {"rid": run_id, "lim": limit},
     ).fetchall()
     out: list[dict[str, Any]] = []
+    corrupt = 0
     for (blob,) in rows:
         try:
             out.append(json.loads(blob))
         except (TypeError, ValueError):
-            # A malformed row shouldn't poison the whole list; the
-            # verify endpoint will catch the hash mismatch separately.
-            continue
-    return out
+            corrupt += 1
+    return out, corrupt
+
+
+def count_events_for_run(conn: Connection, run_id: str) -> int:
+    """Return total event count for the run.  Used by /audit/verify
+    to detect truncation (correctness gap H) — if the actual count
+    exceeds the page cap, verify refuses rather than reporting
+    ``ok=True`` for only the visible prefix."""
+    row = conn.execute(
+        text("SELECT COUNT(*) FROM event_rows WHERE run_id = :rid"),
+        {"rid": run_id},
+    ).first()
+    return int(row[0]) if row else 0

@@ -23,7 +23,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
-from evalguard_api.audit_persistence import list_events_for_run
+from evalguard_api.audit_persistence import count_events_for_run, list_events_for_run
 from evalguard_api.auth import Principal, require_principal
 from evalguard_api.db import resolve_project_or_404
 from evalguard_api.deps import get_conn
@@ -84,8 +84,23 @@ def list_audit_events(
     ``verify_chain_events`` will re-hash."""
     project = _resolve_project(conn, principal, project_slug)
     _assert_run_belongs_to_project(conn, run_id, project["project_id"])
-    events = list_events_for_run(conn, run_id, limit=limit)
-    return AuditEventList(events=events, count=len(events))
+    events, corrupt = list_events_for_run(conn, run_id, limit=limit)
+    # Round-5 ultra-review (Correctness G): surface corrupt-row
+    # count + truncation flag explicitly.  Without the flag, a
+    # caller reading /audit/events for a 50k-event chain couldn't
+    # tell the response was a 500-row prefix; without
+    # ``corrupt_rows``, a silently-dropped malformed event_json
+    # would vanish with no signal even though /audit/verify
+    # would report ``ok=False`` on the same data.
+    total = count_events_for_run(conn, run_id)
+    truncated = total > limit
+    return AuditEventList(
+        events=events,
+        count=len(events),
+        corrupt_rows=corrupt,
+        total=total,
+        truncated=truncated,
+    )
 
 
 @router.get(
@@ -108,6 +123,39 @@ def verify_audit_chain(
     human string explaining the failure."""
     project = _resolve_project(conn, principal, project_slug)
     _assert_run_belongs_to_project(conn, run_id, project["project_id"])
-    events = list_events_for_run(conn, run_id, limit=_EVENTS_MAX)
+    # Round-5 ultra-review (Correctness H): the events page cap is
+    # silent for the LIST endpoint (operator iterates and stops
+    # when they've seen enough), but verify is a CORRECTNESS gate
+    # — silently truncating the chain at the cap and reporting
+    # ``ok=True`` for the visible prefix would mislead the
+    # operator into believing the FULL chain is intact when only
+    # the first ``_EVENTS_MAX`` events were checked.  Refuse with
+    # 413 + a clear message until cursor pagination ships.
+    total = count_events_for_run(conn, run_id)
+    if total > _EVENTS_MAX:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=(
+                f"Run has {total} events, exceeding the verify-page "
+                f"cap of {_EVENTS_MAX}.  Cursor pagination for "
+                f"long-chain verify is on the roadmap; refusing "
+                f"rather than reporting a misleading partial-chain "
+                f"``ok=True``."
+            ),
+        )
+    events, corrupt = list_events_for_run(conn, run_id, limit=_EVENTS_MAX)
+    if corrupt > 0:
+        # Don't pretend a chain with corrupt rows verified — the
+        # gap is real even if the prefix walks cleanly.  Surface
+        # via ``ok=False`` + a structured reason.
+        return AuditVerifyResponse(
+            ok=False,
+            events=len(events),
+            broken_at=None,
+            reason=(
+                f"chain has {corrupt} corrupt event_json row(s); "
+                f"cannot verify integrity"
+            ),
+        )
     result = verify_chain_events(events)
     return AuditVerifyResponse(**result)

@@ -76,6 +76,15 @@ router = APIRouter()
 # slice can make this per-project via the stored config.
 _PROVIDER_CALL_TIMEOUT_S: float = 60.0
 
+# Cap on the provider-exception message head we capture into
+# ``payload.error`` (round-5 ultra-review, Security B).  Provider
+# SDKs frequently echo the user's prompt into error messages; the
+# audit chain is immutable + project-readable so an unbounded
+# capture would leak production PII to every project member.  240
+# chars matches ``output_preview`` and is enough to triage class
+# + leading words; full traces stay in the structured access log.
+_ERROR_MSG_CHARS: int = 240
+
 
 # Project-resolution + cross-org 404 — see ``db.py:resolve_project_or_404``.
 _resolve_project = resolve_project_or_404
@@ -208,6 +217,19 @@ async def invoke(
         # timestamp ages out — dynamic so a project with a tight
         # cap (e.g. 5/min) gets a small Retry-After rather than the
         # fixed 60s that misled callers under the previous revision.
+        #
+        # Audit asymmetry (round-5 ultra-review, Security L): rate-
+        # limit refusals deliberately do NOT emit chain events.
+        # Two reasons: (a) under sustained abuse a hammering client
+        # would flood the audit chain at line rate (cost-cap
+        # refusals are rare-and-important; rate-limit refusals are
+        # noise-under-attack), and (b) the structured access-log
+        # middleware already captures every 429 with key_id +
+        # endpoint + status, which is the right surface for "who
+        # got throttled".  ``/audit/events`` covers "what calls did
+        # EvalGuard process"; the access log covers "what HTTP
+        # requests did EvalGuard receive".  Different questions,
+        # different surfaces.
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail=(
@@ -316,7 +338,20 @@ async def invoke(
             )
             latency_ms = int((time.monotonic() - t0) * 1000)
         except Exception as e:
-            error = f"{type(e).__name__}: {e}"
+            # Round-5 ultra-review (Security B): provider exception
+            # messages often echo the request body — OpenAI 400s
+            # include the offending prompt, Anthropic errors quote
+            # input, etc.  That string lands verbatim in
+            # ``payload.error`` inside ``event_json`` which is
+            # immutable + project-readable.  Cap at 240 chars (same
+            # length as ``output_preview``) + keep only the
+            # exception class name + the head of the message so we
+            # have enough triage signal without writing the
+            # operator's PII into the audit chain.
+            raw_msg = str(e)
+            if len(raw_msg) > _ERROR_MSG_CHARS:
+                raw_msg = raw_msg[:_ERROR_MSG_CHARS] + "…[truncated]"
+            error = f"{type(e).__name__}: {raw_msg}"
             latency_ms = int((time.monotonic() - t0) * 1000)
             is_rate_limited = _looks_like_rate_limit(e)
 
@@ -433,6 +468,12 @@ async def invoke(
                 # types and the CLI uses "cli" / "gha" — "api_key" makes
                 # the source unambiguous to anyone tailing the chain.
                 actor_type="api_key",
+                # Round-5 ultra-review (Correctness K): empty
+                # ``actor_meta`` strips useful triage context.  Capture
+                # the key's scope set so an auditor reading the chain
+                # knows which permissions were in effect — without
+                # capturing the secret itself (only ``key_id`` lands).
+                actor_meta={"scopes": list(principal.scopes)},
                 subject_id=f"{provider_name}:{model}",
                 inputs=body.input,
                 outputs=output if error is None else None,
@@ -479,7 +520,18 @@ async def invoke(
         # cost is silently lost from EvalGuard's perspective.
         # Log CRITICAL so operators can reconcile via the provider's
         # own billing dashboard (round-4 review-pass A from Agent-1).
-        if error is None and cost_usd > 0:
+        #
+        # Round-5 ultra-review (Security K + Correctness E): the
+        # earlier ``error is None and cost_usd > 0`` gate suppressed
+        # the log on partial-failure paths — e.g. chain-retry
+        # exhaustion AFTER a successful provider call that ALSO
+        # carried an upstream-error indicator (rare but possible
+        # for providers that return an error AND charge anyway).
+        # Drop the ``error is None`` half: cost_usd > 0 means a
+        # charge happened; the operator needs the reconciliation
+        # breadcrumb regardless of whether the response was a
+        # success or a soft-failure.
+        if cost_usd > 0:
             logger.critical(
                 '{"evt":"phase3_failed_after_provider_charge","project_id":%r,'
                 '"row_id":%r,"provider":%r,"model":%r,"cost_usd_lost":%.6f,'

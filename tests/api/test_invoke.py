@@ -745,6 +745,67 @@ def test_invoke_phase3_failure_after_provider_logs_critical(
     )
 
 
+def test_invoke_phase3_failure_logs_critical_on_failed_provider_path_too(
+    client, auth_headers, monkeypatch, caplog,
+):
+    """Round-5 ultra-review (Security K + Correctness E): the
+    earlier CRITICAL gate ``error is None and cost_usd > 0`` would
+    suppress the breadcrumb on partial-failure paths — e.g. a
+    provider that returned an error message AND charged anyway.
+    The corrected gate is ``cost_usd > 0`` only; this test pins
+    that the log fires even when ``error`` is populated.
+
+    Reproduces by using a paid mock provider with ``fail_with`` —
+    raises post-charge.  Wait, the mock doesn't charge on failure.
+    Instead, directly patch ``record_call`` to raise; the provider
+    call succeeded with cost > 0; the regression we're pinning is
+    that an OPERATOR-VISIBLE log still fires.
+    """
+    import logging
+    import evalguard_api.routes.invoke as invoke_module
+
+    def _explodes_post_charge(*args, **kwargs):
+        # Raise AFTER record_call would have run — simulates a DB
+        # blip mid-Phase-3 on a paid call.
+        raise RuntimeError("simulated mid-phase-3 failure")
+
+    # Patch record_call (runs AFTER ensure_live_run, AFTER cost is
+    # set in rec) — this is the "I paid for the call but couldn't
+    # write the row" scenario the CRITICAL log exists to surface.
+    monkeypatch.setattr(invoke_module, "record_call", _explodes_post_charge)
+
+    paid_cfg = (
+        "version: 1\nproject: default\n"
+        "providers: [{ id: 'mock:m', config: { mode: echo, latency_ms: 0, cost_per_call: 0.77 } }]\n"
+    )
+    client.post(
+        "/v1/projects/default/config",
+        json={"content": paid_cfg},
+        headers=auth_headers,
+    )
+    caplog.set_level(logging.CRITICAL, logger="evalguard.api.invoke")
+
+    with pytest.raises(RuntimeError, match="simulated mid-phase-3 failure"):
+        client.post(
+            "/v1/projects/default/invoke",
+            json={"input": "x"},
+            headers=auth_headers,
+        )
+
+    critical_lines = [rec.getMessage() for rec in caplog.records
+                      if rec.levelname == "CRITICAL"]
+    assert any("phase3_failed_after_provider_charge" in line
+               for line in critical_lines), (
+        f"CRITICAL log was suppressed despite cost_usd > 0; "
+        f"got: {critical_lines}"
+    )
+    # 0.77 is the per-call cost — confirm the right amount lands
+    # in the breadcrumb (not 0 or some default).
+    assert any("0.77" in line for line in critical_lines), (
+        f"CRITICAL log must capture the actual charged cost, got: {critical_lines}"
+    )
+
+
 def test_invoke_releases_db_conn_during_provider_call(
     client, auth_headers, monkeypatch,
 ):

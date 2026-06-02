@@ -46,11 +46,30 @@ def _invoke(client, headers, input_: str = "x"):
 
 def test_first_invoke_emits_one_event_with_no_prev(client, auth_headers):
     """The day's first call lazy-creates the live run AND opens the
-    chain.  ``prev_event_hash`` must be ``None`` (chain origin)."""
+    chain.  ``prev_event_hash`` must be ``None`` (chain origin).
+
+    Test-quality round (Finding F8): assert ``actor_id`` equals the
+    actual bootstrap admin key_id, not just truthy.  Anchors against
+    a regression where the route accidentally hardcodes a wrong id.
+    """
+    from sqlalchemy import text as _text
     _push_paid_config(client, auth_headers)
     r = _invoke(client, auth_headers)
     assert r.status_code == 200
     run_id = r.json()["run_id"]
+
+    # Look up the actual bootstrap key_id so we can pin actor_id to it.
+    # The lifespan creates ONE key for the default org named
+    # "bootstrap (env)" (apps/api/evalguard_api/main.py:168).
+    engine = client.app.state.engine
+    with engine.connect() as conn:
+        expected_key_id = conn.execute(
+            _text("SELECT key_id FROM api_keys "
+                  "WHERE name = 'bootstrap (env)' LIMIT 1"),
+        ).scalar()
+    assert expected_key_id is not None, (
+        "bootstrap (env) key not found — fixture setup changed?"
+    )
 
     events = client.get(
         f"/v1/projects/default/audit/events?run_id={run_id}",
@@ -60,9 +79,20 @@ def test_first_invoke_emits_one_event_with_no_prev(client, auth_headers):
     ev = events[0]
     assert ev["kind"]            == "provider.called"
     assert ev["prev_event_hash"] is None
-    assert ev["event_hash"]   # populated
+    # event_hash must be a proper sha256 hex (64 chars) — a bug that
+    # produced an empty or short hash would otherwise slip through.
+    assert isinstance(ev["event_hash"], str) and len(ev["event_hash"]) == 64
+    assert all(c in "0123456789abcdef" for c in ev["event_hash"])
     assert ev["actor_type"]      == "api_key"
-    assert ev["actor_id"]   # the principal's key_id
+    # Round-5 test-quality F8: pin the actual key_id, not just truthy.
+    assert ev["actor_id"] == expected_key_id, (
+        f"actor_id mismatch: event has {ev['actor_id']!r}, "
+        f"bootstrap key is {expected_key_id!r}"
+    )
+    # Round-5 (Correctness K): actor_meta now carries scopes so an
+    # auditor sees which permissions were in effect.  Bootstrap is
+    # admin-scoped.
+    assert ev["actor_meta"].get("scopes") == ["admin"]
     assert ev["payload"]["provider"] == "mock"
     assert ev["payload"]["model"]    == "m"
     # Cost flows through to the audit event so the reconciliation
@@ -73,7 +103,13 @@ def test_first_invoke_emits_one_event_with_no_prev(client, auth_headers):
 def test_two_invokes_form_a_linear_chain(client, auth_headers):
     """Second event's ``prev_event_hash`` must equal first event's
     ``event_hash``.  This is the chain-fork-prevention invariant
-    ``UNIQUE (run_id, prev_event_hash)`` exists to enforce."""
+    ``UNIQUE (run_id, prev_event_hash)`` exists to enforce.
+
+    Test-quality round (Finding F3): assert event_hash is non-empty
+    + properly-shaped on BOTH events.  Without this, a chain where
+    one node had a blank hash could pass the chaining assertion
+    trivially (``None == None`` style).
+    """
     _push_paid_config(client, auth_headers)
     r1 = _invoke(client, auth_headers, "a")
     r2 = _invoke(client, auth_headers, "b")
@@ -84,14 +120,28 @@ def test_two_invokes_form_a_linear_chain(client, auth_headers):
         headers=auth_headers,
     ).json()["events"]
     assert len(events) == 2
+    # Both hashes are real sha256 hex (64 lowercase hex chars).
+    for ev in events:
+        h = ev["event_hash"]
+        assert isinstance(h, str) and len(h) == 64
+        assert all(c in "0123456789abcdef" for c in h)
     assert events[0]["prev_event_hash"] is None
     assert events[1]["prev_event_hash"] == events[0]["event_hash"]
+    # And the two events DO NOT share an event_hash (would mean
+    # the second insert duplicated the first).
+    assert events[0]["event_hash"] != events[1]["event_hash"]
 
 
 def test_provider_failure_emits_provider_failed_event(client, auth_headers):
     """A failed upstream call still emits one chain-linked event,
     but with ``kind = provider.failed`` and the error message
-    captured in the payload."""
+    captured in the payload.
+
+    Test-quality round (Finding F4): also pin ``is_rate_limited``
+    and ``is_cost_capped`` to False so a generic upstream-5xx
+    failure can't be silently confused with a rate-limit or
+    cost-cap path in the audit chain.
+    """
     bad_cfg = (
         "version: 1\nproject: default\n"
         "providers: [{ id: 'mock:m', config: { mode: echo, latency_ms: 0, fail_with: 'simulated 500' } }]\n"
@@ -107,8 +157,16 @@ def test_provider_failure_emits_provider_failed_event(client, auth_headers):
         headers=auth_headers,
     ).json()["events"]
     assert len(events) == 1
-    assert events[0]["kind"]               == "provider.failed"
-    assert "simulated 500" in events[0]["payload"]["error"]
+    payload = events[0]["payload"]
+    assert events[0]["kind"]            == "provider.failed"
+    assert "simulated 500" in payload["error"]
+    # Distinguish a generic upstream failure from rate-limit /
+    # cost-cap paths — without these assertions a rate-limit
+    # failure routed through the same code path would look
+    # identical to this generic-failure case.
+    assert payload["is_rate_limited"] is False
+    assert payload["is_cost_capped"]  is False
+    assert payload["passed"]          is False
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +174,13 @@ def test_provider_failure_emits_provider_failed_event(client, auth_headers):
 
 
 def test_verify_clean_chain_returns_ok(client, auth_headers):
+    """Test-quality round (Finding F1): ``ok=True`` + ``events==4``
+    is a weak anchor — verify could be a stub that always returns
+    ok and the count would still match (since the count comes from
+    ``len(events)``).  Strengthen by independently fetching the
+    events and asserting the chain prev-links form an unbroken
+    sequence — that's the structural invariant verify is
+    SUPPOSED to enforce."""
     _push_paid_config(client, auth_headers)
     _invoke(client, auth_headers, "a")
     _invoke(client, auth_headers, "b")
@@ -133,6 +198,23 @@ def test_verify_clean_chain_returns_ok(client, auth_headers):
     assert body["broken_at"] is None
     assert body["reason"]
 
+    # Independent structural check: the events list itself must
+    # form a chain of length 4 with prev=None at the root and
+    # each subsequent prev_event_hash == previous event_hash.
+    # If verify were ever swapped for a stub that just returned
+    # ``ok=True``, this still catches the regression.
+    events = client.get(
+        f"/v1/projects/default/audit/events?run_id={run_id}",
+        headers=auth_headers,
+    ).json()["events"]
+    assert len(events) == 4
+    assert events[0]["prev_event_hash"] is None
+    for i in range(1, 4):
+        assert events[i]["prev_event_hash"] == events[i - 1]["event_hash"], (
+            f"chain broken at event[{i}]: prev={events[i]['prev_event_hash']!r}, "
+            f"expected={events[i - 1]['event_hash']!r}"
+        )
+
 
 def test_verify_detects_event_hash_tamper(client, auth_headers):
     """Mutate one event's payload AFTER it was hashed.  The
@@ -145,22 +227,39 @@ def test_verify_detects_event_hash_tamper(client, auth_headers):
     _invoke(client, auth_headers, "c")
     run_id = r2.json()["run_id"]
 
+    # Test-quality round (Finding F2): identify the event to tamper
+    # by ITS event_id via the public events API, not by raw-SQL
+    # ORDER BY id OFFSET 1.  The OFFSET approach is fragile (any
+    # ordering change or pre-existing fixture data shifts the
+    # target) AND the previous assertion was self-referential
+    # (``broken_at == row["event_id"]`` where row was the row we
+    # tampered + the row whose id we asserted on).  Now: pick the
+    # SECOND event from the public list, tamper it specifically,
+    # and assert verify reports THAT event_id as broken_at.
+    api_events = client.get(
+        f"/v1/projects/default/audit/events?run_id={run_id}",
+        headers=auth_headers,
+    ).json()["events"]
+    assert len(api_events) == 3
+    target_event_id = api_events[1]["event_id"]
+
     engine = client.app.state.engine
     with engine.begin() as conn:
-        row = conn.execute(
-            text("SELECT id, event_id, event_json FROM event_rows "
-                 "WHERE run_id = :rid ORDER BY id LIMIT 1 OFFSET 1"),
-            {"rid": run_id},
-        ).mappings().fetchone()
         # Mutate the event_json (the canonical form verify_chain
         # re-hashes) but leave event_hash + prev_event_hash alone.
         # This simulates after-the-fact tampering — exactly what
         # the chain exists to detect.
+        row = conn.execute(
+            text("SELECT event_json FROM event_rows "
+                 "WHERE event_id = :eid"),
+            {"eid": target_event_id},
+        ).mappings().fetchone()
         tampered = json.loads(row["event_json"])
         tampered["payload"] = {"tampered": True}
         conn.execute(
-            text("UPDATE event_rows SET event_json = :j WHERE id = :id"),
-            {"j": json.dumps(tampered), "id": row["id"]},
+            text("UPDATE event_rows SET event_json = :j "
+                 "WHERE event_id = :eid"),
+            {"j": json.dumps(tampered), "eid": target_event_id},
         )
 
     v = client.get(
@@ -168,7 +267,10 @@ def test_verify_detects_event_hash_tamper(client, auth_headers):
         headers=auth_headers,
     ).json()
     assert v["ok"] is False
-    assert v["broken_at"] == row["event_id"]
+    assert v["broken_at"] == target_event_id, (
+        f"verify named the wrong event: got {v['broken_at']!r}, "
+        f"expected the tampered event {target_event_id!r}"
+    )
     assert "event_hash mismatch" in v["reason"]
 
 
@@ -181,12 +283,20 @@ def test_verify_detects_prev_hash_tamper(client, auth_headers):
     r2 = _invoke(client, auth_headers, "b")
     run_id = r2.json()["run_id"]
 
+    # Test-quality round (F2): identify by event_id via the public
+    # API, not OFFSET — same robustness reason as the event-hash
+    # tamper test above.
+    api_events = client.get(
+        f"/v1/projects/default/audit/events?run_id={run_id}",
+        headers=auth_headers,
+    ).json()["events"]
+    target_event_id = api_events[1]["event_id"]
+
     engine = client.app.state.engine
     with engine.begin() as conn:
         row = conn.execute(
-            text("SELECT id, event_id, event_json FROM event_rows "
-                 "WHERE run_id = :rid ORDER BY id LIMIT 1 OFFSET 1"),
-            {"rid": run_id},
+            text("SELECT event_json FROM event_rows WHERE event_id = :eid"),
+            {"eid": target_event_id},
         ).mappings().fetchone()
         tampered = json.loads(row["event_json"])
         tampered["prev_event_hash"] = "0" * 64
@@ -197,11 +307,12 @@ def test_verify_detects_prev_hash_tamper(client, auth_headers):
         tampered["event_hash"] = hash_event(tampered)
         conn.execute(
             text("UPDATE event_rows SET event_json = :j, "
-                 "prev_event_hash = :p, event_hash = :h WHERE id = :id"),
+                 "prev_event_hash = :p, event_hash = :h "
+                 "WHERE event_id = :eid"),
             {"j": json.dumps(tampered),
              "p": tampered["prev_event_hash"],
              "h": tampered["event_hash"],
-             "id": row["id"]},
+             "eid": target_event_id},
         )
 
     v = client.get(
@@ -209,7 +320,10 @@ def test_verify_detects_prev_hash_tamper(client, auth_headers):
         headers=auth_headers,
     ).json()
     assert v["ok"] is False
-    assert v["broken_at"] == row["event_id"]
+    assert v["broken_at"] == target_event_id, (
+        f"verify named the wrong event: got {v['broken_at']!r}, "
+        f"expected the tampered event {target_event_id!r}"
+    )
     assert "prev_event_hash mismatch" in v["reason"]
 
 
@@ -249,6 +363,21 @@ def test_audit_events_cross_org_returns_404(
     assert inv.status_code == 200
     run_id = inv.json()["run_id"]
 
+    # Test-quality round (Finding F5): a sanity assertion that the
+    # default-org member's token DOES authenticate (200 on its own
+    # org's endpoints) before asserting 404 on the cross-org path.
+    # Without this, a 404 could fire from auth failure misread as
+    # anti-enumeration tenancy isolation.
+    auth_sanity = client.get(
+        "/v1/projects/default/calls?tab=recent&limit=1",
+        headers={"Authorization": f"Bearer {member_default}"},
+    )
+    assert auth_sanity.status_code == 200, (
+        f"default-org member token failed auth on its OWN project "
+        f"({auth_sanity.status_code}); the cross-org 404 below can't "
+        f"be attributed to tenancy isolation"
+    )
+
     # Default member knows the slug but must 404.
     r = client.get(
         f"/v1/projects/secret/audit/events?run_id={run_id}",
@@ -287,9 +416,18 @@ def test_audit_events_wrong_project_for_run_returns_404(
 
 
 def test_audit_events_unauth_returns_401(client):
-    r = client.get("/v1/projects/default/audit/events?run_id=run_anything")
-    assert r.status_code == 401
-    v = client.get("/v1/projects/default/audit/verify?run_id=run_anything")
+    """Test-quality round (Finding F6): use a real-shape run_id so
+    a future route-level format validator (UUID-shaped, prefix-
+    pattern, etc.) can't 422 the request before the auth check
+    fires.  ``run_live_<16 hex>`` matches the proxy's deterministic
+    id format from ``live.live_run_id``."""
+    well_formed = "run_live0123456789abcdef"
+    r = client.get(f"/v1/projects/default/audit/events?run_id={well_formed}")
+    assert r.status_code == 401, (
+        f"got {r.status_code} instead of 401 — auth must fire "
+        f"before any other gate.  Body: {r.text[:200]}"
+    )
+    v = client.get(f"/v1/projects/default/audit/verify?run_id={well_formed}")
     assert v.status_code == 401
 
 
@@ -351,4 +489,55 @@ def test_chain_root_partial_unique_index_blocks_double_first_event(client, auth_
     assert null_prev_count == 1, (
         f"expected exactly one chain root after the rogue insert; "
         f"got {null_prev_count}"
+    )
+
+
+def test_emit_event_rejects_mismatched_project_id(client, auth_headers):
+    """Round-5 ultra-review (Correctness J + Security G): the
+    ``project_id`` argument to ``emit_event`` must match the
+    ``runs.project_id`` of the supplied ``run_id``.  Without this
+    runtime check, a buggy caller could write events scoped to the
+    WRONG tenant — RLS on event_rows would then grant the wrong
+    org visibility while hiding the events from the rightful owner.
+
+    Reproduces by calling ``emit_event`` directly (the only way to
+    trigger the mismatch — invoke.py always resolves the project
+    correctly).  Asserts ValueError fires BEFORE any chain row
+    lands."""
+    import pytest
+    from sqlalchemy import text as _text
+    from evalguard_api.audit_persistence import emit_event
+
+    # First do a real invoke to lazy-create the live run.
+    _push_paid_config(client, auth_headers)
+    r = _invoke(client, auth_headers, "seed")
+    run_id = r.json()["run_id"]
+
+    engine = client.app.state.engine
+    with engine.begin() as conn:
+        # Count audit rows BEFORE the rogue call so we can assert
+        # nothing landed during the rejected attempt.
+        before = conn.execute(
+            _text("SELECT COUNT(*) FROM event_rows WHERE run_id = :rid"),
+            {"rid": run_id},
+        ).scalar_one()
+
+        with pytest.raises(ValueError, match="project_id mismatch"):
+            emit_event(
+                conn,
+                kind="provider.called",
+                run_id=run_id,
+                project_id="proj_TOTALLY_WRONG",   # intentionally wrong
+                actor_id="some_key",
+                actor_type="api_key",
+            )
+
+        # Fail-closed: no row landed.
+        after = conn.execute(
+            _text("SELECT COUNT(*) FROM event_rows WHERE run_id = :rid"),
+            {"rid": run_id},
+        ).scalar_one()
+    assert before == after, (
+        f"emit_event wrote {after - before} row(s) despite raising — "
+        "the mismatch check must fire BEFORE the chain insert"
     )

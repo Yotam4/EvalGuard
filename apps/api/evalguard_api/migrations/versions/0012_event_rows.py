@@ -54,8 +54,13 @@ def upgrade() -> None:
             sa.Column("id",              sa.Integer(),
                 primary_key=True, autoincrement=True),
             sa.Column("event_id",        sa.Text(), nullable=False, unique=True),
+            # Round-5 ultra-review (Correctness I): RESTRICT not
+            # CASCADE — audit chains must outlive the runs they
+            # describe (SOC 2 / GDPR forensics).  Operators wanting
+            # to drop a run must explicitly purge its audit chain
+            # first via a separate (future) retention-policy job.
             sa.Column("run_id",          sa.Text(),
-                sa.ForeignKey("runs.run_id", ondelete="CASCADE"),
+                sa.ForeignKey("runs.run_id", ondelete="RESTRICT"),
                 nullable=False),
             sa.Column("trial_id",        sa.Text()),
             sa.Column("row_id",          sa.Text()),
@@ -90,17 +95,14 @@ def upgrade() -> None:
         # first-of-day inserts both with ``prev_event_hash = NULL``
         # would both succeed silently.  Partial unique index forces
         # only ONE NULL-prev row per run.  SQLite 3.8+ and every
-        # supported Postgres version honour ``WHERE``.
-        if _is_postgres():
-            op.execute(
-                "CREATE UNIQUE INDEX uq_event_rows_chain_root "
-                "ON event_rows (run_id) WHERE prev_event_hash IS NULL"
-            )
-        else:
-            op.execute(
-                "CREATE UNIQUE INDEX uq_event_rows_chain_root "
-                "ON event_rows (run_id) WHERE prev_event_hash IS NULL"
-            )
+        # supported Postgres version honour ``WHERE`` on
+        # ``CREATE UNIQUE INDEX`` — same SQL works on both, no need
+        # for a dialect branch (round-5 review: dead if/else
+        # collapsed).
+        op.execute(
+            "CREATE UNIQUE INDEX uq_event_rows_chain_root "
+            "ON event_rows (run_id) WHERE prev_event_hash IS NULL"
+        )
 
     if not _is_postgres():
         return

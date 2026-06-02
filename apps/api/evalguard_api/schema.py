@@ -343,8 +343,16 @@ event_rows = Table(
     "event_rows", metadata,
     Column("id",              Integer, primary_key=True, autoincrement=True),
     Column("event_id",        Text, nullable=False, unique=True),
+    # Round-5 ultra-review (Correctness I): audit logs MUST outlive
+    # the entity they describe.  SOC 2 / GDPR Article 30 / financial
+    # audit all require the trail be retained for forensics even
+    # after the operational record is gone.  ``ON DELETE RESTRICT``
+    # blocks ``DELETE FROM runs WHERE run_id = ?`` while audit
+    # events still exist — operators wanting to delete a run must
+    # first explicitly purge its audit chain (or wait for a
+    # retention-policy follow-up that does so deliberately).
     Column("run_id",          Text,
-        ForeignKey("runs.run_id", ondelete="CASCADE"),
+        ForeignKey("runs.run_id", ondelete="RESTRICT"),
         nullable=False),
     Column("trial_id",        Text),
     Column("row_id",          Text),
