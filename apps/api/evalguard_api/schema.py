@@ -310,4 +310,58 @@ RLS_TARGET_TABLES: tuple[str, ...] = (
     "row_reviews",
     "golden_candidates",
     "project_configs",
+    "event_rows",
+)
+
+
+# Phase PROXY-3.5 — per-event audit chain rows.
+#
+# The existing ``events`` table is one-blob-per-run (UNIQUE on
+# run_id, the whole event chain serialised into ``events_json``).
+# That shape was correct for CLI/OTLP batch ingest: a run completes,
+# its full audit chain arrives in one POST, gets stored as one blob.
+#
+# The proxy can't fit that shape — a live run accumulates events
+# across many distinct ``/invoke`` calls over a day.  Re-serialising
+# the whole blob per call would be O(N²) in events and re-writing it
+# atomically against concurrent writers is awkward.
+#
+# ``event_rows`` is the per-event granular form: one row per
+# emitted event, chain-linked via ``prev_event_hash``.
+# ``UNIQUE (run_id, prev_event_hash)`` is the linchpin: only ONE
+# event can ever follow a given chain tip, so two concurrent writers
+# racing on the same run see one win and the other catches an
+# IntegrityError and retries with the fresh tip.  Without that
+# constraint a fork would silently corrupt the chain.
+#
+# ``event_json`` carries the full canonical event dict — same shape
+# ``build_event`` returns — so ``verify_chain_events`` can re-hash
+# verbatim without us having to perfectly denormalise every PROV
+# field into a separate column.  Disk space is cheap; audit clarity
+# is not.
+event_rows = Table(
+    "event_rows", metadata,
+    Column("id",              Integer, primary_key=True, autoincrement=True),
+    Column("event_id",        Text, nullable=False, unique=True),
+    Column("run_id",          Text,
+        ForeignKey("runs.run_id", ondelete="CASCADE"),
+        nullable=False),
+    Column("trial_id",        Text),
+    Column("row_id",          Text),
+    Column("project_id",      Text, nullable=False),
+    Column("kind",            Text, nullable=False),
+    Column("actor_id",        Text, nullable=False),
+    Column("actor_type",      Text, nullable=False),
+    Column("subject_kind",    Text),
+    Column("subject_id",      Text),
+    Column("cost_usd",        Float),
+    Column("duration_ms",     Integer),
+    Column("prev_event_hash", Text),
+    Column("event_hash",      Text, nullable=False),
+    Column("event_json",      Text, nullable=False),
+    Column("ingested_at",     Text, nullable=False),
+    UniqueConstraint("run_id", "prev_event_hash",
+                     name="uq_event_rows_chain"),
+    Index("idx_event_rows_run",  "run_id", "id"),
+    Index("idx_event_rows_proj", "project_id", "ingested_at", "id"),
 )

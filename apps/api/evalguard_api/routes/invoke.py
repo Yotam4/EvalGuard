@@ -54,6 +54,7 @@ from sqlalchemy.engine import Connection
 
 logger = logging.getLogger("evalguard.api.invoke")
 
+from evalguard_api.audit_persistence import emit_event
 from evalguard_api.auth import Principal, require_principal
 from evalguard_api.db import apply_rls_context, resolve_project_or_404
 from evalguard_api.live import (
@@ -407,6 +408,45 @@ async def invoke(
             record_call(
                 conn, run_id=run_id, trial_id=trial_id,
                 project_id=project_id, rec=rec,
+            )
+            # PROXY-3.5 — chain-linked audit event for this call.
+            # ``emit_event`` handles the prev_event_hash chaining
+            # + IntegrityError-retry on concurrent writers; we just
+            # provide the actor + PROV subject context.  ``kind`` is
+            # ``provider.called`` on success or ``provider.failed``
+            # when the upstream call errored (timeout / 429 / 5xx).
+            # The row's input + output are passed-through; the
+            # audit core's ``redact_secrets`` strips key-shaped
+            # fields before hashing.
+            ev_kind = "provider.failed" if error else "provider.called"
+            emit_event(
+                conn,
+                kind=ev_kind,
+                run_id=run_id,
+                project_id=project_id,
+                trial_id=trial_id,
+                row_id=row_id,
+                actor_id=principal.key_id,
+                # The proxy actor is always an API key (no human-in-the-
+                # loop ingest path here); the existing audit vocabulary
+                # in evalguard_evaluators.audit accepts free-form actor
+                # types and the CLI uses "cli" / "gha" — "api_key" makes
+                # the source unambiguous to anyone tailing the chain.
+                actor_type="api_key",
+                subject_id=f"{provider_name}:{model}",
+                inputs=body.input,
+                outputs=output if error is None else None,
+                payload={
+                    "provider":     provider_name,
+                    "model":        model,
+                    "error":        error,
+                    "is_rate_limited": is_rate_limited,
+                    "is_cost_capped":  is_cost_capped,
+                    "passed":       passed and error is None,
+                    "n_scores":     len(scores_payload),
+                },
+                cost_usd=cost_usd,
+                duration_ms=latency_ms,
             )
             # Post-write cost-cap detection (round-4 ultra-review,
             # Agent-1 B / Agent-3 C).  The Phase-1 cap check is

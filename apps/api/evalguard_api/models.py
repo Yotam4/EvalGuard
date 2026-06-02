@@ -888,3 +888,39 @@ class LiveAggregate(_Strict):
     row_fail_count: int
     cost_usd:       float
     run_count:      int     # how many daily runs the window covers
+
+
+# ---------------------------------------------------------------------------
+# Phase PROXY-3.5 — audit chain endpoints.
+
+
+class AuditEventList(_Loose):
+    """``GET /v1/projects/{slug}/audit/events`` response.
+
+    ``events`` is the full canonical record list — same shape
+    ``evalguard_evaluators.audit.build_event`` returns — in chain
+    order.  Each event includes ``event_id``, ``kind``, all PROV
+    fields, ``prev_event_hash``, ``event_hash``, and the
+    ``payload`` blob the proxy attached.  Loose-shape so future
+    additions to the canonical event (new PROV term, new payload
+    key) don't break clients pinned to a Pydantic version.
+    """
+
+    events: list[dict[str, Any]]
+    count:  int
+
+
+class AuditVerifyResponse(_Strict):
+    """``GET /v1/projects/{slug}/audit/verify`` response.
+
+    Same shape as the CLI's ``verify_chain`` return — an operator
+    parsing one log can parse the other.  ``ok=True`` iff every
+    ``prev_event_hash → event_hash`` link verifies; on failure
+    ``broken_at`` is the ``event_id`` of the first broken event and
+    ``reason`` is a human-readable explanation.
+    """
+
+    ok:        bool
+    events:    int             # how many events were walked
+    broken_at: str | None
+    reason:    str
