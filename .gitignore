@@ -20,4 +20,3 @@ next-env.d.ts
 pytest-cache-files-*/
 .ruff_cache/
 .mypy_cache/
-uv.lock

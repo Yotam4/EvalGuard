@@ -166,6 +166,111 @@ def test_post_rejects_malformed_yaml(client, auth_headers):
     assert "valid yaml" in r.text.lower()
 
 
+def test_post_rejects_provider_config_non_mapping(client, auth_headers):
+    """Round-4 ultra-review (Agent-2 G): ``providers[0].config`` must
+    be a YAML mapping when set; a scalar slips through to load_provider
+    and 500s the invoke call with an opaque AttributeError."""
+    bad = (
+        "version: 1\n"
+        "project: default\n"
+        "providers:\n  - id: 'mock:m'\n    config: 'not a mapping'\n"
+    )
+    r = client.post(
+        "/v1/projects/default/config",
+        json={"content": bad},
+        headers=auth_headers,
+    )
+    assert r.status_code == 422, r.text
+    assert "config" in r.text.lower()
+
+
+def test_post_rejects_negative_rate_limit(client, auth_headers):
+    """Round-4 ultra-review (Agent-3 F): ``rate_limit_per_minute: -1``
+    would pass the ``≤ 0 → disabled`` branch in quotas.py and
+    silently remove rate limiting.  Must 422 at push."""
+    bad = (
+        "version: 1\nproject: default\n"
+        "providers: [{ id: 'mock:m' }]\n"
+        "rate_limit_per_minute: -1\n"
+    )
+    r = client.post(
+        "/v1/projects/default/config",
+        json={"content": bad},
+        headers=auth_headers,
+    )
+    assert r.status_code == 422
+    assert "rate_limit_per_minute" in r.text
+
+
+def test_post_rejects_string_rate_limit(client, auth_headers):
+    bad = (
+        "version: 1\nproject: default\n"
+        "providers: [{ id: 'mock:m' }]\n"
+        "rate_limit_per_minute: 'unlimited'\n"
+    )
+    r = client.post(
+        "/v1/projects/default/config",
+        json={"content": bad},
+        headers=auth_headers,
+    )
+    assert r.status_code == 422
+
+
+def test_post_rejects_nan_cost_cap(client, auth_headers):
+    """Round-4 ultra-review (Agent-3 F): ``NaN > 0`` is False so the
+    cap silently bypasses.  Must 422 at push."""
+    bad = (
+        "version: 1\nproject: default\n"
+        "providers: [{ id: 'mock:m' }]\n"
+        "cost_cap_usd_daily: .nan\n"
+    )
+    r = client.post(
+        "/v1/projects/default/config",
+        json={"content": bad},
+        headers=auth_headers,
+    )
+    assert r.status_code == 422
+    assert "cost_cap_usd_daily" in r.text
+
+
+def test_post_rejects_negative_cost_cap(client, auth_headers):
+    bad = (
+        "version: 1\nproject: default\n"
+        "providers: [{ id: 'mock:m' }]\n"
+        "cost_cap_usd_daily: -5.0\n"
+    )
+    r = client.post(
+        "/v1/projects/default/config",
+        json={"content": bad},
+        headers=auth_headers,
+    )
+    assert r.status_code == 422
+
+
+def test_post_warns_on_cost_cap_usd_typo(client, auth_headers, caplog):
+    """Round-4 ultra-review (Agent-3 K): operator wrote
+    ``cost_cap_usd`` (CLI executor field) instead of
+    ``cost_cap_usd_daily`` (proxy field).  Push succeeds (the field
+    is legal for batch) but emits a structured WARNING so the
+    confusion surfaces in the access log."""
+    import logging
+    yaml_blob = (
+        "version: 1\nproject: default\n"
+        "providers: [{ id: 'mock:m' }]\n"
+        "cost_cap_usd: 1.00\n"
+    )
+    caplog.set_level(logging.WARNING, logger="evalguard.api.configs")
+    r = client.post(
+        "/v1/projects/default/config",
+        json={"content": yaml_blob},
+        headers=auth_headers,
+    )
+    assert r.status_code in (200, 201)
+    warns = [rec.getMessage() for rec in caplog.records
+             if rec.levelname == "WARNING"]
+    assert any("config.typo_warn" in line for line in warns), warns
+
+
 def test_post_accepts_proxy_config_without_datasets(client, auth_headers):
     """A pure-proxy config has no datasets — the lighter validation
     (vs the full evalguard.schema.json) must accept it."""

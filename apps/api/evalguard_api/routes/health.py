@@ -71,10 +71,33 @@ def ready(request: Request) -> JSONResponse:
     parse ``ok`` regardless of HTTP status.
     """
     settings = request.app.state.settings
-    engine   = request.app.state.engine
+    # Round-4 ultra-review (Agent-1 H): a k8s probe can hit /v1/ready
+    # in the brief window between worker process start and lifespan
+    # completion — ``app.state.engine`` doesn't yet exist.  An
+    # AttributeError would surface as a 500 (which the probe treats
+    # the same as 503 for readiness purposes, so the safety
+    # outcome is correct), but monitoring parsing the structured
+    # body would not find the expected shape.  Convert to a clean
+    # 503 with the documented body so log shippers stay happy.
+    engine = getattr(request.app.state, "engine", None)
 
     checks: dict[str, dict] = {}
     overall_ok = True
+
+    if engine is None:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "ok":      False,
+                "version": __version__,
+                "mode":    "open" if settings.is_open_mode else "auth",
+                "checks": {
+                    "db":         {"ok": False, "error": "engine not initialised (lifespan still starting)"},
+                    "migration":  {"ok": False, "error": "engine not initialised"},
+                    "evaluators": {"ok": False, "error": "engine not initialised"},
+                },
+            },
+        )
 
     # --- DB --------------------------------------------------------
     try:

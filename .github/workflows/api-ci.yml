@@ -18,6 +18,10 @@ on:
       - 'apps/api/**'
       - 'packages/evaluators/**'
       - 'packages/cli/**'
+      - 'packages/schemas/**'    # round-4 ultra-review (Agent-2 B):
+                                  # schema-only PRs would otherwise
+                                  # skip the drift-canary tests in
+                                  # ``tests/test_schema_drift.py``.
       - 'tests/**'
       - 'pyproject.toml'
       - 'uv.lock'
@@ -28,6 +32,7 @@ on:
       - 'apps/api/**'
       - 'packages/evaluators/**'
       - 'packages/cli/**'
+      - 'packages/schemas/**'
       - 'tests/**'
 
 
@@ -50,11 +55,12 @@ jobs:
           python-version: '3.11'
 
       - name: Install workspace
-        # ``uv sync`` installs the workspace members (cli, evaluators,
-        # api) in dev mode + every dev / test dep declared in the root
-        # ``pyproject.toml``.  Same one-shot setup the local dev loop
-        # uses.
-        run: uv sync --all-extras
+        # ``--frozen`` makes CI fail loudly when ``uv.lock`` is out
+        # of date (rather than silently resolving fresh and risking
+        # version drift between PR runs).  Update ``uv.lock``
+        # locally via ``uv lock`` and commit when the locked set
+        # legitimately changes.
+        run: uv sync --frozen --all-extras
 
       - name: Run pytest
         # Postgres-only tests skip cleanly when ``EVALGUARD_TEST_POSTGRES_URL``
@@ -105,8 +111,10 @@ jobs:
         # ``--all-extras`` includes the ``[postgres]`` extra which
         # pulls in psycopg3.  Without it the Postgres fixture would
         # skip at import time and the job would green-pass with zero
-        # tests run — silently masking RLS regressions.
-        run: uv sync --all-extras
+        # tests run — silently masking RLS regressions.  ``--frozen``
+        # pins to ``uv.lock`` so the two jobs install identical
+        # dep sets.
+        run: uv sync --frozen --all-extras
 
       - name: Run pytest (full suite — Postgres path executes)
         run: uv run pytest -q

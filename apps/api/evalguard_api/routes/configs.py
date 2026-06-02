@@ -346,3 +346,63 @@ def _validate_proxy_essential_shape(content: str) -> None:
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=f"providers[{i}] must carry a non-empty string ``id``.",
             )
+        # Round-4 ultra-review (Agent-2 G): the proxy reads
+        # ``providers[i].config`` and passes it to ``load_provider``;
+        # if a scalar slips through here it'd 500 the invoke call
+        # with an opaque ``AttributeError: 'str' has no attribute
+        # 'get'``.  Catch it at push so the operator sees the typo.
+        pcfg = entry.get("config")
+        if pcfg is not None and not isinstance(pcfg, dict):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    f"providers[{i}].config must be a YAML mapping if set "
+                    f"(got {type(pcfg).__name__})."
+                ),
+            )
+
+    # Round-4 ultra-review (Agent-3 F): the quota fields the proxy
+    # reads at /invoke time MUST be sane numbers, otherwise an
+    # operator's typo silently disables the protection.  Specifically:
+    # - ``rate_limit_per_minute: -1`` would pass ``≤ 0 → disabled``
+    #   in quotas.py.  Reject negative + non-int values at push.
+    # - ``cost_cap_usd_daily: NaN`` would make every ``NaN > 0`` /
+    #   ``today_cost_usd >= NaN`` comparison False, silently bypassing
+    #   the cap.  Reject non-finite values.
+    rl = cfg.get("rate_limit_per_minute")
+    if rl is not None:
+        if isinstance(rl, bool) or not isinstance(rl, int) or rl < 0:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    "``rate_limit_per_minute`` must be a non-negative integer "
+                    "(0 disables the per-key rate limit; any positive value "
+                    "caps requests/minute per API key)."
+                ),
+            )
+    cap = cfg.get("cost_cap_usd_daily")
+    if cap is not None:
+        import math
+        if isinstance(cap, bool) or not isinstance(cap, (int, float)) or not math.isfinite(cap) or cap < 0:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    "``cost_cap_usd_daily`` must be a non-negative finite number "
+                    "(0 disables the daily cost cap)."
+                ),
+            )
+
+    # Operator-typo guard (Agent-3 K): the CLI executor's config
+    # uses ``cost_cap_usd`` (per-run abort), the proxy uses
+    # ``cost_cap_usd_daily`` (per-day budget).  An operator who
+    # writes the wrong field gets no warning and no protection.
+    # Emit a structured log + warning so it surfaces in the access
+    # log without 422'ing (the field is legal for the batch path).
+    if "cost_cap_usd" in cfg and "cost_cap_usd_daily" not in cfg:
+        import logging as _logging
+        _logging.getLogger("evalguard.api.configs").warning(
+            '{"evt":"config.typo_warn","field_set":"cost_cap_usd",'
+            '"field_expected":"cost_cap_usd_daily",'
+            '"hint":"cost_cap_usd is the CLI executor field (per-run abort); '
+            'the proxy reads cost_cap_usd_daily (per-day budget)."}',
+        )

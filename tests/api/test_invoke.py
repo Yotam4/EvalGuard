@@ -559,6 +559,84 @@ def test_invoke_cost_cap_disabled_when_unset(client, auth_headers):
     assert r.status_code == 200, r.text
 
 
+def test_invoke_rate_limit_retry_after_reflects_window(client, auth_headers):
+    """Round-4 ultra-review (Agent-1 J): ``Retry-After`` was a
+    hardcoded ``60`` regardless of the configured cap.  With a tight
+    cap (2/min) the client could legitimately retry well before 60s.
+    The dynamic value should be ≤ 61 and ≥ 1 (the time until the
+    oldest in-window timestamp ages out)."""
+    cfg = (
+        "version: 1\nproject: default\n"
+        "providers: [{ id: 'mock:m', config: { mode: echo, latency_ms: 0 } }]\n"
+        "rate_limit_per_minute: 2\n"
+    )
+    client.post("/v1/projects/default/config",
+                json={"content": cfg}, headers=auth_headers)
+    for _ in range(2):
+        client.post("/v1/projects/default/invoke",
+                    json={"input": "x"}, headers=auth_headers)
+    r = client.post("/v1/projects/default/invoke",
+                    json={"input": "x"}, headers=auth_headers)
+    assert r.status_code == 429
+    retry_after = int(r.headers["Retry-After"])
+    # Just-after-burst: oldest timestamp ~ a few ms old, so
+    # retry-after ≈ 60s.  Bounds keep the assertion robust against
+    # CI clock jitter.
+    assert 1 <= retry_after <= 61, retry_after
+
+
+def test_invoke_cost_cap_concurrent_overshoot_logs_warn(
+    client, auth_headers, monkeypatch, caplog,
+):
+    """Round-4 ultra-review (Agent-1 B / Agent-3 C): two concurrent
+    requests can both pass the Phase-1 advisory check, then both
+    write — overshooting the cap.  The post-write detection in
+    Phase 3 must log a structured ``cost_cap_overshot`` event so
+    operators can reconcile.
+
+    Simulation: pre-populate today's live run with cost = $0.99,
+    cap = $1.00.  One $0.50 call passes Phase 1 (within cap) and
+    overshoots in Phase 3 to $1.49.  Assert WARN log fires."""
+    import logging
+    from sqlalchemy import text as _text
+
+    cfg = (
+        "version: 1\nproject: default\n"
+        "providers: [{ id: 'mock:m', config: { mode: echo, latency_ms: 0, cost_per_call: 0.50 } }]\n"
+        "cost_cap_usd_daily: 1.00\n"
+    )
+    client.post("/v1/projects/default/config",
+                json={"content": cfg}, headers=auth_headers)
+
+    # One call to lazy-create today's run + accumulate $0.50.
+    r1 = client.post("/v1/projects/default/invoke",
+                     json={"input": "x"}, headers=auth_headers)
+    assert r1.status_code == 200
+
+    # Backdoor: bump the run's cost to $0.99 so the NEXT call's
+    # Phase-1 check passes ($0.99 < $1.00) but Phase 3 overshoots
+    # to $1.49.  Simulates the lost-update race without needing
+    # actual concurrency in the sync TestClient.
+    engine = client.app.state.engine
+    with engine.begin() as conn:
+        conn.execute(
+            _text("UPDATE runs SET cost_usd = 0.99 "
+                  "WHERE project_id = (SELECT project_id FROM projects WHERE slug='default') "
+                  "AND source = 'live'"),
+        )
+
+    caplog.set_level(logging.WARNING, logger="evalguard.api.invoke")
+    r2 = client.post("/v1/projects/default/invoke",
+                     json={"input": "y"}, headers=auth_headers)
+    assert r2.status_code == 200, r2.text   # call succeeded; provider was charged
+
+    warn_lines = [rec.getMessage() for rec in caplog.records
+                  if rec.levelname == "WARNING"]
+    assert any("cost_cap_overshot" in line for line in warn_lines), (
+        f"expected cost_cap_overshot WARN log, got: {warn_lines}"
+    )
+
+
 def test_invoke_releases_db_conn_during_provider_call(
     client, auth_headers, monkeypatch,
 ):

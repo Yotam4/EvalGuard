@@ -82,6 +82,37 @@ def test_open_mode_opted_in_with_specific_cors_boots_clean(tmp_path: Path):
     validate_for_startup(s)   # no raise
 
 
+def test_open_mode_with_non_loopback_bind_refuses(tmp_path: Path):
+    """Round-4 ultra-review (Agent-2 I): open mode + a non-loopback
+    bind would expose the proxy invoke endpoint to anyone on the
+    network.  ``validate_for_startup`` must refuse."""
+    s = Settings(
+        database_url=f"sqlite:///{tmp_path}/x.db",
+        api_key="",
+        open_mode_opt_in=True,
+        bind_host="0.0.0.0",
+        cors_origins=("http://localhost:3000",),
+    )
+    with pytest.raises(StartupRefusal) as exc:
+        validate_for_startup(s)
+    assert "EVALGUARD_HOST" in str(exc.value)
+    assert "0.0.0.0" in str(exc.value)
+
+
+def test_open_mode_with_bracketed_ipv6_loopback_allowed(tmp_path: Path):
+    """Bracketed IPv6 loopback ``[::1]`` (round-3 fix) is in the
+    loopback allowlist so an operator using the bracketed form
+    isn't refused."""
+    s = Settings(
+        database_url=f"sqlite:///{tmp_path}/x.db",
+        api_key="",
+        open_mode_opt_in=True,
+        bind_host="[::1]",
+        cors_origins=("http://localhost:3000",),
+    )
+    validate_for_startup(s)   # no raise
+
+
 def test_auth_mode_with_cors_wildcard_allowed_with_warning(tmp_path: Path):
     """Auth on + CORS=* is allowed (some users genuinely need it),
     but emits a startup log warning. The validate function does not

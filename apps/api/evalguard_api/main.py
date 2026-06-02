@@ -215,7 +215,17 @@ class _JsonAwareFormatter(logging.Formatter):
                 parsed = _json.loads(msg)
             except (TypeError, ValueError):
                 parsed = None
-            if isinstance(parsed, dict):
+            # Round-4 ultra-review (Agent-3 E): require an ``"evt"``
+            # key before treating the parsed dict as a first-party
+            # structured log line.  Without this any user-controlled
+            # JSON-shaped string that hits a ``logger.info`` call
+            # (provider exception messages, evaluator raw blobs,
+            # arbitrary input echoed in an error) would be emitted as
+            # if it were our own structured event — log injection.
+            # Internal emitters (access-log middleware, cost-cap
+            # overshoot, phase-3 failure) always set ``evt``; the
+            # convention is documented at the call site.
+            if isinstance(parsed, dict) and "evt" in parsed:
                 # Inject the log level so a shipper can filter by it
                 # without parsing the surrounding plain-text wrapper.
                 # ``ts`` is added only when absent — access-log lines
@@ -230,7 +240,9 @@ class _JsonAwareFormatter(logging.Formatter):
                     ).isoformat(timespec="milliseconds")
                 import json as _json
                 return _json.dumps(parsed, default=str)
-        # Plain-text path — alembic, uvicorn, free-text logger calls.
+        # Plain-text path — alembic, uvicorn, free-text logger calls,
+        # and any JSON-shaped string without an ``evt`` key (which we
+        # treat as user content, not first-party structured output).
         return super().format(record)
 
 

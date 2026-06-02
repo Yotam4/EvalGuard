@@ -199,8 +199,14 @@ async def invoke(
     # the operator's /calls/ view).  The structured access-log line
     # the middleware emits captures the rejection for audit.
     rate_limit_rpm = int(cfg.get("rate_limit_per_minute") or DEFAULT_RATE_LIMIT_PER_MINUTE)
-    if not rate_limit_check(principal.key_id, limit_per_minute=rate_limit_rpm):
-        response.headers["Retry-After"] = "60"
+    allowed, retry_after_s = rate_limit_check(
+        principal.key_id, limit_per_minute=rate_limit_rpm,
+    )
+    if not allowed:
+        # ``Retry-After`` is the time until the OLDEST in-window
+        # timestamp ages out — dynamic so a project with a tight
+        # cap (e.g. 5/min) gets a small Retry-After rather than the
+        # fixed 60s that misled callers under the previous revision.
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail=(
@@ -208,7 +214,7 @@ async def invoke(
                 f"Tune ``rate_limit_per_minute`` in the project config to raise the cap, "
                 f"or back off and retry."
             ),
-            headers={"Retry-After": "60"},
+            headers={"Retry-After": str(retry_after_s)},
         )
 
     # --- Quota gate: per-project daily cost cap ---
@@ -386,21 +392,62 @@ async def invoke(
         tags=body.tags, scores=scores_payload,
         provider=provider_name, model=model, error=error,
     )
-    with engine.begin() as conn:
-        apply_rls_context(
-            conn, org_id=principal.org_id, is_admin=principal.is_admin,
-        )
-        run_id   = ensure_live_run(
-            conn, project_id=project_id, project_name=project_name,
-        )
-        trial_id = ensure_live_trial(
-            conn, run_id=run_id, project_id=project_id,
-            provider_id=provider_id, provider=provider_name, model=model,
-        )
-        record_call(
-            conn, run_id=run_id, trial_id=trial_id,
-            project_id=project_id, rec=rec,
-        )
+    try:
+        with engine.begin() as conn:
+            apply_rls_context(
+                conn, org_id=principal.org_id, is_admin=principal.is_admin,
+            )
+            run_id   = ensure_live_run(
+                conn, project_id=project_id, project_name=project_name,
+            )
+            trial_id = ensure_live_trial(
+                conn, run_id=run_id, project_id=project_id,
+                provider_id=provider_id, provider=provider_name, model=model,
+            )
+            record_call(
+                conn, run_id=run_id, trial_id=trial_id,
+                project_id=project_id, rec=rec,
+            )
+            # Post-write cost-cap detection (round-4 ultra-review,
+            # Agent-1 B / Agent-3 C).  The Phase-1 cap check is
+            # advisory: two concurrent calls can both pass it when
+            # the accumulated cost is just under the cap, then both
+            # write and overshoot.  Re-read the new accumulated cost
+            # WITHIN the same transaction (so we see our own write
+            # and any concurrent committed write); if it overshot,
+            # log a WARN with the overshoot amount.  We don't refund
+            # — the provider was already charged — but the operator
+            # gets a structured audit trail and the row still lands
+            # in /calls/ so the call is visible.
+            if cost_cap_usd > 0 and cost_usd > 0:
+                new_total = conn.execute(
+                    text("SELECT cost_usd FROM runs WHERE run_id = :rid"),
+                    {"rid": run_id},
+                ).scalar()
+                if new_total is not None and new_total > cost_cap_usd:
+                    overshoot = float(new_total) - cost_cap_usd
+                    logger.warning(
+                        '{"evt":"cost_cap_overshot","project_id":%r,'
+                        '"run_id":%r,"row_id":%r,"cap_usd":%.4f,'
+                        '"new_total_usd":%.4f,"overshoot_usd":%.4f}',
+                        project_id, run_id, row_id,
+                        cost_cap_usd, float(new_total), overshoot,
+                    )
+    except Exception:
+        # Phase 3 failed AFTER the provider call (Phase 2).  The
+        # provider was charged, but the row isn't recorded — the
+        # cost is silently lost from EvalGuard's perspective.
+        # Log CRITICAL so operators can reconcile via the provider's
+        # own billing dashboard (round-4 review-pass A from Agent-1).
+        if error is None and cost_usd > 0:
+            logger.critical(
+                '{"evt":"phase3_failed_after_provider_charge","project_id":%r,'
+                '"row_id":%r,"provider":%r,"model":%r,"cost_usd_lost":%.6f,'
+                '"latency_ms":%d}',
+                project_id, row_id, provider_name, model,
+                cost_usd, latency_ms,
+            )
+        raise
 
     # Provider-failed calls surface as the most useful status for
     # the caller's retry logic.  Rate-limit errors get 429 + a
