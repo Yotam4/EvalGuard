@@ -383,12 +383,23 @@ def _validate_proxy_essential_shape(content: str) -> None:
     cap = cfg.get("cost_cap_usd_daily")
     if cap is not None:
         import math
-        if isinstance(cap, bool) or not isinstance(cap, (int, float)) or not math.isfinite(cap) or cap < 0:
+        # Round-5 test-quality review (general G): ``-0.0`` passed
+        # ``cap < 0`` (False) but is also falsy in Python — at
+        # invoke time ``float(cfg.get("cost_cap_usd_daily")) or 0.0``
+        # silently disabled the cap, exactly the bug we're trying
+        # to catch.  ``math.copysign(1, cap) < 0`` distinguishes
+        # ``-0.0`` from ``+0.0``.
+        bad_neg_zero = (
+            isinstance(cap, float) and cap == 0.0 and math.copysign(1.0, cap) < 0
+        )
+        if (isinstance(cap, bool) or not isinstance(cap, (int, float))
+                or not math.isfinite(cap) or cap < 0 or bad_neg_zero):
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=(
                     "``cost_cap_usd_daily`` must be a non-negative finite number "
-                    "(0 disables the daily cost cap)."
+                    "(0 disables the daily cost cap; -0.0 is rejected because it "
+                    "would silently disable the cap at invoke time)."
                 ),
             )
 

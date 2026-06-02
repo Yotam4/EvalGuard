@@ -65,23 +65,27 @@ def test_ready_503_when_migration_drift(client, monkeypatch):
     """Simulate "code says head is X but DB is at Y" by patching the
     script-directory head accessor.  Real-world: rolling deploy where
     the new pod starts before the old one's migration completes — the
-    LB should pull it out of rotation until the schema catches up."""
-    import evalguard_api.routes.health as health_mod
+    LB should pull it out of rotation until the schema catches up.
+
+    Test-quality round (Finding 5): the previous version wrapped the
+    monkeypatch in ``try/finally`` to restore the real head, but
+    ``monkeypatch`` already undoes its own changes at fixture
+    teardown — the manual restore was redundant noise.
+    """
     from alembic.script import ScriptDirectory
 
-    real_get_current_head = ScriptDirectory.get_current_head
-
-    def _fake_head(self):
-        return "9999_phantom_head"
-
-    monkeypatch.setattr(ScriptDirectory, "get_current_head", _fake_head)
-    try:
-        r = client.get("/v1/ready")
-    finally:
-        monkeypatch.setattr(ScriptDirectory, "get_current_head", real_get_current_head)
+    monkeypatch.setattr(
+        ScriptDirectory, "get_current_head",
+        lambda self: "9999_phantom_head",
+    )
+    r = client.get("/v1/ready")
     assert r.status_code == 503
     body = r.json()
     assert body["ok"] is False
+    # Anchor that the DB check passed and only the migration check
+    # failed — otherwise the 503 could be triggered by an unrelated
+    # failure and the assertion above would be misleading.
+    assert body["checks"]["db"]["ok"] is True, body["checks"]
     assert body["checks"]["migration"]["ok"] is False
     assert "alembic version drift" in body["checks"]["migration"]["error"]
 

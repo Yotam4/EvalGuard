@@ -207,30 +207,37 @@ def test_live_timeline_empty_when_no_live_runs(client, auth_headers):
     assert r.json() == {"entries": []}
 
 
-def test_live_timeline_returns_runs_newest_first(client, auth_headers):
-    _push_default_config(client, auth_headers)
-    inv = _invoke(client, auth_headers, input="x")
-    run_id = inv.json()["run_id"]
-    _set_run_started_at(client, run_id, "2026-05-29T00:00:00+00:00")
+def test_live_timeline_returns_runs_newest_first(client, auth_headers, monkeypatch):
+    """Test-quality round (Finding 9): create both timeline rows
+    via the actual ``/invoke`` route, not a raw-SQL backdoor.  The
+    earlier version inserted a synthetic ``runs`` row with hard-
+    coded ``row_count = 100`` etc. and asserted the read endpoint
+    returned those numbers — that verified a pass-through, not the
+    proxy's own counters.
 
-    # Synthesise a second live run from yesterday so we can prove ordering.
-    from sqlalchemy import text
-    engine = client.app.state.engine
-    with engine.begin() as conn:
-        conn.execute(
-            text("""INSERT INTO runs(
-                      run_id, project_id, project_name,
-                      status, row_status, gate_status,
-                      started_at, finished_at,
-                      cost_usd, row_count, row_pass_count, row_fail_count,
-                      payload_json, ingested_at, ingested_by, source)
-                    VALUES (
-                      'run_liveyesterdayxxx', (SELECT project_id FROM projects WHERE slug='default'),
-                      'default', 'running', 'pending', 'pending',
-                      '2026-05-28T00:00:00+00:00', NULL,
-                      1.5, 100, 90, 10,
-                      '{}', '2026-05-28T00:00:00+00:00', 'proxy', 'live')"""),
-        )
+    We control which day each ``/invoke`` lazy-creates by patching
+    ``utc_date_str`` to return a chosen date for each call.  Result:
+    two real ``run_live*`` rows, each with the proxy's own
+    incremented counters.
+    """
+    import evalguard_api.live as live_module
+
+    _push_default_config(client, auth_headers)
+
+    # First invoke: lazy-creates the "yesterday" run.
+    monkeypatch.setattr(live_module, "utc_date_str",
+                        lambda *a, **kw: "2026-05-28")
+    r_yesterday = _invoke(client, auth_headers, input="yesterday")
+    run_yesterday = r_yesterday.json()["run_id"]
+
+    # Second invoke: lazy-creates the "today" run.  Different date
+    # → different deterministic id → different parent row.
+    monkeypatch.setattr(live_module, "utc_date_str",
+                        lambda *a, **kw: "2026-05-29")
+    r_today = _invoke(client, auth_headers, input="today")
+    run_today = r_today.json()["run_id"]
+    assert run_today != run_yesterday, \
+        "both invokes routed to the same run — date patch didn't take"
 
     r = client.get(
         "/v1/projects/default/live/timeline?days=7",
@@ -239,11 +246,19 @@ def test_live_timeline_returns_runs_newest_first(client, auth_headers):
     assert r.status_code == 200
     entries = r.json()["entries"]
     assert len(entries) == 2
-    # Newest first.
-    assert entries[0]["run_id"] == run_id
-    assert entries[1]["run_id"] == "run_liveyesterdayxxx"
-    assert entries[1]["row_count"]      == 100
-    assert entries[1]["row_pass_count"] == 90
+    # Newest first.  ``started_at`` is ``<date>T00:00:00+00:00``
+    # per ``live.ensure_live_run``'s synthesised stamp.
+    assert entries[0]["run_id"]     == run_today
+    assert entries[0]["started_at"] == "2026-05-29T00:00:00+00:00"
+    assert entries[1]["run_id"]     == run_yesterday
+    assert entries[1]["started_at"] == "2026-05-28T00:00:00+00:00"
+    # And critically: each row's row_count came from THE PROXY's
+    # ``record_call`` increment, not a raw INSERT.  One invoke per
+    # day ⇒ row_count=1, row_pass_count=1 each.
+    for entry in entries:
+        assert entry["row_count"]      == 1
+        assert entry["row_pass_count"] == 1
+        assert entry["row_fail_count"] == 0
 
 
 def test_live_timeline_excludes_batch_runs(client, auth_headers):

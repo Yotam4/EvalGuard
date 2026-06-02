@@ -160,7 +160,17 @@ def test_admin_rls_context_source_uses_null():
     fn_start = body.index("def apply_admin_rls_context")
     next_def = body.index("\ndef ", fn_start + 1)
     fn = body[fn_start:next_def]
-    assert "set_config('app.org_id', NULL" in fn
+    # Test-quality round (Finding 7): bind ALL THREE arguments of
+    # set_config — name, value, is_local.  A bug that flipped
+    # is_local from ``true`` to ``false`` would silently make the
+    # GUC session-scoped (RLS bleed across requests on the same
+    # pooled backend); the earlier ``in fn`` substring match would
+    # have let that slip through.
+    assert "set_config('app.org_id', NULL, true)" in fn, (
+        "apply_admin_rls_context must call set_config(..., NULL, true) — "
+        "the true (is_local) third arg scopes the GUC to the current "
+        "transaction.  A false there is a tenant-bleed bug."
+    )
     # Specifically forbid the SQL that writes the literal sentinel
     # back into the GUC. The string ``_system_`` is allowed in the
     # docstring (explaining what the previous, broken implementation

@@ -13,6 +13,8 @@ stays air-gap-clean.
 
 from __future__ import annotations
 
+import pytest
+
 
 def _config_yaml(
     *,
@@ -451,7 +453,15 @@ def test_invoke_rate_limit_returns_429_with_retry_after(client, auth_headers):
         headers=auth_headers,
     )
     assert r.status_code == 429
-    assert r.headers.get("Retry-After") == "60"
+    # Round-5 ultra-review (general H / test-quality F10): Retry-After
+    # is now DYNAMIC — computed from the oldest in-window timestamp.
+    # On a fast machine the math can land on 60 or 61 (rounding +
+    # microseconds elapsed); the parallel ``retry_after_reflects_window``
+    # test uses the same bounded-range assertion.  Exact ``== "60"``
+    # was flaky and only passed because SQLite overhead added 20–50ms
+    # of slack between calls.
+    retry_after = int(r.headers["Retry-After"])
+    assert 1 <= retry_after <= 61, retry_after
     body = r.json()
     assert "rate limit exceeded" in body["detail"].lower()
 
@@ -630,10 +640,108 @@ def test_invoke_cost_cap_concurrent_overshoot_logs_warn(
                      json={"input": "y"}, headers=auth_headers)
     assert r2.status_code == 200, r2.text   # call succeeded; provider was charged
 
+    # Test-quality round (Finding 2): the log assertion alone could
+    # pass even if the cost-cap branch were a typo'd no-op (no row
+    # written, but the log still fires).  Anchor against the
+    # OBSERVABLE BEHAVIOUR the warning is supposed to describe.
     warn_lines = [rec.getMessage() for rec in caplog.records
                   if rec.levelname == "WARNING"]
     assert any("cost_cap_overshot" in line for line in warn_lines), (
         f"expected cost_cap_overshot WARN log, got: {warn_lines}"
+    )
+
+    # 1. The DB cost MUST have advanced past the cap — the whole point
+    #    of the WARN is to call out the overshoot the proxy already
+    #    persisted.
+    with engine.connect() as conn:
+        final_cost = conn.execute(
+            _text("SELECT cost_usd FROM runs "
+                  "WHERE source = 'live' "
+                  "AND project_id = (SELECT project_id FROM projects WHERE slug='default')"),
+        ).scalar_one()
+    assert final_cost > 1.00, (
+        f"cost_usd={final_cost} — overshoot did not actually persist; "
+        "log fired but row state is wrong"
+    )
+    assert final_cost == pytest.approx(1.49, abs=1e-9), (
+        f"expected $0.99 (backdoor) + $0.50 (provider) = $1.49, got {final_cost}"
+    )
+
+    # 2. The row MUST appear in /calls/ so the operator can drill in.
+    #    "Logged but not visible" would be the worst failure mode.
+    calls = client.get(
+        "/v1/projects/default/calls?tab=recent&limit=10",
+        headers=auth_headers,
+    ).json()["calls"]
+    assert any(c["row_id"] == r2.json()["row_id"] for c in calls), (
+        "overshoot row didn't land in /calls/ — operator can't see it"
+    )
+
+
+def test_invoke_phase3_failure_after_provider_logs_critical(
+    client, auth_headers, monkeypatch, caplog,
+):
+    """Round-5 ultra-review (general I + test-quality coverage): the
+    CRITICAL log path fires when the provider call succeeded (cost
+    was charged) but Phase 3 couldn't record the row.  Without
+    this log line the operator has no reconciliation breadcrumb.
+
+    Reproduces: monkeypatch ``ensure_live_run`` to raise after the
+    provider call has returned, then assert the CRITICAL structured
+    log fires AND the request surfaces as a 500 (the row isn't
+    written, so the caller sees the error rather than a silent
+    success)."""
+    import logging
+    import evalguard_api.routes.invoke as invoke_module
+
+    def _phase3_explodes(*args, **kwargs):
+        raise RuntimeError("simulated phase-3 DB unreachable")
+
+    # The function is imported by name into the module; patching the
+    # module-level binding catches the route's reference.
+    monkeypatch.setattr(invoke_module, "ensure_live_run", _phase3_explodes)
+
+    # The CRITICAL log gates on ``cost_usd > 0`` (no charge → nothing
+    # to reconcile).  Push a paid config so the provider call
+    # returns a non-zero cost and the gate falls through.
+    paid_cfg = (
+        "version: 1\nproject: default\n"
+        "providers: [{ id: 'mock:m', config: { mode: echo, latency_ms: 0, cost_per_call: 0.42 } }]\n"
+    )
+    client.post(
+        "/v1/projects/default/config",
+        json={"content": paid_cfg},
+        headers=auth_headers,
+    )
+    caplog.set_level(logging.CRITICAL, logger="evalguard.api.invoke")
+
+    # Starlette's TestClient defaults to raising server-side
+    # exceptions back through the test (``raise_server_exceptions=True``).
+    # That's the right behaviour to verify here — the route handler
+    # explicitly re-raises after logging, so the exception leaving
+    # the handler IS the contract.  A future change that silently
+    # swallowed the exception would not raise here, and the
+    # CRITICAL log assertion would still fire — but the bug would
+    # be visible because the test would no longer raise.
+    with pytest.raises(RuntimeError, match="simulated phase-3 DB unreachable"):
+        client.post(
+            "/v1/projects/default/invoke",
+            json={"input": "x"},
+            headers=auth_headers,
+        )
+
+    critical_lines = [rec.getMessage() for rec in caplog.records
+                      if rec.levelname == "CRITICAL"]
+    assert any("phase3_failed_after_provider_charge" in line
+               for line in critical_lines), (
+        f"expected phase3 CRITICAL log naming the lost cost, got: {critical_lines}"
+    )
+    # Anchor: the log entry must contain the cost_usd_lost field
+    # (the whole point of the breadcrumb is reconciliation against
+    # the provider billing dashboard).  Without this check, a log
+    # like ``phase3_failed_after_provider_charge: ok`` would pass.
+    assert any("cost_usd_lost" in line for line in critical_lines), (
+        f"CRITICAL log must include cost_usd_lost field, got: {critical_lines}"
     )
 
 
@@ -782,7 +890,7 @@ def _push_default_config_simple(client, headers):
 # live.py id determinism
 
 
-def test_live_run_id_deterministic_for_same_day(client, auth_headers):
+def test_live_run_id_deterministic_for_same_day():
     """Same project + same UTC day → same run_id, every time.
     Different day → different run_id."""
     from evalguard_api.live import live_run_id
@@ -796,7 +904,7 @@ def test_live_run_id_deterministic_for_same_day(client, auth_headers):
     assert len(a) == 24
 
 
-def test_live_trial_id_deterministic_for_same_provider(client, auth_headers):
+def test_live_trial_id_deterministic_for_same_provider():
     from evalguard_api.live import live_trial_id
     a = live_trial_id("run_live1234", "openai:gpt-4o-mini", "gpt-4o-mini")
     b = live_trial_id("run_live1234", "openai:gpt-4o-mini", "gpt-4o-mini")
@@ -807,11 +915,46 @@ def test_live_trial_id_deterministic_for_same_provider(client, auth_headers):
     assert len(a) == 26
 
 
-def test_live_run_id_does_not_collide_across_projects(client, auth_headers):
+def test_live_run_id_does_not_collide_across_projects():
     from evalguard_api.live import live_run_id
     a = live_run_id("proj_a", "2026-05-29")
     b = live_run_id("proj_b", "2026-05-29")
     assert a != b
+
+
+def test_invoke_actually_uses_live_run_id_for_run_creation(client, auth_headers):
+    """Test-quality round (Finding 3): the three pure unit tests above
+    are necessary but insufficient — they don't prove the production
+    path ACTUALLY routes through ``live_run_id``.  A refactor that
+    silently swapped the id derivation for another function would
+    leave the unit tests green but break the day's-run-reuse semantic.
+
+    This test bridges the gap: it asks the route layer for the
+    run_id and asserts it matches what ``live_run_id`` produces for
+    today's project."""
+    from evalguard_api.live import live_run_id, utc_date_str
+    from sqlalchemy import text as _text
+
+    _push_default_config_simple(client, auth_headers)
+    r = client.post(
+        "/v1/projects/default/invoke",
+        json={"input": "x"},
+        headers=auth_headers,
+    )
+    assert r.status_code == 200
+    returned_run_id = r.json()["run_id"]
+
+    engine = client.app.state.engine
+    with engine.begin() as conn:
+        project_id = conn.execute(
+            _text("SELECT project_id FROM projects WHERE slug = 'default'"),
+        ).scalar_one()
+    expected = live_run_id(project_id, utc_date_str())
+    assert returned_run_id == expected, (
+        f"invoke returned {returned_run_id!r}, but live_run_id() "
+        f"for (project_id={project_id!r}, today) = {expected!r}. "
+        "If these diverge the day's-run-reuse invariant breaks."
+    )
 
 
 # ---------------------------------------------------------------------------

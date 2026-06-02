@@ -247,16 +247,47 @@ def test_post_rejects_negative_cost_cap(client, auth_headers):
     assert r.status_code == 422
 
 
+def test_post_rejects_negative_zero_cost_cap(client, auth_headers):
+    """Round-5 ultra-review (general G): ``-0.0`` passed the
+    ``< 0`` guard but evaluated as falsy at invoke time, silently
+    disabling the cap.  Must be 422 at push."""
+    bad = (
+        "version: 1\nproject: default\n"
+        "providers: [{ id: 'mock:m' }]\n"
+        "cost_cap_usd_daily: -0.0\n"
+    )
+    r = client.post(
+        "/v1/projects/default/config",
+        json={"content": bad},
+        headers=auth_headers,
+    )
+    assert r.status_code == 422, r.text
+    assert "cost_cap_usd_daily" in r.text
+
+
 def test_post_warns_on_cost_cap_usd_typo(client, auth_headers, caplog):
     """Round-4 ultra-review (Agent-3 K): operator wrote
     ``cost_cap_usd`` (CLI executor field) instead of
     ``cost_cap_usd_daily`` (proxy field).  Push succeeds (the field
     is legal for batch) but emits a structured WARNING so the
-    confusion surfaces in the access log."""
+    confusion surfaces in the access log.
+
+    Test-quality round (Finding 4): the warn-log is only a hint.
+    The DAMAGE the typo causes — the cost cap being silently
+    disabled — is the actual behaviour we have to lock down.  We
+    push a config with the WRONG field name + a cost_per_call that
+    would blow past the intended cap if the cap were active, then
+    confirm an invoke call succeeds.  If the typo guard were
+    deleted and the field actually applied, the call would 402.
+    """
     import logging
+    # The intended cap is $1.00, cost_per_call is $5.00 — if the
+    # typo'd field name were accidentally applied, the second call
+    # would 402.  With the field silently ignored (current correct
+    # behaviour we're documenting), both calls succeed.
     yaml_blob = (
         "version: 1\nproject: default\n"
-        "providers: [{ id: 'mock:m' }]\n"
+        "providers: [{ id: 'mock:m', config: { mode: echo, latency_ms: 0, cost_per_call: 5.00 } }]\n"
         "cost_cap_usd: 1.00\n"
     )
     caplog.set_level(logging.WARNING, logger="evalguard.api.configs")
@@ -269,6 +300,24 @@ def test_post_warns_on_cost_cap_usd_typo(client, auth_headers, caplog):
     warns = [rec.getMessage() for rec in caplog.records
              if rec.levelname == "WARNING"]
     assert any("config.typo_warn" in line for line in warns), warns
+
+    # Downstream silent-failure assertion: confirm the wrongly-
+    # named field really is inert.  Two invoke calls each cost $5;
+    # if cost_cap_usd had been the proxy's field, the second would
+    # 402.  Both must 200.
+    for _ in range(2):
+        rr = client.post(
+            "/v1/projects/default/invoke",
+            json={"input": "x"},
+            headers=auth_headers,
+        )
+        assert rr.status_code == 200, (
+            f"invoke returned {rr.status_code} — the typo'd field "
+            f"``cost_cap_usd`` should be IGNORED by the proxy "
+            f"(only ``cost_cap_usd_daily`` is read).  If you see "
+            f"402 here, the typo-guard collapsed into accidental "
+            f"enforcement: {rr.text}"
+        )
 
 
 def test_post_accepts_proxy_config_without_datasets(client, auth_headers):

@@ -183,3 +183,49 @@ def test_todays_live_run_cost_returns_zero_when_no_run_exists(client):
 def test_default_rate_limit_constant_is_sane():
     """Lock the default so a change is loud."""
     assert DEFAULT_RATE_LIMIT_PER_MINUTE == 60
+
+
+def test_default_rate_limit_actually_flows_into_invoke(client, auth_headers, monkeypatch):
+    """Test-quality round (Finding 6): the pinned-constant test above
+    is necessary but proves nothing about runtime behaviour.  A
+    refactor that swallowed the default (e.g. ``int(cfg.get(...) or
+    9999)``) would leave the constant test green but disable the
+    intended protection.
+
+    This test pushes a config WITHOUT ``rate_limit_per_minute``,
+    monkeypatches ``DEFAULT_RATE_LIMIT_PER_MINUTE`` to 2 (so we
+    don't have to make 60 HTTP calls), and confirms the 3rd invoke
+    is rate-limited.  If the route ever stops consulting the
+    default, this asserts the failure mode.
+    """
+    import evalguard_api.routes.invoke as invoke_module
+
+    # Override the default at the route's import site (the route
+    # binds the name once at import time via ``from ... import
+    # DEFAULT_RATE_LIMIT_PER_MINUTE``).
+    monkeypatch.setattr(invoke_module, "DEFAULT_RATE_LIMIT_PER_MINUTE", 2)
+
+    # Config OMITS rate_limit_per_minute — the route MUST fall back
+    # to the default.
+    yaml_blob = (
+        "version: 1\n"
+        "project: default\n"
+        "providers: [{ id: 'mock:m', config: { mode: echo, latency_ms: 0 } }]\n"
+    )
+    client.post(
+        "/v1/projects/default/config",
+        json={"content": yaml_blob},
+        headers=auth_headers,
+    )
+    # Two pass.
+    for _ in range(2):
+        r = client.post("/v1/projects/default/invoke",
+                        json={"input": "x"}, headers=auth_headers)
+        assert r.status_code == 200, r.text
+    # Third trips the (default-via-monkeypatch) cap.
+    r = client.post("/v1/projects/default/invoke",
+                    json={"input": "x"}, headers=auth_headers)
+    assert r.status_code == 429, (
+        f"default rate limit didn't flow into the route — third call "
+        f"should have hit the limit-of-2 cap, got {r.status_code}: {r.text}"
+    )
