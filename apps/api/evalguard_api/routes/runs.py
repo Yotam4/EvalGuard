@@ -192,7 +192,18 @@ def list_runs(
         clauses.append("project_id IN (SELECT project_id FROM projects WHERE org_id = :org_id)")
         params["org_id"] = principal.org_id
     if project is not None:
-        clauses.append("project_name = :project")
+        # Round-9 review-pass: callers wire this filter from two
+        # different sources — ``/projects → view runs`` uses the
+        # project slug; ``/assets → view runs`` uses the display
+        # name; an operator typing into the filter box might use
+        # either.  Accept BOTH so the inter-page links and the
+        # manual filter box converge on the same query semantics
+        # instead of silently returning zero rows when the caller
+        # picked the "wrong" identifier.
+        clauses.append(
+            "(project_name = :project OR project_id IN "
+            "(SELECT project_id FROM projects WHERE slug = :project))"
+        )
         params["project"] = project
     if source is not None:
         clauses.append("source = :source")

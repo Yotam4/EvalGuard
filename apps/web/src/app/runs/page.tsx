@@ -9,7 +9,7 @@ import { Card } from "@/components/Card";
 import { Badge, statusTone } from "@/components/Badge";
 import { ConnectionGate } from "@/components/ConnectionGate";
 import { Tabs, type TabSpec } from "@/components/Tabs";
-import { listRuns, type RunSource, type RunSummary } from "@/lib/api";
+import { fmtError, listRuns, type RunSource, type RunSummary } from "@/lib/api";
 
 
 // 3-state filter for ``?source=``.  ``null`` means "no filter";
@@ -100,7 +100,7 @@ function RunsList() {
           {q.isPending && <p className="text-sm text-[var(--color-fg-muted)]">Loading…</p>}
           {q.error && (
             <p className="text-sm text-[var(--color-fail)]">
-              {q.error instanceof Error ? q.error.message : String(q.error)}
+              {fmtError(q.error)}
             </p>
           )}
           {q.data && <RunsTable runs={q.data.runs} />}

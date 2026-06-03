@@ -20,11 +20,16 @@ export function Nav() {
   const pathname = usePathname();
   return (
     <nav className="border-b border-[var(--color-border)] bg-[var(--color-bg-card)]">
-      <div className="mx-auto flex max-w-6xl items-center gap-6 px-6 py-3">
+      {/* Round-9 review-pass: ten items on a single non-wrapping flex
+          row clipped past 720 px and pushed the rightmost links off
+          screen on a 375 px phone.  ``flex-wrap`` on the outer row
+          and the inner link list lets the strip break to a second
+          line at narrow widths so every page stays reachable. */}
+      <div className="mx-auto flex max-w-6xl flex-wrap items-center gap-x-6 gap-y-2 px-6 py-3">
         <Link href="/runs" className="font-semibold tracking-tight text-[var(--color-accent)]">
           EvalGuard
         </Link>
-        <div className="flex gap-1 text-sm">
+        <div className="flex flex-wrap gap-1 text-sm">
           {items.map((it) => {
             const active = pathname?.startsWith(it.href);
             return (

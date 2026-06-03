@@ -5,7 +5,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { Card } from "@/components/Card";
 import { ConnectionGate } from "@/components/ConnectionGate";
-import { ApiError, createOrg, listOrgs, type Org } from "@/lib/api";
+import { createOrg, fmtError, listOrgs, type Org } from "@/lib/api";
 
 /**
  * /orgs — list every visible org and (admin-only) create new ones.
@@ -41,7 +41,7 @@ function Inner() {
       qc.invalidateQueries({ queryKey: ["orgs"] });
     },
     onError: (e: Error) =>
-      setErrMsg(e instanceof ApiError ? e.detail : e.message),
+      setErrMsg(fmtError(e)),
   });
 
   return (
@@ -53,7 +53,7 @@ function Inner() {
           {list.isPending && <p className="text-sm text-[var(--color-fg-muted)]">Loading…</p>}
           {list.error && (
             <p className="text-sm text-[var(--color-fail)]">
-              {list.error instanceof Error ? list.error.message : String(list.error)}
+              {fmtError(list.error)}
             </p>
           )}
           {list.data && <OrgsTable orgs={list.data.orgs} />}

@@ -11,7 +11,7 @@
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 
-import { promoteToGolden, unPromoteGolden } from "@/lib/api";
+import { fmtError, promoteToGolden, unPromoteGolden } from "@/lib/api";
 
 
 /**
@@ -94,6 +94,21 @@ export function PromoteButton({
           >
             {undo.isPending ? "undoing…" : "undo"}
           </button>
+          {/* Round-9 review-pass: surface undo failures inline.  A
+              403 (key lost the scope) or 404 (someone else already
+              un-promoted via /golden) previously sat silent — the
+              button just flipped back to "undo" with no signal that
+              nothing happened.  Now the operator sees the reason
+              and can re-try from the same surface. */}
+          {undo.error && (
+            <span
+              data-testid="promote-undo-error"
+              className="text-[var(--color-fail)]"
+              title={fmtError(undo.error)}
+            >
+              undo failed
+            </span>
+          )}
         </span>
       );
     }
@@ -148,7 +163,7 @@ export function PromoteButton({
           data-testid="promote-error"
           className="text-xs text-[var(--color-fail)]"
         >
-          {m.error instanceof Error ? m.error.message : String(m.error)}
+          {fmtError(m.error)}
         </span>
       )}
     </form>

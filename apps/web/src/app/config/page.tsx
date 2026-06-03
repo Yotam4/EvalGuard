@@ -9,7 +9,7 @@ import { Badge } from "@/components/Badge";
 import { Card } from "@/components/Card";
 import { ConnectionGate } from "@/components/ConnectionGate";
 import {
-  ApiError,
+  ApiError, fmtError,
   getLatestProjectConfig, getProjectConfigHistory, getProjectConfigRevision,
   pushProjectConfig,
   type ProjectConfig, type ProjectConfigSummary,
@@ -204,9 +204,7 @@ function EditorPanel({
       // YAML parse output like "Line 14, column 3: …").  Falling
       // back to ``message`` produced ``"422: detail"`` collapsed
       // onto one line — unreadable for structured YAML errors.
-      if (e instanceof ApiError) setPushError(e.detail);
-      else if (e instanceof Error) setPushError(e.message);
-      else setPushError(String(e));
+      setPushError(fmtError(e));
     },
   });
 
@@ -253,7 +251,7 @@ function EditorPanel({
     return (
       <Card>
         <p className="text-sm text-[var(--color-fail)]">
-          {q.error instanceof Error ? q.error.message : String(q.error)}
+          {fmtError(q.error)}
         </p>
       </Card>
     );

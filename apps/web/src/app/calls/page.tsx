@@ -12,7 +12,7 @@ import { CallDetailPanel } from "@/components/CallDetailPanel";
 import { ConnectionGate } from "@/components/ConnectionGate";
 import { LiveTimeline } from "@/components/LiveTimeline";
 import {
-  getCallDetail, listProjectCalls,
+  fmtError, getCallDetail, listProjectCalls,
   type CallSummary, type CallsTab, type RunSource,
 } from "@/lib/api";
 
@@ -349,7 +349,7 @@ function CallsList({
     return (
       <Card>
         <p className="text-sm text-[var(--color-fail)]">
-          {q.error instanceof Error ? q.error.message : String(q.error)}
+          {fmtError(q.error)}
         </p>
       </Card>
     );
@@ -501,7 +501,7 @@ function DetailFetcher({
       <Card>
         <div className="flex items-baseline justify-between gap-2">
           <p className="text-sm text-[var(--color-fail)]">
-            {q.error instanceof Error ? q.error.message : String(q.error)}
+            {fmtError(q.error)}
           </p>
           <button
             type="button"

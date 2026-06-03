@@ -8,7 +8,7 @@ import { Badge } from "@/components/Badge";
 import {
   clearAuth, getServerUrl, getToken, setServerUrl, setToken,
 } from "@/lib/auth";
-import { health, type Health } from "@/lib/api";
+import { fmtError, health, type Health } from "@/lib/api";
 
 /**
  * Settings page — server URL + token + connectivity probe.
@@ -98,9 +98,7 @@ export default function SettingsPage() {
           {probe.data && <HealthSummary data={probe.data} />}
           {probe.error && (
             <p className="text-sm text-[var(--color-fail)]">
-              {probe.error instanceof Error
-                ? probe.error.message
-                : String(probe.error)}
+              {fmtError(probe.error)}
             </p>
           )}
         </Card>
@@ -186,6 +184,17 @@ function Field({
         value={value}
         placeholder={placeholder}
         onChange={(e) => onChange(e.target.value)}
+        // Round-9 review-pass: opt out of the browser's credential
+        // save / autofill on these fields.  The API token is not a
+        // login password — letting the browser save it would
+        // (a) prompt every visitor to save a stolen-credential-
+        // looking thing, and (b) auto-fill it across origins under
+        // some setups.  ``autoComplete="off"`` + ``spellCheck=false``
+        // is the minimal combo Chrome / Firefox / Safari honour.
+        autoComplete="off"
+        autoCorrect="off"
+        autoCapitalize="off"
+        spellCheck={false}
         className="mt-1 w-full rounded border border-[var(--color-border)] bg-[var(--color-bg)] px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
       />
     </label>

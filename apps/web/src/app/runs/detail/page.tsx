@@ -10,7 +10,7 @@ import { Badge, statusTone } from "@/components/Badge";
 import { ConnectionGate } from "@/components/ConnectionGate";
 import { DriftBody } from "@/components/DriftBody";
 import {
-  getRun, getRunDrift,
+  fmtError, getRun, getRunDrift,
   type Gate, type RunOut, type Trial,
 } from "@/lib/api";
 
@@ -70,7 +70,7 @@ function RunDetail({ runId }: { runId: string }) {
   if (q.error)
     return (
       <p className="text-sm text-[var(--color-fail)]">
-        {q.error instanceof Error ? q.error.message : String(q.error)}
+        {fmtError(q.error)}
       </p>
     );
   if (!q.data) return null;
@@ -129,11 +129,18 @@ function DriftSection({
   function submit(e: React.FormEvent) {
     e.preventDefault();
     const id = draft.trim();
-    if (!id) return;
+    // Round-9 review-pass: short-circuit when the baseline equals
+    // the current run.  ``getRunDrift(runId, runId)`` returns an
+    // all-zero diff that confuses the operator into thinking
+    // "nothing drifted" when really they just compared a run to
+    // itself by typing the wrong id.  ``selfBaseline`` drives the
+    // inline hint below.
+    if (!id || id === runId) return;
     // ``replace`` (not push) so the user's history isn't littered
     // with intermediate baselines as they iterate.
     router.replace(`/runs/detail/?id=${encodeURIComponent(runId)}&baseline=${encodeURIComponent(id)}`);
   }
+  const selfBaseline = draft.trim() === runId && draft.trim() !== "";
 
   return (
     <Card title="Drift">
@@ -163,6 +170,14 @@ function DriftSection({
             clear
           </Link>
         )}
+        {selfBaseline && (
+          <span
+            data-testid="drift-self-baseline-hint"
+            className="text-xs text-[var(--color-warn)]"
+          >
+            baseline matches the current run — pick a different run
+          </span>
+        )}
       </form>
       {baselineId && <DriftReportView runId={runId} baselineId={baselineId} />}
     </Card>
@@ -188,7 +203,7 @@ function DriftReportView({
   if (q.error)
     return (
       <p className="mt-3 text-sm text-[var(--color-fail)]">
-        {q.error instanceof Error ? q.error.message : String(q.error)}
+        {fmtError(q.error)}
       </p>
     );
   if (!q.data) return null;

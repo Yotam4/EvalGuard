@@ -6,7 +6,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { Card } from "@/components/Card";
 import { ConnectionGate } from "@/components/ConnectionGate";
-import { ApiError, createProject, listProjects, type Project } from "@/lib/api";
+import { createProject, fmtError, listProjects, type Project } from "@/lib/api";
 
 /**
  * /projects — list projects in the caller's org and create new
@@ -46,7 +46,7 @@ function Inner() {
       qc.invalidateQueries({ queryKey: ["projects"] });
     },
     onError: (e: Error) =>
-      setErrMsg(e instanceof ApiError ? e.detail : e.message),
+      setErrMsg(fmtError(e)),
   });
 
   return (
@@ -68,7 +68,7 @@ function Inner() {
           {list.isPending && <p className="text-sm text-[var(--color-fg-muted)]">Loading…</p>}
           {list.error && (
             <p className="text-sm text-[var(--color-fail)]">
-              {list.error instanceof Error ? list.error.message : String(list.error)}
+              {fmtError(list.error)}
             </p>
           )}
           {list.data && <ProjectsTable projects={list.data.projects} />}

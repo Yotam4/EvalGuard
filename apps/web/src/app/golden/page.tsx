@@ -10,7 +10,7 @@ import { ConfirmButton } from "@/components/ConfirmButton";
 import { ConnectionGate } from "@/components/ConnectionGate";
 import { GoldenRowPreview } from "@/components/GoldenRowPreview";
 import {
-  listGoldenCandidates, listProjects, unPromoteGolden,
+  fmtError, listGoldenCandidates, listProjects, unPromoteGolden,
   type GoldenCandidate,
 } from "@/lib/api";
 import {
@@ -180,7 +180,7 @@ function Body({ projectSlug }: { projectSlug: string }) {
   if (q.error)
     return (
       <p className="text-sm text-[var(--color-fail)]">
-        {q.error instanceof Error ? q.error.message : String(q.error)}
+        {fmtError(q.error)}
       </p>
     );
 

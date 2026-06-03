@@ -10,7 +10,7 @@ import { Badge } from "@/components/Badge";
 import { ConnectionGate } from "@/components/ConnectionGate";
 import { ReviewItem } from "@/components/ReviewItem";
 import {
-  getReviewQueue, listRunReviews, submitReview,
+  fmtError, getReviewQueue, listRunReviews, submitReview,
   type Review, type ReviewVerdict,
 } from "@/lib/api";
 
@@ -138,7 +138,7 @@ function ReviewBody({ runId }: { runId: string }) {
   if (err)
     return (
       <p className="text-sm text-[var(--color-fail)]">
-        {err instanceof Error ? err.message : String(err)}
+        {fmtError(err)}
       </p>
     );
 
@@ -180,10 +180,7 @@ function ReviewBody({ runId }: { runId: string }) {
         )}
         {submitter.error && (
           <p className="mt-3 text-xs text-[var(--color-fail)]">
-            Submit failed:{" "}
-            {submitter.error instanceof Error
-              ? submitter.error.message
-              : String(submitter.error)}
+            Submit failed: {fmtError(submitter.error)}
           </p>
         )}
       </Card>

@@ -31,6 +31,27 @@ export class NotConfiguredError extends Error {
   }
 }
 
+
+/**
+ * Surface the server's clean ``detail`` string when the error is an
+ * ``ApiError``, falling back to the plain message for everything else.
+ *
+ * Round-9 review-pass: every ``useQuery``/``useMutation`` error-
+ * rendering site was inlining the same ternary
+ * (``e instanceof Error ? e.message : String(e)``).  For an
+ * ``ApiError`` that produced the ugly ``"422: name already in use"``
+ * concatenated form instead of just ``"name already in use"`` — the
+ * same gap the config editor's mutation onError already fixed.
+ * Centralising the formatter ensures every error-display site stays
+ * consistent and a future tweak (e.g. localised prefixes) flows to
+ * every page from one edit.
+ */
+export function fmtError(e: unknown): string {
+  if (e instanceof ApiError) return e.detail;
+  if (e instanceof Error)    return e.message;
+  return String(e);
+}
+
 // Explicit allowlist of paths the UI should call WITHOUT a bearer
 // token. Using ``endsWith("/health")`` (the previous shape) would
 // also unauthenticate any future endpoint coincidentally ending in

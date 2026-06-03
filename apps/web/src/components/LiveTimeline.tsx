@@ -193,9 +193,15 @@ function TimelineBar({
                 ? "var(--color-warn)"
                 : "var(--color-fail)",
         }}
+        // Round-9 review-pass: the bar's pass/warn/fail tone was
+        // communicated by colour ONLY (green vs yellow vs red).
+        // Colourblind operators and screen-reader users saw no
+        // difference between a healthy day and one with 60% failures.
+        // Bake the pass-rate into the accessible name so both
+        // channels carry the same signal.
         aria-label={isEmpty
           ? `${shortDate(from)} no traffic`
-          : `${entry.row_count} calls`}
+          : `${entry.row_count} calls · ${(passRate * 100).toFixed(0)}% pass`}
       />
       <span className="text-[10px] text-[var(--color-fg-muted)]">
         {shortDate(from)}

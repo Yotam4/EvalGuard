@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { Card } from "@/components/Card";
@@ -8,7 +8,7 @@ import { Badge } from "@/components/Badge";
 import { ConfirmButton } from "@/components/ConfirmButton";
 import { ConnectionGate } from "@/components/ConnectionGate";
 import {
-  ApiError,
+  fmtError,
   createApiKey, listApiKeys, listOrgs, revokeApiKey,
   type ApiKeyCreated, type ApiKeySummary,
 } from "@/lib/api";
@@ -37,8 +37,22 @@ function Inner() {
   const orgs = useQuery({ queryKey: ["orgs"], queryFn: () => listOrgs() });
 
   const [orgId, setOrgId] = useState<string | null>(null);
-  // Default to the first visible org once the list loads.
-  const effectiveOrg = orgId ?? orgs.data?.orgs[0]?.org_id ?? null;
+  // Round-9 review-pass: seed ``orgId`` from the first visible org
+  // exactly ONCE on data load instead of using a ternary fallback on
+  // every render.  The fallback approach left ``orgId`` null while
+  // ``effectiveOrg`` silently pointed at the first org — the
+  // ``<select value={effectiveOrg ?? ""}>`` then showed blank to the
+  // user (its empty value wasn't in the option list, so the browser
+  // rendered nothing selected) while the Create form quietly
+  // targeted the first org.  Selection invisible == data destruction
+  // waiting to happen.  With the effect, the select value always
+  // matches the operator's actual choice.
+  useEffect(() => {
+    if (orgId !== null) return;
+    const firstOrg = orgs.data?.orgs[0]?.org_id;
+    if (firstOrg) setOrgId(firstOrg);
+  }, [orgs.data, orgId]);
+  const effectiveOrg = orgId;
 
   const keys = useQuery({
     queryKey: ["keys", effectiveOrg],
@@ -71,7 +85,7 @@ function Inner() {
     // ``e.message`` produces.  The config editor already does this
     // — keys/projects/orgs were the stragglers.
     onError: (e: Error) =>
-      setErrMsg(e instanceof ApiError ? e.detail : e.message),
+      setErrMsg(fmtError(e)),
   });
 
   const revoke = useMutation({
@@ -88,9 +102,21 @@ function Inner() {
         action={
           <select
             value={effectiveOrg ?? ""}
-            onChange={(e) => setOrgId(e.target.value)}
+            onChange={(e) => setOrgId(e.target.value || null)}
             className="rounded border border-[var(--color-border)] bg-[var(--color-bg)] px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
           >
+            {/* Round-9 review-pass: explicit placeholder so the
+                select can't quietly render a blank ``value`` while
+                the browser auto-resolves to the first <option>.
+                Without this, an admin landing during the orgs-list
+                fetch saw a blank dropdown but ``effectiveOrg``
+                already pointed at the first org — the Create form
+                then targeted an org the user couldn't see selected.
+                The disabled flag keeps the placeholder un-pickable
+                so it can't re-enter the form. */}
+            <option value="" disabled>
+              {orgs.isPending ? "Loading orgs…" : "Select an org…"}
+            </option>
             {orgs.data?.orgs.map((o) => (
               <option key={o.org_id} value={o.org_id}>{o.slug}</option>
             ))}
@@ -162,7 +188,7 @@ function Inner() {
           )}
           {keys.error && (
             <p className="text-sm text-[var(--color-fail)]">
-              {keys.error instanceof Error ? keys.error.message : String(keys.error)}
+              {fmtError(keys.error)}
             </p>
           )}
           {keys.data && (

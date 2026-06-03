@@ -9,7 +9,7 @@ import { Card } from "@/components/Card";
 import { Badge } from "@/components/Badge";
 import { ConnectionGate } from "@/components/ConnectionGate";
 import { AssetVersionsTable } from "@/components/AssetVersionsTable";
-import { listAssetVersions, type AssetKind } from "@/lib/api";
+import { fmtError, listAssetVersions, type AssetKind } from "@/lib/api";
 
 
 /**
@@ -75,7 +75,7 @@ function Detail({
   if (q.error)
     return (
       <p className="text-sm text-[var(--color-fail)]">
-        {q.error instanceof Error ? q.error.message : String(q.error)}
+        {fmtError(q.error)}
       </p>
     );
   if (!q.data) return null;
@@ -106,8 +106,12 @@ function Detail({
               {r.project_name}
             </Link>
           </span>
-          <Badge tone="info">{distinctVersions} version{distinctVersions === 1 ? "" : "s"}</Badge>
-          <Badge tone="info">{r.versions.length} ingest{r.versions.length === 1 ? "" : "s"}</Badge>
+          {/* Round-9 review-pass: count chips are metadata, not state.
+              ``info`` is reserved for actionable state markers
+              (``live``, ``latest``, admin scope) per the round-8
+              convention.  Switch to ``muted``. */}
+          <Badge tone="muted">{distinctVersions} version{distinctVersions === 1 ? "" : "s"}</Badge>
+          <Badge tone="muted">{r.versions.length} ingest{r.versions.length === 1 ? "" : "s"}</Badge>
         </div>
       </div>
 

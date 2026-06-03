@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useState } from "react";
+import { Suspense } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
@@ -9,7 +9,7 @@ import { Card } from "@/components/Card";
 import { Badge } from "@/components/Badge";
 import { ConnectionGate } from "@/components/ConnectionGate";
 import { Tabs, type TabSpec } from "@/components/Tabs";
-import { listAssets, type AssetKind, type AssetSummary } from "@/lib/api";
+import { fmtError, listAssets, type AssetKind, type AssetSummary } from "@/lib/api";
 
 /**
  * /assets — cross-run aggregation. One row per (project, kind,
@@ -61,7 +61,16 @@ function Inner() {
     qs.set("kind", next);
     router.replace(`/assets/?${qs}`);
   }
-  const [project, setProject] = useState("");
+  // Round-9 review-pass: ``project`` also URL-synced so reload
+  // preserves the filter and deep-links carry it.  Round-8 wired
+  // ``kind`` and left this stragglet; the page header already
+  // promised URL-as-state.
+  const project = params.get("project") ?? "";
+  function setProject(next: string) {
+    const qs = new URLSearchParams(params);
+    if (next) qs.set("project", next); else qs.delete("project");
+    router.replace(qs.toString() ? `/assets/?${qs}` : "/assets/");
+  }
 
   const q = useQuery({
     queryKey: ["assets", kind, project || null],
@@ -87,7 +96,7 @@ function Inner() {
           {q.isPending && <p className="text-sm text-[var(--color-fg-muted)]">Loading…</p>}
           {q.error && (
             <p className="text-sm text-[var(--color-fail)]">
-              {q.error instanceof Error ? q.error.message : String(q.error)}
+              {fmtError(q.error)}
             </p>
           )}
           {q.data && <AssetsTable kind={kind} assets={q.data.assets} />}
