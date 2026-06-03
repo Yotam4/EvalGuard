@@ -6,6 +6,7 @@ import { usePathname } from "next/navigation";
 const items = [
   { href: "/runs",     label: "Runs" },
   { href: "/calls",    label: "Calls" },
+  { href: "/config",   label: "Config" },   // PROXY-4 — config editor
   { href: "/reviews",  label: "Reviews" },
   { href: "/golden",   label: "Golden" },
   { href: "/assets",   label: "Assets" },

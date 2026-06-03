@@ -244,6 +244,54 @@ test.beforeEach(async ({ context }) => {
       });
     }
 
+    // PROXY-4 — project config read + write endpoints.
+    if (path === "/v1/projects/demo/config" && route.request().method() === "GET") {
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          id: 7, project_id: "proj_e2e",
+          content_sha256: "abc123def456789012345678901234567890123456789012345678901234abcd",
+          content: "version: 1\nproject: demo\nproviders:\n  - id: 'mock:m'\n",
+          pushed_by: "key_e2e", pushed_at: "2026-05-15T08:00:00",
+        }),
+      });
+    }
+    if (path === "/v1/projects/demo/config/history") {
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          configs: [
+            {
+              id: 7, project_id: "proj_e2e",
+              content_sha256: "abc123def456789012345678901234567890123456789012345678901234abcd",
+              pushed_by: "key_e2e", pushed_at: "2026-05-15T08:00:00",
+            },
+            {
+              id: 6, project_id: "proj_e2e",
+              content_sha256: "feed111122223333444455556666777788889999aaaabbbbccccddddeeeefffe",
+              pushed_by: "key_e2e", pushed_at: "2026-05-14T08:00:00",
+            },
+          ],
+        }),
+      });
+    }
+    if (path === "/v1/projects/demo/config" && route.request().method() === "POST") {
+      // Successful push — return id 8 so the editor's "saved" chip
+      // can be observed (uses the response sha256 prefix).
+      return route.fulfill({
+        status: 201,
+        contentType: "application/json",
+        body: JSON.stringify({
+          id: 8, project_id: "proj_e2e",
+          content_sha256: "deadbeef000011112222333344445555666677778888999900001111aaaabbbb",
+          content: "version: 1\nproject: demo\nproviders:\n  - id: 'mock:m'\n",
+          pushed_by: "key_e2e", pushed_at: "2026-05-15T08:30:00",
+        }),
+      });
+    }
+
     // Fall through to a 404 so an un-mocked endpoint surfaces
     // clearly in the test output (rather than the test hanging
     // on a network call to a fake hostname).
@@ -355,4 +403,41 @@ test("settings → runs → run detail → assets → asset detail → calls →
     page.getByTestId("golden-download-all").click(),
   ]);
   expect(download.suggestedFilename()).toBe("demo-golden.jsonl");
+
+  // 9. PROXY-4 — project config editor.  Loads the latest revision
+  // metadata, renders the textarea seeded with the stored content,
+  // shows the history list, allows an edit + save round-trip.
+  await page.goto("/config/?project=demo");
+  await expect(page.getByRole("heading", { name: /project config/i }))
+    .toBeVisible();
+
+  // Metadata strip carries sha256 prefix + pushed_by.
+  const meta = page.getByTestId("config-meta");
+  await expect(meta).toContainText("abc123def456…");
+  await expect(meta).toContainText("key_e2e");
+
+  // Editor is pre-populated with the stored YAML.
+  const editor = page.getByTestId("config-editor");
+  await expect(editor).toHaveValue(/version: 1/);
+  await expect(editor).toHaveValue(/providers:/);
+
+  // History rail shows both revisions; the latest carries the
+  // ``latest`` chip and is the active selection by default.
+  const history = page.getByTestId("config-history");
+  const historyRows = history.locator('[data-testid="config-history-row"]');
+  await expect(historyRows).toHaveCount(2);
+  await expect(historyRows.first()).toHaveAttribute("aria-pressed", "true");
+
+  // Save button is disabled until the operator types.
+  const saveButton = page.getByTestId("config-save");
+  await expect(saveButton).toBeDisabled();
+
+  // Type one keystroke + save — the route mock returns 201 with a
+  // fresh sha256, and the editor surfaces the success chip.
+  await editor.focus();
+  await editor.press("End");
+  await editor.pressSequentially(" # edited");
+  await expect(saveButton).toBeEnabled();
+  await saveButton.click();
+  await expect(page.getByTestId("config-save-ok")).toContainText("deadbeef0000…");
 });

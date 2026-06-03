@@ -8,6 +8,9 @@ import {
   getLiveAggregate, listProjectCalls, listProjectLiveTimeline,
   listRunReviews, listRuns,
   promoteToGolden, revokeApiKey, submitReview, unPromoteGolden,
+  // PROXY-4 — project config read + write
+  getLatestProjectConfig, getProjectConfigHistory, getProjectConfigRevision,
+  pushProjectConfig,
 } from "../api";
 
 /**
@@ -642,5 +645,92 @@ describe("api client", () => {
     expect(url).toBe(
       "https://api.example.com/v1/projects/demo/live/aggregate",
     );
+  });
+
+
+  // ---------------------------------------------------------------------
+  // PROXY-4 — project config read + write client
+
+
+  it("getLatestProjectConfig targets the /config root", async () => {
+    setServerUrl("https://api.example.com");
+    setToken("evk_x");
+    fetchMock.mockResolvedValueOnce({
+      ok: true, status: 200,
+      json: async () => ({
+        id: 7, project_id: "proj_x", content_sha256: "abc",
+        content: "version: 1\n", pushed_by: "k_x", pushed_at: "now",
+      }),
+    });
+    await getLatestProjectConfig("demo");
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "https://api.example.com/v1/projects/demo/config",
+    );
+  });
+
+
+  it("getProjectConfigHistory composes the limit param", async () => {
+    setServerUrl("https://api.example.com");
+    setToken("evk_x");
+    fetchMock.mockResolvedValueOnce({
+      ok: true, status: 200, json: async () => ({ configs: [] }),
+    });
+    await getProjectConfigHistory("demo", { limit: 5 });
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "https://api.example.com/v1/projects/demo/config/history?limit=5",
+    );
+  });
+
+
+  it("getProjectConfigHistory omits the limit param when not supplied", async () => {
+    setServerUrl("https://api.example.com");
+    setToken("evk_x");
+    fetchMock.mockResolvedValueOnce({
+      ok: true, status: 200, json: async () => ({ configs: [] }),
+    });
+    await getProjectConfigHistory("demo");
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "https://api.example.com/v1/projects/demo/config/history",
+    );
+  });
+
+
+  it("getProjectConfigRevision composes the per-id URL", async () => {
+    setServerUrl("https://api.example.com");
+    setToken("evk_x");
+    fetchMock.mockResolvedValueOnce({
+      ok: true, status: 200,
+      json: async () => ({
+        id: 42, project_id: "proj_x", content_sha256: "abc",
+        content: "version: 1\n", pushed_by: "k_x", pushed_at: "now",
+      }),
+    });
+    await getProjectConfigRevision("demo", 42);
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "https://api.example.com/v1/projects/demo/config/42",
+    );
+  });
+
+
+  it("pushProjectConfig POSTs the content blob unchanged", async () => {
+    setServerUrl("https://api.example.com");
+    setToken("evk_x");
+    fetchMock.mockResolvedValueOnce({
+      ok: true, status: 201,
+      json: async () => ({
+        id: 1, project_id: "proj_x", content_sha256: "abc",
+        content: "version: 1\nproject: demo\n", pushed_by: "k_x", pushed_at: "now",
+      }),
+    });
+    const body = "version: 1\nproject: demo\nproviders: [{id: 'mock:m'}]\n";
+    await pushProjectConfig("demo", body);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("https://api.example.com/v1/projects/demo/config");
+    expect(init.method).toBe("POST");
+    // Server stores bytes verbatim — the client must not
+    // re-serialise YAML on the way out (we deliberately don't
+    // wrap content in any envelope beyond the JSON body the
+    // server expects).
+    expect(JSON.parse(init.body as string)).toEqual({ content: body });
   });
 });

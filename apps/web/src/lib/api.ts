@@ -475,6 +475,79 @@ export const unPromoteGolden = (id: number) =>
     method: "DELETE",
   });
 
+
+// PROXY-4 — project_configs read + write.
+//
+// Wire-shape pinned in ``apps/api/evalguard_api/models.py``:
+// - ``ProjectConfig`` carries the full record incl. raw ``content``
+// - ``ProjectConfigSummary`` omits content (used in the history list)
+// - ``ProjectConfigHistory`` is just ``{configs: ProjectConfigSummary[]}``
+// The server validates the YAML shape at push time (round-4 ticket #4),
+// so a 422 carries a human-readable ``detail`` string the editor can
+// surface inline.
+
+export interface ProjectConfig {
+  id:             number;
+  project_id:     string;
+  content_sha256: string;
+  content:        string;
+  pushed_by:      string;
+  pushed_at:      string;
+}
+
+export interface ProjectConfigSummary {
+  id:             number;
+  project_id:     string;
+  content_sha256: string;
+  pushed_by:      string;
+  pushed_at:      string;
+}
+
+export interface ProjectConfigHistory {
+  configs: ProjectConfigSummary[];
+}
+
+export const getLatestProjectConfig = (projectSlug: string) =>
+  request<ProjectConfig>(
+    `/v1/projects/${encodeURIComponent(projectSlug)}/config`,
+  );
+
+export const getProjectConfigHistory = (
+  projectSlug: string, opts: { limit?: number } = {},
+) => {
+  const qs = new URLSearchParams();
+  if (opts.limit) qs.set("limit", String(opts.limit));
+  const tail = qs.toString();
+  return request<ProjectConfigHistory>(
+    `/v1/projects/${encodeURIComponent(projectSlug)}/config/history`
+    + (tail ? `?${tail}` : ""),
+  );
+};
+
+export const getProjectConfigRevision = (
+  projectSlug: string, configId: number,
+) =>
+  request<ProjectConfig>(
+    `/v1/projects/${encodeURIComponent(projectSlug)}/config/${configId}`,
+  );
+
+export const pushProjectConfig = (
+  projectSlug: string, content: string,
+) =>
+  // Server returns ``201`` for a new revision and ``200`` when the
+  // SHA-256 matches an existing one (idempotent push of the same
+  // bytes).  ``request<T>`` unwraps the body in both cases; the
+  // caller can compare ``pushed_at`` against the previous fetch
+  // to tell whether their push was a no-op.
+  request<ProjectConfig>(
+    `/v1/projects/${encodeURIComponent(projectSlug)}/config`,
+    {
+      method: "POST",
+      body:   JSON.stringify({ content }),
+    },
+  );
+
+
 export const getRun = (runId: string) =>
   request<RunOut>(`/v1/runs/${encodeURIComponent(runId)}`);
 
