@@ -10,6 +10,8 @@
 
 "use client";
 
+import Link from "next/link";
+
 import { Badge } from "./Badge";
 import { PromoteButton } from "./PromoteButton";
 import type { CallDetail, Score } from "@/lib/api";
@@ -32,7 +34,7 @@ export function CallDetailPanel({
       data-testid="call-detail-panel"
       data-run-id={data.run_id}
       data-row-id={data.row_id}
-      className="space-y-4 rounded border border-[var(--color-border)] bg-[var(--color-bg-card)] p-4"
+      className="space-y-4 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-card)] p-4"
     >
       <Header data={data} onClose={onClose} projectSlug={projectSlug} />
       {/* PROXY-2.5 review-pass: live calls that failed (provider error,
@@ -87,8 +89,19 @@ function Header({
           {data.provider}:{data.model}
         </span>
       )}
+      {/* Round-8 review-pass: the run_id is now a link to the run
+          detail so an operator drilling from a failing call back to
+          the originating run doesn't have to copy the id out of the
+          panel and paste it into the URL bar.  The detail page
+          re-derives /calls context via its own header. */}
       <span className="text-xs text-[var(--color-fg-muted)]">
-        run <span className="font-mono">{data.run_id}</span>
+        run{" "}
+        <Link
+          href={`/runs/detail/?id=${encodeURIComponent(data.run_id)}`}
+          className="font-mono text-[var(--color-accent)] hover:underline"
+        >
+          {data.run_id}
+        </Link>
       </span>
       <span className="ml-auto flex items-center gap-3 text-xs text-[var(--color-fg-muted)]">
         <span className="font-mono">{data.latency_ms} ms</span>

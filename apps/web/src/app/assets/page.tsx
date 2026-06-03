@@ -171,9 +171,12 @@ function AssetsTable({
                 </Link>
               </td>
               <td className="px-3 py-2 text-right">
-                <Badge tone={a.version_count === 1 ? "muted" : "info"}>
-                  {a.version_count}
-                </Badge>
+                {/* Round-8 review-pass: version-count is a metadata
+                    chip, not a state marker.  ``info`` is reserved
+                    for actionable states (``live``, ``latest``,
+                    admin scope); free-form counts use ``muted`` so
+                    the eye knows which chips encode status. */}
+                <Badge tone="muted">{a.version_count}</Badge>
               </td>
               <td className="px-3 py-2 text-right font-mono text-xs">
                 {a.run_count}

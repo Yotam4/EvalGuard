@@ -33,10 +33,18 @@ export function CallCard({
       aria-pressed={selected}
       onClick={() => onSelect(call)}
       className={
-        "block w-full rounded border bg-[var(--color-bg-card)] p-3 text-left transition " +
+        // Round-8 review-pass: ``rounded-lg`` matches the Card
+        // component's radius so cards next to one another don't
+        // visibly mismatch their corners.  Selected state changes
+        // BOTH border AND background (not just border) so peripheral
+        // vision can tell the active card apart from hover.
+        // ``focus-visible:outline`` adopts the same focus token the
+        // rest of the app uses so keyboard users get a consistent
+        // ring instead of the default browser outline.
+        "block w-full rounded-lg border p-3 text-left transition focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--color-accent)] " +
         (selected
-          ? "border-[var(--color-accent)] ring-1 ring-[var(--color-accent)]"
-          : "border-[var(--color-border)] hover:bg-[var(--color-bg-row)]")
+          ? "border-[var(--color-accent)] bg-[var(--color-bg-row)] ring-1 ring-[var(--color-accent)]"
+          : "border-[var(--color-border)] bg-[var(--color-bg-card)] hover:bg-[var(--color-bg-row)]")
       }
     >
       <div className="flex flex-wrap items-baseline gap-2 text-sm">
@@ -53,8 +61,13 @@ export function CallCard({
             default before the proxy shipped. */}
         {call.source === "live" && <Badge tone="info">live</Badge>}
         {call.cache_hit && <Badge tone="muted">cache</Badge>}
+        {/* Round-8 review-pass: free-form tags render with the ``muted``
+            tone so the accent (``info``) stays reserved for state
+            markers like ``live`` and ``latest``.  Mixing both on the
+            same row made it hard to tell which chips carried meaning
+            and which were decorative metadata. */}
         {call.tags.slice(0, 3).map((t) => (
-          <Badge key={t} tone="info">{t}</Badge>
+          <Badge key={t} tone="muted">{t}</Badge>
         ))}
         <span className="ml-auto flex items-center gap-3 text-xs text-[var(--color-fg-muted)]">
           <span className="font-mono">{call.latency_ms} ms</span>

@@ -113,7 +113,13 @@ describe("<PromoteButton>", () => {
   });
 
 
-  it("post-success label flips to ✓ Promoted and idempotently re-opens", async () => {
+  it("post-success collapses the form into a ✓ Promoted chip plus an undo affordance", async () => {
+    // Round-8 review-pass: the success state now replaces the
+    // single button with a chip + Undo (so a mis-click is reversible
+    // in-place without navigating to /golden).  The form must still
+    // collapse, the chip text must surface "Promoted", and the
+    // undo button must be present and pointed at the freshly-
+    // promoted candidate.
     fetchMock.mockResolvedValueOnce({
       ok: true, status: 201,
       json: async () => ({
@@ -127,12 +133,15 @@ describe("<PromoteButton>", () => {
     ));
     fireEvent.click(screen.getByTestId("promote-button"));
     fireEvent.click(screen.getByTestId("promote-confirm"));
-    // Once the mutation resolves, the form collapses and the
-    // button shows the success label.
     await waitFor(() =>
-      expect(screen.getByTestId("promote-button").textContent)
+      expect(screen.getByTestId("promote-success").textContent)
         .toMatch(/promoted/i),
     );
+    // The trigger button is gone (replaced by the chip); the form
+    // is gone too.  Undo is present and addressable.
+    expect(screen.queryByTestId("promote-button")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("promote-form")).not.toBeInTheDocument();
+    expect(screen.getByTestId("promote-undo")).toBeInTheDocument();
   });
 
 
@@ -174,14 +183,16 @@ describe("<PromoteButton>", () => {
     const { rerender } = render(<Wrap rowId="r-1" />);
     fireEvent.click(screen.getByTestId("promote-button"));
     fireEvent.click(screen.getByTestId("promote-confirm"));
+    // Post-success the trigger button is replaced by the chip + undo.
     await waitFor(() =>
-      expect(screen.getByTestId("promote-button").textContent).toMatch(/promoted/i),
+      expect(screen.getByTestId("promote-success").textContent).toMatch(/promoted/i),
     );
     // Same QueryClient, different ``rowId`` — the ``key`` forces
-    // unmount + remount, so the new button is back at idle.
+    // unmount + remount, so the new row renders the idle trigger
+    // button again with no carried-over success state.
     rerender(<Wrap rowId="r-2" />);
     expect(screen.getByTestId("promote-button").textContent).toMatch(/promote to golden/i);
-    expect(screen.getByTestId("promote-button").textContent).not.toMatch(/promoted/i);
+    expect(screen.queryByTestId("promote-success")).not.toBeInTheDocument();
   });
 
 

@@ -199,6 +199,12 @@ function DriftReportView({
 
 
 function Header({ run }: { run: RunOut }) {
+  // Round-8 review-pass: when a run has failing rows, surface a
+  // "Review failures →" affordance so the operator has a direct path
+  // into /reviews?run_id=... without copying the id by hand.  The
+  // queue endpoint expects exactly the same id format ``run.run_id``
+  // exposes, so no translation is needed.
+  const failingRows = run.row_fail_count ?? 0;
   return (
     <div>
       <Link
@@ -208,7 +214,7 @@ function Header({ run }: { run: RunOut }) {
         ← Runs
       </Link>
       <div className="mt-1 flex flex-wrap items-baseline gap-3">
-        <h1 className="font-mono text-lg font-semibold">{run.run_id}</h1>
+        <h1 className="font-mono text-xl font-semibold">{run.run_id}</h1>
         <Badge tone={statusTone(run.status)}>{run.status ?? "—"}</Badge>
         <Badge tone={statusTone(run.gate_status)}>gates: {run.gate_status ?? "—"}</Badge>
         <span className="text-sm text-[var(--color-fg-muted)]">
@@ -221,6 +227,15 @@ function Header({ run }: { run: RunOut }) {
           >
             via <span className="font-mono">{run.server.ingested_by}</span>
           </span>
+        )}
+        {failingRows > 0 && (
+          <Link
+            data-testid="review-failures-link"
+            href={`/reviews?run_id=${encodeURIComponent(run.run_id)}`}
+            className="ml-auto rounded border border-[var(--color-accent)] px-2 py-0.5 text-xs text-[var(--color-accent)] hover:bg-[var(--color-bg-row)]"
+          >
+            Review {failingRows} failure{failingRows === 1 ? "" : "s"} →
+          </Link>
         )}
       </div>
     </div>

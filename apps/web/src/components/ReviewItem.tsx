@@ -48,7 +48,7 @@ export function ReviewItem({
     <div
       data-testid="review-item"
       data-row-id={item.row_id}
-      className="rounded border border-[var(--color-border)] bg-[var(--color-bg-card)] p-3"
+      className="rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-card)] p-3"
     >
       <div className="flex flex-wrap items-baseline gap-3 text-sm">
         <span className="font-mono text-xs">{item.row_id}</span>
@@ -90,11 +90,18 @@ export function ReviewItem({
               data-verdict={v.value}
               aria-pressed={verdict === v.value}
               onClick={() => setVerdict(v.value)}
+              // Round-8 review-pass: pressed state changes border,
+              // background fill, AND font weight — previously only
+              // the border swapped to accent, which at this size was
+              // barely distinguishable from the hover state and made
+              // it hard to confirm which verdict was armed.  Added
+              // ``focus-visible:outline`` for consistent keyboard
+              // affordance.
               className={
-                "rounded border px-3 py-1 text-xs " +
+                "rounded border px-3 py-1 text-xs transition focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--color-accent)] " +
                 (verdict === v.value
-                  ? "border-[var(--color-accent)] bg-[var(--color-bg-row)]"
-                  : "border-[var(--color-border)] hover:bg-[var(--color-bg-row)]")
+                  ? "border-[var(--color-accent)] bg-[color-mix(in_srgb,var(--color-accent)_15%,var(--color-bg-card))] font-semibold text-[var(--color-fg)]"
+                  : "border-[var(--color-border)] text-[var(--color-fg-muted)] hover:bg-[var(--color-bg-row)] hover:text-[var(--color-fg)]")
               }
             >
               {v.label}
@@ -115,7 +122,7 @@ export function ReviewItem({
             type="submit"
             disabled={!verdict || submitting}
             className={
-              "rounded border px-3 py-1 text-xs " +
+              "rounded border px-3 py-1 text-xs transition focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--color-accent)] " +
               (!verdict || submitting
                 ? "cursor-not-allowed border-[var(--color-border)] text-[var(--color-fg-muted)]"
                 : "border-[var(--color-accent)] hover:bg-[var(--color-bg-row)]")

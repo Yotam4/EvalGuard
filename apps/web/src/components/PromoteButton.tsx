@@ -11,7 +11,7 @@
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 
-import { promoteToGolden } from "@/lib/api";
+import { promoteToGolden, unPromoteGolden } from "@/lib/api";
 
 
 /**
@@ -57,7 +57,46 @@ export function PromoteButton({
     },
   });
 
+  // Round-8 review-pass: surface an inline Undo affordance after a
+  // successful promote.  Previously the only feedback was the
+  // button-label flip to "✓ Promoted" and a mis-click forced the
+  // operator to navigate to /golden, find the candidate, and
+  // un-promote there.  ``m.data.id`` is the row id returned by the
+  // POST and is the same id ``unPromoteGolden`` consumes.
+  const undo = useMutation({
+    mutationFn: (id: number) => unPromoteGolden(id),
+    onSuccess: () => {
+      m.reset();
+      if (projectSlug) {
+        qc.invalidateQueries({
+          queryKey: ["golden-candidates", projectSlug],
+        });
+      }
+    },
+  });
+
   if (!editing) {
+    if (m.isSuccess && m.data) {
+      return (
+        <span className="inline-flex items-center gap-1.5 text-xs">
+          <span
+            data-testid="promote-success"
+            className="text-[var(--color-pass)]"
+          >
+            ✓ Promoted
+          </span>
+          <button
+            type="button"
+            data-testid="promote-undo"
+            disabled={undo.isPending}
+            onClick={() => undo.mutate(m.data.id)}
+            className="rounded border border-[var(--color-border)] px-1.5 py-0.5 text-[var(--color-fg-muted)] hover:bg-[var(--color-bg-row)] hover:text-[var(--color-fg)] disabled:opacity-40"
+          >
+            {undo.isPending ? "undoing…" : "undo"}
+          </button>
+        </span>
+      );
+    }
     return (
       <button
         type="button"
@@ -65,7 +104,7 @@ export function PromoteButton({
         onClick={() => setEditing(true)}
         className="rounded border border-[var(--color-border)] px-2 py-0.5 text-xs hover:bg-[var(--color-bg-row)]"
       >
-        {m.isSuccess ? "✓ Promoted" : "Promote to golden"}
+        Promote to golden
       </button>
     );
   }
