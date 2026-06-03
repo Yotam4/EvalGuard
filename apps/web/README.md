@@ -51,16 +51,18 @@ code, same family as `apps/api/`); the MIT-licensed CLI / evaluators
 | Route | What it shows | Key endpoints |
 |---|---|---|
 | `/settings/` | Server URL + token entry, health probe, mixed-content guard | `GET /v1/health` |
-| `/runs/` | List, project filter, `?source=cli\|otlp` tab strip, 10 s polling | `GET /v1/runs` |
-| `/runs/detail/?id=run_xxx` | Run header, gates, trials, assets, drift card | `GET /v1/runs/{id}`, `GET /v1/runs/{id}/drift?vs=…` |
-| `/assets/` | Cross-run aggregate, kind tabs, project filter | `GET /v1/assets` |
+| `/runs/` | List, project filter (slug OR display name), `?source=cli\|otlp\|live` filter, 10 s polling | `GET /v1/runs` |
+| `/runs/detail/?id=run_xxx` | Run header, gates, trials, assets, drift card with self-baseline guard, "Review N failures →" link when the run has failing rows | `GET /v1/runs/{id}`, `GET /v1/runs/{id}/drift?vs=…` |
+| `/assets/` | Cross-run aggregate, kind tabs (URL-synced), project filter (URL-synced) | `GET /v1/assets` |
 | `/assets/detail/?kind=&asset_id=&project_id=` | Every `(version, run, ingested)` for one asset | `GET /v1/assets/{kind}/{asset_id}/versions` |
-| `/reviews?run_id=run_xxx` | Human review queue for failing rows + verdict submit | `GET /v1/reviews/queue`, `POST /v1/reviews`, `GET /v1/runs/{id}/reviews` |
-| `/calls/?project=…` | Per-project call stream with cursor pagination, Recent / Failures tabs | `GET /v1/projects/{slug}/calls` |
-| `/golden/?project=…` | Promoted golden-dataset candidates | `GET /v1/projects/{slug}/golden/candidates` |
+| `/reviews?run_id=run_xxx` | Human review queue for failing rows + verdict submit (per-row pending state) | `GET /v1/reviews/queue`, `POST /v1/reviews`, `GET /v1/runs/{id}/reviews` |
+| `/calls/?project=…` | Per-project call stream with cursor pagination, Recent / Failures / Passed tabs, project-day `LiveTimeline` strip above the stream (click a bar to filter by day; clicking the active bar clears the window), inline `CallDetailPanel` with "Promote to golden" + inline undo | `GET /v1/projects/{slug}/calls`, `GET /v1/projects/{slug}/calls/{run_id}/{row_id}`, `GET /v1/projects/{slug}/live/timeline`, `GET /v1/projects/{slug}/live/aggregate` |
+| `/config/?project=…[&rev=N]` | Per-project YAML config editor with revision history + restore; `<pre>` rendering for multi-line validation errors; `beforeunload` guard on unsaved edits; "Saved · sha256 …" chip auto-clears after 10 s | `GET /v1/projects/{slug}/config`, `POST /v1/projects/{slug}/config`, `GET /v1/projects/{slug}/config/history`, `GET /v1/projects/{slug}/config/{rev}` |
+| `/golden/?project=…[&q=&sort=]` | Promoted golden candidates with free-text filter, sort, bulk select + `ConfirmButton`-guarded bulk remove, in-browser JSONL download | `GET /v1/projects/{slug}/golden/candidates`, `DELETE /v1/golden/candidates/{id}` |
 | `/orgs/` | Org list + create (admin) | `GET /v1/orgs`, `POST /v1/orgs` |
 | `/projects/` | Project list + create | `GET /v1/projects`, `POST /v1/projects` |
-| `/keys/` | API-key CRUD; new keys flash plaintext once with Copy | `GET /v1/orgs/{id}/api_keys`, `POST /v1/orgs/{id}/api_keys`, `DELETE /v1/api_keys/{id}` |
+| `/keys/` | API-key CRUD; new keys flash plaintext once with Copy; explicit "Select an org…" placeholder | `GET /v1/orgs/{id}/api_keys`, `POST /v1/orgs/{id}/api_keys`, `DELETE /v1/api_keys/{id}` |
+| `*` (unknown) | App-themed `not-found.tsx` keeps the dark chrome + top nav reachable | — |
 
 `next build` finalises every route as static content; the exact
 count moves as features land — verify with `npm run build`.
@@ -72,29 +74,41 @@ src/
   app/
     layout.tsx                       # Nav + react-query provider
     page.tsx                         # → /runs
-    globals.css                      # Tailwind + @theme tokens
+    not-found.tsx                    # themed 404 (unknown route)
+    error.tsx                        # themed render-error boundary
+    globals.css                      # Tailwind + @theme tokens; color-scheme: dark
     runs/
-      page.tsx                       # list, ?source= tabs, polling
-      detail/page.tsx                # run header + drift card
-    reviews/page.tsx                 # queue + verdict form
+      page.tsx                       # list, ?source= filter, URL-synced project, polling
+      detail/page.tsx                # run header + drift card + "Review N failures →"
+    reviews/page.tsx                 # queue + verdict form, per-row pending
     assets/
-      page.tsx                       # aggregate
+      page.tsx                       # aggregate, URL-synced kind + project filters
       detail/page.tsx                # one-asset drill-down
-    settings/page.tsx                # URL / token / probe
+    calls/page.tsx                   # virtualized stream + LiveTimeline + drill panel
+    config/page.tsx                  # YAML editor + history + restore + beforeunload guard
+    golden/page.tsx                  # candidates with ?q=, ?sort=, bulk download / remove
+    settings/page.tsx                # URL / token / probe (autocomplete off)
     orgs/page.tsx
     projects/page.tsx
-    keys/page.tsx
+    keys/page.tsx                    # org dropdown with explicit placeholder
   components/
-    Nav.tsx                          # top tab strip
+    Nav.tsx                          # top tab strip, wraps below ~720 px
     Card.tsx / Badge.tsx             # primitives + statusTone()
     ConnectionGate.tsx               # render Settings prompt if no creds
-    ConfirmButton.tsx                # 4-s armed destructive button
+    ConfirmButton.tsx                # 4-s armed destructive button (2-click)
+    Tabs.tsx                         # generic radiogroup (default) / tablist
     DriftBody.tsx                    # presentational drift report
     ReviewItem.tsx                   # one queue card + verdict form
     AssetVersionsTable.tsx           # version × run table
+    CallCard.tsx                     # one row of /calls/ stream (selected ring + bg)
+    CallDetailPanel.tsx              # drill-down, run_id is a Link to /runs/detail
+    GoldenRowPreview.tsx             # inline input/expected/output preview
+    LiveTimeline.tsx                 # per-day bars on /calls/ (a11y: pass% in label)
+    PromoteButton.tsx                # promote-to-golden with inline undo
   lib/
-    api.ts                           # typed fetch wrapper + every endpoint
+    api.ts                           # typed fetch wrapper + every endpoint + fmtError()
     auth.ts                          # localStorage helpers
+    golden-export.ts                 # in-browser JSONL composer
     query.tsx                        # QueryClient provider (5-min stale)
   types/
     testing.d.ts                     # jest-dom matcher refs for tsc
@@ -244,8 +258,18 @@ Tests live next to the code they cover:
   `DriftBody` (formatting helpers + direction-of-regression tones),
   `ReviewItem` (Submit gated by verdict, trims note on submit),
   `AssetVersionsTable` (truncation, source badge, data-* attrs),
-  `Tabs` (ARIA tablist semantics, roving tabindex, ArrowLeft/Right
-  + Home/End keyboard navigation).
+  `Tabs` (radiogroup default + tabs variant, roving tabindex,
+  ArrowLeft/Right + Home/End keyboard navigation),
+  `CallCard` (selected vs hover, tag tones), `CallDetailPanel`
+  (run-id link, score / gate rendering), `PromoteButton` (success
+  chip + inline undo + error path), `GoldenRowPreview`,
+  `LiveTimeline.padToWindow` (sparse-day padding to a contiguous
+  30-day window).
+- `src/app/golden/__tests__/filterAndSort.test.ts` — pure
+  filter+sort helper covers free-text search across content +
+  metadata.
+- `src/app/reviews/__tests__/page.regression.test.ts` — tightened
+  per-row pending behaviour after the round-8 fix.
 
 ### Playwright (e2e)
 

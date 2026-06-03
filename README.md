@@ -220,7 +220,7 @@ shared (server + every CLI runner pushes to it for org-wide
 visibility).
 
 ```bash
-# Run the server
+# Run the server (auth mode — production)
 export EVALGUARD_API_KEY=$(openssl rand -hex 32)
 uvicorn evalguard_api.main:app --host 0.0.0.0 --port 8787
 
@@ -230,6 +230,17 @@ export EVALGUARD_API_TOKEN=$EVALGUARD_API_KEY
 evalguard run                     # local
 evalguard push --last             # → POST /v1/runs
 ```
+
+Local dev without a key: set `EVALGUARD_OPEN_MODE=1` to acknowledge
+the no-auth posture; the server refuses to boot otherwise (and
+refuses to bind anything but loopback when in open mode).
+
+EvalGuard is **also** an LLM gateway. Point your application's
+OpenAI base URL at `POST /v1/projects/{slug}/invoke` and the proxy
+serves the call, scores it with the project's pushed YAML config,
+records every call in an audited live run, and enforces per-key
+rate limits + a per-project daily cost cap. See the **PROXY** phase
+under [Status](#status) below.
 
 `apps/api/README.md` has the full endpoint reference, configuration
 matrix, and Docker quickstart. License: Apache-2.0 (server core),
@@ -354,12 +365,40 @@ separate from the MIT-licensed CLI.
   `/golden/` database view (inline preview, search, sort, bulk
   select, in-browser JSONL download) + the `evalguard golden`
   CLI bridge. See [`docs/golden-dataset.md`](docs/golden-dataset.md).
+- **Phase PROXY (production LLM gateway)** — `POST /v1/projects/{slug}/invoke`
+  serves an OpenAI-shaped chat completion request, scoring each
+  call inline against the project's server-stored YAML config and
+  recording the call as one row of a lazy-created daily live run
+  (`run_live_<sha>`, `source=live`).  Backed by:
+  - **`project_configs`** table + `GET/POST /v1/projects/{slug}/config`,
+    `GET /v1/projects/{slug}/config/history`, `GET /v1/projects/{slug}/config/{rev}`;
+    content-addressed by SHA-256 so re-pushing identical bytes is
+    idempotent and prior revisions stay restoreable from the
+    `/config` web page.
+  - **`event_rows`** per-event audit chain (`UNIQUE (run_id, prev_event_hash)`
+    + partial-unique on the chain root) — `GET /v1/projects/{slug}/audit/events`
+    + `GET /v1/projects/{slug}/audit/verify` walk and verify the
+    per-`/invoke` chain.  Same `build_event` / `verify_chain_events`
+    helpers in `evalguard_evaluators.audit` the CLI uses for batch
+    runs.
+  - **`LiveTimeline`** per-day rollup endpoints (`GET /v1/projects/{slug}/live/timeline`,
+    `GET /v1/projects/{slug}/live/aggregate`) powering the strip
+    above the `/calls/` stream.
+  - **Quotas** — sliding-window per-key rate limit + per-project
+    daily cost cap (`rate_limit_per_minute`, `cost_cap_usd_daily`
+    in the project YAML); `429` on rate exhaustion, `402` on
+    cost-cap exhaustion, both recorded as audit events.
+  - **Web surfaces** — `/calls` (live stream + timeline), `/config`
+    (per-project YAML editor + revision history + restore),
+    `/golden`, `/reviews`, `/assets` are all wired against the
+    same live-aware endpoints.  `runs.source` extends to
+    `cli | otlp | live`; `?source=live` filters the `/v1/runs`
+    list.
 
 ## Coming next
 
 | Phase | Deliverable |
 |---|---|
-| PROXY | `POST /v1/projects/{slug}/invoke` — EvalGuard as the production LLM gateway (server-side project config + record-as-you-go) |
 | 5 | Enterprise tier (SSO / SCIM / audit / dedicated) under ELv2 in `apps/api/ee/` |
 | charts | Project trends (pass-rate / cost / latency over time) via a charting lib |
 
@@ -391,6 +430,13 @@ Feature-level docs live under [`docs/`](docs/).
 | `evalguard audit export <run_id> -f jsonl\|prov-json\|otel-json` | Export for archival / OTel collector |
 
 ### Event vocabulary (W3C PROV "Activity")
+
+The vocabulary below was originally the CLI's `events.events_json`
+blob format; the same `build_event` / `verify_chain_events`
+helpers in `evalguard_evaluators.audit` now power the per-event
+`event_rows` table, one row per `/v1/projects/{slug}/invoke` call,
+so the same auditor reading a CLI batch run's audit log reads a
+production gateway's audit log the same way.
 
 | Kind | When |
 |---|---|
@@ -469,13 +515,27 @@ $ evalguard audit export run_abc -f otel-json | otel-collector ingest
 
 ```
 apps/
-  api/                FastAPI server (Apache-2.0): /v1/runs ingest + read
-  web/                Next.js 16 SPA (Apache-2.0): Runs + Settings pages,
-                      static export, deploys behind nginx or any static host
-                      (planned: worker)
+  api/                FastAPI server (Apache-2.0): multi-tenant control
+                      plane (orgs / projects / api_keys), batch ingest
+                      (/v1/runs, /v1/otlp/v1/traces), per-call observability
+                      (/v1/projects/{slug}/calls), human review
+                      (/v1/reviews), golden dataset (/v1/golden/candidates),
+                      asset catalog (/v1/assets), per-project YAML config
+                      (/v1/projects/{slug}/config), audit chain
+                      (/v1/projects/{slug}/audit/{events,verify}), live
+                      rollups (/v1/projects/{slug}/live/{timeline,aggregate}),
+                      and the LLM gateway (/v1/projects/{slug}/invoke).
+                      SQLite or Postgres (RLS via session GUCs); Alembic
+                      migrations auto-applied at startup.
+  web/                Next.js 16 SPA (Apache-2.0): Runs, Calls, Config,
+                      Reviews, Golden, Assets, Projects, Keys, Orgs,
+                      Settings. Static export — deploys behind nginx or
+                      any static host. Bearer + server URL live in
+                      localStorage; one bundle deploys against staging
+                      or prod with no rebuild.
 packages/
   cli/                evalguard CLI + local executor
-  evaluators/         heuristics, metrics, judges, providers
+  evaluators/         heuristics, metrics, judges, providers, audit chain
   schemas/            evalguard.yaml + run + baseline JSON schemas
   templates/          starter scaffolds (text_gen, rag, text_to_sql)
   action/             Phase-1 Docker GitHub Action
@@ -485,7 +545,10 @@ tests/                pytest — loader, cache, gate, judges, executor,
                       env subst, custom_check, layered gates, retry,
                       stats / ttest, shadow-DB, schema drift, push, …
   api/                pytest — FastAPI: health, auth, runs roundtrip,
-                      conflict, list, pydantic drift canary
+                      conflict, list, pydantic drift canary, audit-chain
+                      verify, /invoke gateway, project configs, golden,
+                      live timeline, reviews, OTLP ingest, quotas,
+                      Postgres RLS (opt-in via env)
 ```
 
 ## License

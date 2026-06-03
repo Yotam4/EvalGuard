@@ -11,8 +11,9 @@ licensed (separate from the MIT-licensed CLI).
 # 1. Install the server package (workspace member)
 uv pip install -e apps/api
 
-# 2. Set a bearer token. Without it, the server runs in "open mode"
-#    (loud startup warning + advertised in /v1/health).
+# 2. Set a bearer token.  Without one the server refuses to boot
+#    unless ``EVALGUARD_OPEN_MODE=1`` is set AND the bind host is
+#    loopback — open mode is dev-only by construction.
 export EVALGUARD_API_KEY="$(openssl rand -hex 32)"
 
 # 3. Run with uvicorn
@@ -46,7 +47,7 @@ curl -s -H "Authorization: Bearer $EVALGUARD_API_KEY" \
 | `GET`  | `/v1/projects`       | Member. Scoped to caller's org by default. |
 | `GET`  | `/v1/projects/{slug}` | Member. 404 (not 403) on cross-org probe. |
 | `POST` | `/v1/runs`           | Member. Ingest under caller's org. 201 + `Location`; 409 on duplicate `run_id` (or 200 + `idempotent_replay` with an `Idempotency-Key`). |
-| `GET`  | `/v1/runs`           | Member. Scoped to caller's org. Query: `project=<slug>&source=cli\|otlp&limit=20`. |
+| `GET`  | `/v1/runs`           | Member. Scoped to caller's org. Query: `project=<slug-or-name>&source=cli\|otlp\|live&limit=20`. `project` matches either the display name or slug — both inter-page links and a manually-typed filter converge on the same query. |
 | `GET`  | `/v1/runs/{run_id}`  | Member. 404 on cross-org access (no info leak). |
 | `GET`  | `/v1/runs/{run_id}/drift` | Member. Welch's t-test vs another run. Query: `vs=<run_id>&alpha=0.05`. 400 if `run_id==vs`; 404 if either is missing/cross-org. |
 | `GET`  | `/v1/runs/{run_id}/reviews` | Member. Every reviewer's verdict on the run. |
@@ -66,7 +67,9 @@ curl -s -H "Authorization: Bearer $EVALGUARD_API_KEY" \
 | `GET`  | `/v1/projects/{slug}/config` | Member. Latest config revision for the project. 404 if no config has been pushed yet. |
 | `GET`  | `/v1/projects/{slug}/config/history` | Member. Recent revisions newest-first (content omitted). Query: `limit=20`. |
 | `GET`  | `/v1/projects/{slug}/config/{config_id}` | Member. Specific revision verbatim — the pin-to-hash surface the proxy invoke path uses. |
-| `POST` | `/v1/projects/{slug}/invoke` | Member. **Phase PROXY-2.** Forward one LLM call through the project's stored provider, score against the configured evaluators, record under the day's live run (`source='live'`), return the model's output. 502 on provider failure (row still recorded). 422 if no config / no providers. |
+| `POST` | `/v1/projects/{slug}/invoke` | Member. **Phase PROXY-2.** Forward one LLM call through the project's stored provider, score against the configured evaluators, record under the day's live run (`source='live'`), return the model's output. 502 on provider failure (row still recorded). 422 if no config / no providers. 429 on per-key rate-limit exhaustion; 402 on per-project daily cost-cap exhaustion. |
+| `GET`  | `/v1/projects/{slug}/audit/events` | Member. **Phase PROXY-3.5.** List events emitted by a live run, in chain order. Query: `run_id=<id>&limit=500`. Response carries `corrupt_rows` + `truncated` so a partial chain has a clear signal. |
+| `GET`  | `/v1/projects/{slug}/audit/verify` | Member. **Phase PROXY-3.5.** Walk the per-run hash chain and verify every `prev_event_hash → event_hash` link. Returns `{ok, events, broken_at, reason}` matching the CLI's `verify_chain` shape. 413 if the chain exceeds the verify page cap (cursor pagination is on the roadmap; refuses rather than reporting a misleading partial-chain `ok=true`). |
 | `GET`  | `/openapi.json`      | OpenAPI 3 spec (auto-generated). |
 | `GET`  | `/docs`              | Swagger UI. |
 
@@ -82,13 +85,22 @@ All settings come from the environment. Defaults in parens.
 
 | Var | Default | Notes |
 |---|---|---|
-| `EVALGUARD_DATABASE_URL`     | `sqlite:///./.evalguard/server.db` | Postgres URL support lands in Phase 2.5. |
-| `EVALGUARD_API_KEY`          | *(empty → open mode)* | Single shared bearer for the MVP. Per-org keys later. |
+| `EVALGUARD_DATABASE_URL`     | `sqlite:///./.evalguard/server.db` | SQLite or `postgresql+psycopg://…` (install `apps/api[postgres]`). |
+| `EVALGUARD_API_KEY`          | *(empty)*                          | Bootstrap admin token. Materialized as an `admin` API key in the default org on first startup. **If empty**, server refuses to boot unless `EVALGUARD_OPEN_MODE=1` is set AND the bind host is loopback. |
+| `EVALGUARD_OPEN_MODE`        | `0`                                | Set `1` to explicitly opt into the no-auth dev posture.  Refused when bind host isn't loopback or `EVALGUARD_CORS_ORIGINS=*`. |
 | `EVALGUARD_DEFAULT_ORG`      | `default`                          | Default tenancy auto-provisioned at startup. |
 | `EVALGUARD_DEFAULT_PROJECT`  | `default`                          | Used when a run's `project` field doesn't match an existing one (which then auto-upserts). |
-| `EVALGUARD_CORS_ORIGINS`     | `*`                                | Comma-separated allowlist, or `*`. |
-| `EVALGUARD_HOST`             | `127.0.0.1`                        | Bind host for the `evalguard-api` console script. |
+| `EVALGUARD_CORS_ORIGINS`     | *(empty — no cross-origin)*        | Comma-separated allowlist (web app origin), or `*` for dev. `*` combined with auth mode is fine; `*` combined with open mode is refused. |
+| `EVALGUARD_HOST`             | `127.0.0.1`                        | Bind host for the `evalguard-api` console script. Open mode requires this to be loopback. |
 | `EVALGUARD_PORT`             | `8787`                             | Bind port. |
+| `EVALGUARD_TRUSTED_HOSTS`    | *(empty — accept all)*             | Comma-separated `Host:` header allowlist. Use behind a reverse proxy in prod. |
+| `EVALGUARD_REQUIRE_HTTPS`    | `0`                                | Set `1` to redirect plain-HTTP requests to HTTPS (behind a TLS-terminating proxy). |
+| `EVALGUARD_MAX_REQUEST_BYTES`| `1048576` (1 MiB)                  | Hard cap on request body size; oversize → 413. |
+| `EVALGUARD_OTLP_SAMPLE_RATE` | `1.0`                              | Head-based deterministic sampling on OTLP ingest. `0.0`–`1.0`. |
+| `EVALGUARD_DB_POOL_SIZE`     | `5`                                | SQLAlchemy pool size (Postgres only; SQLite stays single-connection). |
+| `EVALGUARD_DB_MAX_OVERFLOW`  | `10`                               | Pool overflow ceiling. |
+| `EVALGUARD_DB_POOL_PRE_PING` | `1`                                | Enable `SELECT 1` health check before checkout (recommended). |
+| `EVALGUARD_DB_POOL_RECYCLE_S`| `1800`                             | Recycle connections older than N seconds. |
 
 ## Multi-tenancy model
 
@@ -193,30 +205,88 @@ access is blocked at the DB layer in addition to the app layer.
 
 The server stores the canonical `run_to_dict()` JSON under
 `runs.payload_json` AND denormalizes trials / rows / gates / assets
-into joinable tables so the eventual UI doesn't have to parse JSON
-to query. Audit events arrive as a JSON blob in `events.events_json`;
-per-event indexing is a later phase.
+into joinable tables so the UI doesn't have to parse JSON to query.
+
+Batch ingest still writes the full audit log as a JSON blob under
+`events.events_json` (the CLI's append-only shape).  **The proxy
+gateway writes per-event rows** to the `event_rows` table (one row
+per `/v1/projects/{slug}/invoke` call), enforcing the chain
+invariant at the DB layer via `UNIQUE (run_id, prev_event_hash)`
++ a partial unique index `(run_id) WHERE prev_event_hash IS NULL`
+so a concurrent first-of-day insert can't fork the chain root.
+`/v1/projects/{slug}/audit/events` + `/audit/verify` walk this
+table; `verify_chain_events` (`evalguard_evaluators.audit`) does
+the per-event hash check.
 
 ## Idempotency
 
-`POST /v1/runs` with an existing `run_id` returns 409. The reasoning:
-re-pushing the same run isn't a merge — runs are immutable artifacts.
-Future versions may add `PUT /v1/runs/{run_id}` for explicit
-replacement (e.g. re-ingesting a corrected baseline).
+`POST /v1/runs` with an `Idempotency-Key` header returns the
+existing run (200 with `idempotent_replay: true` envelope) when the
+combination of caller + key + payload matches a previous request,
+so a CI retry after a network blip doesn't 409.  Without the header
+a duplicate `run_id` returns 409 — runs are immutable artifacts.
+
+The proxy's `/v1/projects/{slug}/invoke` is implicitly idempotent
+at the chain layer: a duplicate insert loses the
+`UNIQUE (run_id, prev_event_hash)` race and the bounded retry loop
+re-reads the chain tip up to 8 times before raising.
 
 ## Auth
 
-Single shared bearer token via `EVALGUARD_API_KEY`. Constant-time
-compare. Missing-or-malformed headers return 401 with a
-`WWW-Authenticate: Bearer` response header. Health endpoint is
-unauthenticated so load balancers can probe it.
+Bearer token via `EVALGUARD_API_KEY` is the bootstrap admin —
+materialised at startup as an `admin` API key in the default org.
+Constant-time compare on every request; missing-or-malformed
+headers return 401 with a `WWW-Authenticate: Bearer` response
+header.  Health endpoint is unauthenticated so load balancers can
+probe it.
 
-When `EVALGUARD_API_KEY` is empty, the server runs in **open mode**
-(no auth check). This is for local dev only; production deploys
-must set the env var. Open mode is loudly advertised:
+When `EVALGUARD_API_KEY` is empty, the server **refuses to boot**
+unless the operator also sets `EVALGUARD_OPEN_MODE=1` AND the bind
+host is loopback (`127.0.0.1` or `::1`).  Open mode + `*` CORS is
+refused too — the combo is too easy to deploy to prod by mistake.
+Open mode is loudly advertised:
 
-- A startup log warning.
+- Startup log warning.
 - `GET /v1/health` returns `"mode": "open"`.
+
+## Gateway use (Phase PROXY)
+
+The server is also a record-as-you-go LLM gateway.  Point your
+app's OpenAI base URL at `POST /v1/projects/{slug}/invoke` and the
+proxy:
+
+1. Loads the project's latest pushed `evalguard.yaml` (`/v1/projects/{slug}/config`).
+2. Fires the request at the configured provider with the same SDK
+   pass-through every other path uses.
+3. Scores the response against the project's evaluators (heuristics
+   / metrics / judges).
+4. Records the call as one row of the day's lazy-created live run
+   (`run_id = run_live_<sha256(project_id|date)[:16]>`,
+   `source = 'live'`), one event of the per-run audit chain
+   (`event_rows`), and one increment of the cost meter.
+5. Returns the model's output.
+
+A failing provider call still records (`provider.failed` event,
+empty output) and bubbles up as 502.  Rate-limit exhaustion
+(`429`) and cost-cap exhaustion (`402`) are both recorded as
+audit events so the operator can reconstruct why a particular
+minute lost traffic.
+
+### Quotas
+
+`quotas.py` enforces two limits, both configurable per-project in
+the pushed YAML:
+
+| YAML key | Default | Behaviour |
+|---|---|---|
+| `rate_limit_per_minute` | unbounded | Sliding-window per API key; `429` on exhaustion (`Retry-After` header carries the seconds-to-reset). |
+| `cost_cap_usd_daily`    | unbounded | Per-project rolling 24h cost; `402` on exhaustion. |
+
+```yaml
+# evalguard.yaml fragment a tenant pushes via /v1/projects/{slug}/config
+rate_limit_per_minute: 600
+cost_cap_usd_daily: 50.00
+```
 
 ## Operations
 
@@ -243,17 +313,18 @@ default tenancy provisioned).
 
 ## What's NOT in scope (yet)
 
-- **Next.js UI** — separate package (Phase 2 part 2).
-- **Postgres** — the `DATABASE_URL` env var is the seam; the SQLite
-  schema mirrors the eventual Postgres tables 1:1.
 - **Async workers (Arq + Redis)** — synchronous POST is sufficient
   for the ingest workload; async queues land when long-running tasks
   appear (re-evaluation, drift recomputation, etc.).
-- **OIDC / SCIM / RBAC** — single shared bearer for now. The
-  `api_keys` table is reserved for per-org keys (Phase 2.5).
+- **OIDC / SAML / SCIM** — per-org API keys + scopes cover the
+  shipped multi-tenant story.  Federated identity lives on the
+  enterprise tier.
 - **Hash-chain verification on ingest** — the chain is for at-rest
-  tamper detection; HTTPS handles transit. Server-side re-verification
-  on read lands when the audit-export endpoint does.
+  tamper detection; HTTPS handles transit.  Server-side
+  re-verification on read is available via `/audit/verify`.
+- **Cursor pagination on `/audit/verify`** — chains beyond the
+  500-event verify cap return 413; the verify path refuses rather
+  than reporting `ok=true` for a visible prefix.
 - **Run mutation** — runs are immutable artifacts.
 - **`apps/api/ee/`** enterprise modules under ELv2 — Phase 5.
 
