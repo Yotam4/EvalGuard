@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
@@ -113,7 +113,18 @@ function DriftSection({
   baselineId: string | null;
 }) {
   const router  = useRouter();
-  const [draft, setDraft] = useState<string>("");
+  // Round-8 review-pass: controlled input so the "clear" link
+  // ACTUALLY clears the field.  The previous ``defaultValue`` made
+  // the input uncontrolled — Next's client-side navigation after
+  // clicking "clear" stripped ``?baseline=`` from the URL but the
+  // DOM input kept its stale value, and pressing Compare re-applied
+  // the just-cleared baseline.  Sync ``draft`` to ``baselineId``
+  // whenever the URL changes so external changes (clear link, back
+  // button, paste-link) update the field.
+  const [draft, setDraft] = useState<string>(baselineId ?? "");
+  useEffect(() => {
+    setDraft(baselineId ?? "");
+  }, [baselineId]);
 
   function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -133,10 +144,10 @@ function DriftSection({
         <input
           id="drift-baseline"
           name="baseline"
-          defaultValue={baselineId ?? ""}
+          value={draft}
           onChange={(e) => setDraft(e.target.value)}
           placeholder="run_xxxxxxxx"
-          className="flex-1 rounded border border-[var(--color-border)] bg-[var(--color-bg-card)] px-2 py-1 font-mono text-xs"
+          className="flex-1 rounded border border-[var(--color-border)] bg-[var(--color-bg)] px-2 py-1 font-mono text-xs"
         />
         <button
           type="submit"

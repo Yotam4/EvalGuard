@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useState } from "react";
+import { Suspense } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
@@ -40,7 +40,19 @@ function RunsList() {
   const source: SourceFilter =
     rawSource === "cli" || rawSource === "otlp" ? rawSource : null;
 
-  const [project, setProject] = useState("");
+  // Round-8 review-pass: ``project`` lives on the URL so deep-links
+  // from /projects and /assets ("view runs for this project") survive
+  // navigation, reloads are stable, and the filter is shareable.
+  // The previous ``useState("")`` orphaned every incoming
+  // ``?project=<slug>`` link — the table rendered ALL runs instead
+  // of the project-scoped subset the linking page promised.
+  const project = params.get("project") ?? "";
+  function setProject(next: string) {
+    const qs = new URLSearchParams(params);
+    if (next) qs.set("project", next);
+    else      qs.delete("project");
+    router.replace(qs.toString() ? `/runs/?${qs}` : "/runs/");
+  }
 
   const q = useQuery({
     queryKey: ["runs", project, source],

@@ -2,7 +2,7 @@
 
 import { Suspense, useState } from "react";
 import Link from "next/link";
-import { useSearchParams } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
 
 import { Card } from "@/components/Card";
@@ -45,9 +45,22 @@ const KINDS: { value: AssetKind; label: string }[] = [
 
 
 function Inner() {
+  const router = useRouter();
   const params = useSearchParams();
-  const initialKind = (params.get("kind") as AssetKind | null) ?? "dataset";
-  const [kind, setKind] = useState<AssetKind>(initialKind);
+  // Round-8 review-pass: the page comment promises ``Query string
+  // drives the kind so deep-links work and the back button restores
+  // state``.  The previous ``useState`` only SEEDED from the URL
+  // once and never wrote back, so the comment lied — reload reverted
+  // to the seed, the back button didn't undo tab switches, and a
+  // user couldn't share a curated tab selection.  Derive on every
+  // render + write through to the URL on change.
+  const rawKind = params.get("kind") as AssetKind | null;
+  const kind: AssetKind = rawKind ?? "dataset";
+  function setKind(next: AssetKind) {
+    const qs = new URLSearchParams(params);
+    qs.set("kind", next);
+    router.replace(`/assets/?${qs}`);
+  }
   const [project, setProject] = useState("");
 
   const q = useQuery({

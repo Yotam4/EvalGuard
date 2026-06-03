@@ -21,6 +21,14 @@
 html, body {
   background: var(--color-bg);
   color: var(--color-fg);
+  /* Declare the document's color scheme so the browser draws native
+     widgets (checkboxes, <select> dropdowns, scrollbars, autofill
+     backgrounds) in dark chrome.  Without this declaration browsers
+     default to light-mode controls, which render as bright squares
+     on top of our dark surfaces — unreadable, and a visual bug a
+     user catches the first time they tick a select-all checkbox on
+     /golden or open the org dropdown on /keys. */
+  color-scheme: dark;
   font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
 

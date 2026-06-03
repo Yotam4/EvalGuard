@@ -6,6 +6,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { Card } from "@/components/Card";
+import { ConfirmButton } from "@/components/ConfirmButton";
 import { ConnectionGate } from "@/components/ConnectionGate";
 import { GoldenRowPreview } from "@/components/GoldenRowPreview";
 import {
@@ -243,20 +244,21 @@ function Body({ projectSlug }: { projectSlug: string }) {
             >
               Download selected ({selected.size})
             </button>
-            <button
-              type="button"
-              data-testid="golden-remove-selected"
-              onClick={() => {
-                // ``removeOne`` removes each id from ``selected`` only
-                // on its own success — a failed delete (403 / 500)
-                // stays selected so the user can retry just the
-                // failures rather than losing the whole selection.
+            {/* Round-8 review-pass: a fat-finger click on bulk remove
+                previously nuked the whole selection with no undo.
+                Wrap in ConfirmButton (same two-click guard the
+                single-row destructive paths use elsewhere — keys
+                revoke, project delete) so the operator has to click
+                twice within 4s.  ``removeOne`` still removes ids from
+                ``selected`` only on each delete's own success, so a
+                failed delete (403 / 500) stays selected for retry. */}
+            <ConfirmButton
+              label={`Remove selected (${selected.size})`}
+              confirmLabel={`Click again to remove ${selected.size}`}
+              onConfirm={() => {
                 selectedCandidates.forEach((c) => removeOne(c.id));
               }}
-              className="rounded border border-[var(--color-border)] px-3 py-1 text-xs text-[var(--color-fail)] hover:bg-[var(--color-bg-row)]"
-            >
-              Remove selected ({selected.size})
-            </button>
+            />
           </>
         )}
       </div>
