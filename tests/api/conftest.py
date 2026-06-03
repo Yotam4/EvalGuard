@@ -69,6 +69,13 @@ def client(settings: Settings) -> TestClient:
 
 @pytest.fixture
 def open_client(open_settings: Settings) -> TestClient:
+    # Round-7 review-pass: mirror the ``client`` fixture's
+    # ``reset_rate_limiter()`` so an open-mode test running after a
+    # ``client`` test that exhausted the per-key quota doesn't
+    # silently start at the cap.  Same per-test isolation contract
+    # the auth-mode fixture has.
+    from evalguard_api.quotas import reset_rate_limiter
+    reset_rate_limiter()
     app = build_app(settings=open_settings)
     with TestClient(app) as c:
         yield c

@@ -492,6 +492,210 @@ def test_chain_root_partial_unique_index_blocks_double_first_event(client, auth_
     )
 
 
+# ---------------------------------------------------------------------------
+# Corrupt rows + verify cap + retry exhaustion
+# Round-7 review-pass: cover the three remaining audit edges that
+# the round-5 ultra-review fixes added (corrupt_rows, 413-on-verify,
+# RuntimeError on retry exhaustion) but had no end-to-end tests for.
+
+
+def test_corrupt_event_json_surfaces_via_corrupt_rows_and_fails_verify(
+    client, auth_headers,
+):
+    """A row whose ``event_json`` column won't JSON-decode must be:
+    1. Counted in ``/audit/events`` ``corrupt_rows`` (not silently
+       dropped — operators have to KNOW the chain has gaps).
+    2. Surfaced as ``ok=False`` from ``/audit/verify`` with a reason
+       that names the corruption (so the operator doesn't read an
+       ``ok=True`` on the visible prefix and assume the chain is clean).
+    """
+    from sqlalchemy import text
+    _push_paid_config(client, auth_headers)
+    _invoke(client, auth_headers, "good1")
+    r = _invoke(client, auth_headers, "good2")
+    run_id = r.json()["run_id"]
+
+    engine = client.app.state.engine
+    with engine.begin() as conn:
+        project_id = conn.execute(
+            text("SELECT project_id FROM runs WHERE run_id = :rid"),
+            {"rid": run_id},
+        ).scalar()
+        # Inject a row whose event_json is not valid JSON.  Use a
+        # unique prev_event_hash so the (run_id, prev_event_hash)
+        # UNIQUE doesn't fire.  This is the exact malformed-row
+        # shape ``list_events_for_run`` catches in its except branch.
+        conn.execute(
+            text("""INSERT INTO event_rows(
+                      event_id, run_id, project_id,
+                      kind, actor_id, actor_type,
+                      prev_event_hash, event_hash,
+                      event_json, ingested_at)
+                    VALUES (
+                      'evt_corrupt_x', :rid, :pid,
+                      'provider.called', 'k', 'api_key',
+                      'unique_prev_for_corrupt_row', 'fake_event_hash',
+                      'this is not json', '2026-06-02T05:00:00')"""),
+            {"rid": run_id, "pid": project_id},
+        )
+
+    events_body = client.get(
+        f"/v1/projects/default/audit/events?run_id={run_id}",
+        headers=auth_headers,
+    ).json()
+    assert events_body["corrupt_rows"] == 1, (
+        f"expected 1 corrupt row, got {events_body['corrupt_rows']}"
+    )
+    # total counts ALL rows (corrupt + clean); the 2 real events
+    # plus the malformed one we just injected.
+    assert events_body["total"] == 3
+    # The DECODABLE prefix is what landed in ``events``.
+    assert events_body["count"] == 2
+
+    v = client.get(
+        f"/v1/projects/default/audit/verify?run_id={run_id}",
+        headers=auth_headers,
+    ).json()
+    assert v["ok"] is False
+    # ``events`` on the verify response is the FULL row count (per
+    # the round-7 fix in audit.py), not just the decodable prefix.
+    assert v["events"] == 3
+    assert "corrupt" in v["reason"].lower()
+
+
+def test_verify_refuses_chains_beyond_events_max_with_413(
+    client, auth_headers,
+):
+    """``/audit/verify`` MUST refuse rather than silently truncate
+    when the chain exceeds the per-page cap.  Reporting ``ok=True``
+    on the first 500 events of a longer chain would mislead the
+    operator into believing the whole chain is intact.  ``/audit/
+    events`` keeps its silent cap but flips ``truncated=True`` so the
+    caller can iterate."""
+    from sqlalchemy import text
+    _push_paid_config(client, auth_headers)
+    r = _invoke(client, auth_headers, "seed")
+    run_id = r.json()["run_id"]
+
+    engine = client.app.state.engine
+    # The route's cap is 500.  Inject 500 dummy rows past the 1 real
+    # one to push the total to 501.  Each row needs a unique
+    # ``prev_event_hash`` per the composite UNIQUE; the actual chain
+    # links don't matter here — we're testing the count gate, not
+    # verify's hash walk.
+    with engine.begin() as conn:
+        project_id = conn.execute(
+            text("SELECT project_id FROM runs WHERE run_id = :rid"),
+            {"rid": run_id},
+        ).scalar()
+        rows = [
+            {
+                "eid": f"evt_dummy_{i}",
+                "rid": run_id,
+                "pid": project_id,
+                "prev": f"dummy_prev_{i}",
+                "hash": f"dummy_hash_{i}",
+                "json_blob": '{"placeholder": true}',
+            }
+            for i in range(500)
+        ]
+        conn.execute(
+            text("""INSERT INTO event_rows(
+                      event_id, run_id, project_id,
+                      kind, actor_id, actor_type,
+                      prev_event_hash, event_hash,
+                      event_json, ingested_at)
+                    VALUES (
+                      :eid, :rid, :pid,
+                      'provider.called', 'k', 'api_key',
+                      :prev, :hash,
+                      :json_blob, '2026-06-02T05:00:00')"""),
+            rows,
+        )
+
+    v = client.get(
+        f"/v1/projects/default/audit/verify?run_id={run_id}",
+        headers=auth_headers,
+    )
+    assert v.status_code == 413, (
+        f"expected 413 (chain exceeds cap); got {v.status_code}: {v.text[:200]}"
+    )
+    assert "cap" in v.json()["detail"].lower()
+
+    # The LIST endpoint silently caps + signals truncation rather
+    # than refusing — operators iterating chains in pages need this
+    # to work (cursor pagination is the future fix).
+    events_body = client.get(
+        f"/v1/projects/default/audit/events?run_id={run_id}&limit=500",
+        headers=auth_headers,
+    ).json()
+    assert events_body["count"] == 500
+    assert events_body["total"] == 501
+    assert events_body["truncated"] is True
+
+
+def test_emit_event_runtime_error_on_retry_exhaustion(
+    client, auth_headers, monkeypatch,
+):
+    """If every INSERT loses the chain-tip race for the bounded
+    retry budget, ``emit_event`` must surface a ``RuntimeError``
+    rather than silently dropping the event.  This is the only
+    audited fail-loud path for an exhausted-retry condition; without
+    a regression here a future refactor could silently swallow the
+    failure (returning None or last_err.detail) and the chain would
+    stop growing without anyone noticing.
+
+    Forces exhaustion by monkeypatching ``chain_tip_for_run`` to
+    always return ``None``.  After the first legitimate event lands
+    (prev=NULL), the partial unique index ``WHERE prev_event_hash IS
+    NULL`` rejects every subsequent NULL-prev INSERT → IntegrityError
+    on each retry → loop exits via ``RuntimeError``."""
+    import pytest
+    from sqlalchemy import text as _text
+    from evalguard_api import audit_persistence
+
+    _push_paid_config(client, auth_headers)
+    r = _invoke(client, auth_headers, "seed")
+    run_id = r.json()["run_id"]
+
+    engine = client.app.state.engine
+    with engine.connect() as conn:
+        project_id = conn.execute(
+            _text("SELECT project_id FROM runs WHERE run_id = :rid"),
+            {"rid": run_id},
+        ).scalar()
+
+    # Patch the chain-tip read so every retry sees the same stale
+    # (None) tip → every INSERT lands a duplicate NULL-prev row →
+    # partial unique index slams them all.
+    monkeypatch.setattr(
+        audit_persistence, "chain_tip_for_run", lambda c, r: None,
+    )
+
+    with engine.begin() as conn:
+        with pytest.raises(RuntimeError, match=r"lost \d+ retries"):
+            audit_persistence.emit_event(
+                conn,
+                kind="provider.called",
+                run_id=run_id,
+                project_id=project_id,
+                actor_id="bootstrap",
+                actor_type="api_key",
+            )
+
+    # Sanity: no spurious row landed.  The one legitimate event
+    # from _invoke + nothing from the exhausted retries.
+    with engine.connect() as conn:
+        total = conn.execute(
+            _text("SELECT COUNT(*) FROM event_rows WHERE run_id = :rid"),
+            {"rid": run_id},
+        ).scalar_one()
+    assert total == 1, (
+        f"emit_event leaked {total - 1} row(s) past the RuntimeError; "
+        "the SAVEPOINT must roll back every failed INSERT"
+    )
+
+
 def test_emit_event_rejects_mismatched_project_id(client, auth_headers):
     """Round-5 ultra-review (Correctness J + Security G): the
     ``project_id`` argument to ``emit_event`` must match the

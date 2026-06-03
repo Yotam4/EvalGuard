@@ -4,13 +4,20 @@ from __future__ import annotations
 
 
 def test_health_returns_ok_with_auth_mode(client):
+    # Round-7 review-pass: anchor ``version`` against the actual
+    # package metadata, not just "truthy".  A regression that hard-
+    # coded the version (e.g. ``"unknown"``) or dropped it to a
+    # placeholder would slip past ``assert body["version"]`` but
+    # surface here.
+    from evalguard_api import __version__
+
     r = client.get("/v1/health")
     assert r.status_code == 200
     body = r.json()
     assert body["status"] == "ok"
     assert body["mode"] == "auth"
     assert body["db"] == "sqlite"
-    assert body["version"]
+    assert body["version"] == __version__
 
 
 def test_health_advertises_open_mode_when_no_key_configured(open_client):

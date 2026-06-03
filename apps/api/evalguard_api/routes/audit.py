@@ -148,9 +148,17 @@ def verify_audit_chain(
         # Don't pretend a chain with corrupt rows verified — the
         # gap is real even if the prefix walks cleanly.  Surface
         # via ``ok=False`` + a structured reason.
+        #
+        # Round-7 review-pass: ``events`` reports the FULL DB row
+        # count (corrupt + clean), not just the decodable ones.
+        # A caller seeing ``ok=False, events=312`` previously had
+        # no way to tell whether the chain was 312 rows (all
+        # corrupt would mean 0 here) or 320 rows with 8 corrupt.
+        # Reporting ``total`` aligns the field with the same
+        # number the list endpoint surfaces via its ``total`` field.
         return AuditVerifyResponse(
             ok=False,
-            events=len(events),
+            events=total,
             broken_at=None,
             reason=(
                 f"chain has {corrupt} corrupt event_json row(s); "

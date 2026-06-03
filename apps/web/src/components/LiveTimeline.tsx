@@ -55,7 +55,24 @@ export function LiveTimeline({
     enabled: (timeline.data?.entries.length ?? 1) > 0,
   });
 
-  if (timeline.isPending) return null;   // silent on first paint
+  if (timeline.isPending) {
+    // Round-7 review-pass: render a fixed-height placeholder card
+    // instead of ``null`` to prevent the layout shift the rest of
+    // the page experiences when the strip pops in 100-200 ms after
+    // first paint.  ``h-[140px]`` matches the rendered card
+    // height (header line + bar row + day-labels + padding) so
+    // the calls list below sits in its final position from frame 1.
+    return (
+      <Card>
+        <div
+          data-testid="live-timeline-loading"
+          className="h-[140px] animate-pulse text-sm text-[var(--color-fg-muted)]"
+        >
+          Loading live timeline…
+        </div>
+      </Card>
+    );
+  }
   const entries = timeline.data?.entries ?? [];
   if (entries.length === 0) return null; // batch-only project — skip
 

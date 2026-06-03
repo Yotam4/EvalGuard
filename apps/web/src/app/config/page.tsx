@@ -9,6 +9,7 @@ import { Badge } from "@/components/Badge";
 import { Card } from "@/components/Card";
 import { ConnectionGate } from "@/components/ConnectionGate";
 import {
+  ApiError,
   getLatestProjectConfig, getProjectConfigHistory, getProjectConfigRevision,
   pushProjectConfig,
   type ProjectConfig, type ProjectConfigSummary,
@@ -131,8 +132,12 @@ function EditorPanel({
       } catch (e) {
         // 404 on "no config pushed yet" is an empty-state, not an
         // error — surface it as ``null`` so the editor renders the
-        // first-push UX instead of an error toast.
-        if (e instanceof Error && /not found/i.test(e.message)) return null;
+        // first-push UX instead of an error toast.  Round-7 review-
+        // pass: match by HTTP status, not a regex on the detail
+        // string.  A future server change to the 404 wording (or a
+        // localised "Not found" → "Introuvable") would silently
+        // demote a real 404 into a thrown error otherwise.
+        if (e instanceof ApiError && e.status === 404) return null;
         throw e;
       }
     },
@@ -193,8 +198,29 @@ function EditorPanel({
       qc.invalidateQueries({ queryKey: ["config", project] });
       qc.invalidateQueries({ queryKey: ["config-history", project] });
     },
-    onError: (e) => setPushError(e instanceof Error ? e.message : String(e)),
+    onError: (e) => {
+      // Round-7 review-pass: use the server's clean ``detail``
+      // string when it's an ApiError (e.g. a 422 with multi-line
+      // YAML parse output like "Line 14, column 3: …").  Falling
+      // back to ``message`` produced ``"422: detail"`` collapsed
+      // onto one line — unreadable for structured YAML errors.
+      if (e instanceof ApiError) setPushError(e.detail);
+      else if (e instanceof Error) setPushError(e.message);
+      else setPushError(String(e));
+    },
   });
+
+  // Round-7 review-pass: clear the "Saved · sha256 …" confirmation
+  // chip ~10s after the save lands.  Without this the chip persists
+  // forever (until the next mutation or page reload), so an operator
+  // returning to the tab tomorrow sees a stale "Saved" indicator
+  // attached to a draft they haven't touched.  ``m.reset()`` returns
+  // the mutation to idle so ``m.isSuccess`` flips back to false.
+  useEffect(() => {
+    if (!m.isSuccess) return;
+    const t = setTimeout(() => m.reset(), 10_000);
+    return () => clearTimeout(t);
+  }, [m.isSuccess, m]);
 
   if (q.isPending) {
     return (
@@ -246,13 +272,19 @@ function EditorPanel({
         className="block w-full resize-y rounded border border-[var(--color-border)] bg-[var(--color-bg-card)] p-2 font-mono text-xs leading-tight text-[var(--color-fg)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--color-accent)]"
       />
       {pushError && (
-        <p
+        // Round-7 review-pass: ``<pre>`` + whitespace-pre-wrap so a
+        // multi-line YAML parse error (line/column markers, the
+        // server's structured 422 message) renders readably.  A
+        // plain ``<p>`` was collapsing newlines and producing
+        // unreadable run-on strings for the common ``yaml.YAMLError``
+        // case.  ``font-mono`` keeps line/column alignment intact.
+        <pre
           data-testid="config-push-error"
           role="alert"
-          className="mt-2 rounded border border-[var(--color-fail)] bg-[var(--color-bg-row)] p-2 text-xs text-[var(--color-fail)]"
+          className="mt-2 whitespace-pre-wrap break-words rounded border border-[var(--color-fail)] bg-[var(--color-bg-row)] p-2 font-mono text-xs text-[var(--color-fail)]"
         >
           {pushError}
-        </p>
+        </pre>
       )}
       <div className="mt-3 flex items-center gap-3">
         <button
@@ -311,8 +343,10 @@ function HistoryPanel({
     );
   }
   // 404 on a brand-new project is fine — the editor handles the
-  // empty state.  Surface other errors loudly.
-  if (q.error && !/not found/i.test((q.error as Error).message ?? "")) {
+  // empty state.  Surface other errors loudly.  Round-7 review-pass:
+  // match by HTTP status so a server wording change (or a localised
+  // detail) doesn't silently swallow a real error.
+  if (q.error && !(q.error instanceof ApiError && q.error.status === 404)) {
     return (
       <Card>
         <p className="text-sm text-[var(--color-fail)]">
