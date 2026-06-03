@@ -1,23 +1,29 @@
 /**
- * Reusable tab strip with proper ARIA semantics + keyboard navigation.
+ * Reusable tab/radiogroup strip with keyboard navigation.
  *
- * The previous ad-hoc tab strips in ``/runs/`` and ``/assets/`` used
- * ``aria-pressed`` (the toggle-button pattern) and had no keyboard
- * support, which is wrong for what behaves like a single-select
- * filter.  This component implements the ARIA Authoring Practices
- * tabs pattern:
+ * Two ARIA flavours via the ``variant`` prop:
  *
- *   - ``role="tablist"`` on the container, ``role="tab"`` on each button
- *   - ``aria-selected`` (not ``aria-pressed``)
- *   - Roving tabindex (active tab is ``tabIndex=0``, others ``-1``)
- *   - ArrowLeft / ArrowRight cycle focus + selection
- *   - Home / End jump to first / last
+ * - ``variant="tabs"`` — proper W3C tabs pattern (``role=tablist`` +
+ *   ``role=tab`` + ``aria-selected``).  Use only when the tabs reveal
+ *   a ``tabpanel``.
  *
- * Generic over the option value type so it works for both the
- * source filter (``null | "cli" | "otlp"``) and the asset kind
- * filter (``AssetKind``) without runtime casts.
+ * - ``variant="radiogroup"`` (default) — single-select filter
+ *   semantics (``role=radiogroup`` + ``role=radio`` + ``aria-checked``).
+ *   Round-8 review-pass: the previous tablist-only API was wrong for
+ *   filter usage on /runs and /assets — screen readers announced
+ *   "tab, 1 of N" and looked for an ``aria-controls``'d region that
+ *   doesn't exist.  /calls had already switched to a hand-rolled
+ *   radiogroup; this consolidates the pattern.
+ *
+ * Both variants share roving tabindex + ArrowLeft/Right + Home/End
+ * keyboard support.
+ *
+ * Generic over the option value type so it works for the source
+ * filter (``null | "cli" | "otlp"``) and the asset kind filter
+ * (``AssetKind``) without runtime casts.
  *
  * Reference: https://www.w3.org/WAI/ARIA/apg/patterns/tabs/
+ *            https://www.w3.org/WAI/ARIA/apg/patterns/radio/
  */
 
 "use client";
@@ -40,20 +46,27 @@ export function Tabs<T>({
   ariaLabel,
   testid,
   dataAttrName,
+  variant = "radiogroup",
 }: {
   value: T;
   onChange: (v: T) => void;
   tabs: TabSpec<T>[];
-  /** Required for screen readers — names the group of tabs (e.g.
+  /** Required for screen readers — names the group (e.g.
    *  "Filter runs by source"). */
   ariaLabel: string;
-  /** Optional ``data-testid`` on the tablist root. */
+  /** Optional ``data-testid`` on the container. */
   testid?: string;
   /** Name of the per-button ``data-*`` attribute (e.g. ``"source-tab"``
    *  → ``data-source-tab="otlp"``).  When omitted the attribute is
    *  skipped. */
   dataAttrName?: string;
+  /** ``radiogroup`` (default) for single-select filters,
+   *  ``tabs`` when the component reveals a ``tabpanel``. */
+  variant?: "tabs" | "radiogroup";
 }) {
+  const isTabs   = variant === "tabs";
+  const groupRole = isTabs ? "tablist" : "radiogroup";
+  const itemRole  = isTabs ? "tab"     : "radio";
   // One ref per tab so the keyboard handler can ``focus()`` the
   // sibling that should receive focus on Arrow.  Using a ref array
   // (not a callback ref map) because the tab count is stable for
@@ -99,7 +112,7 @@ export function Tabs<T>({
 
   return (
     <div
-      role="tablist"
+      role={groupRole}
       aria-label={ariaLabel}
       data-testid={testid}
       onKeyDown={onKeyDown}
@@ -107,18 +120,22 @@ export function Tabs<T>({
     >
       {tabs.map((t, i) => {
         const active = i === activeIndex;
-        const extra: Record<string, string> = {};
+        const extra: Record<string, string | boolean> = {};
         if (dataAttrName && t.dataAttr !== undefined) {
           extra[`data-${dataAttrName}`] = t.dataAttr;
         }
+        // ``aria-selected`` for tabs, ``aria-checked`` for radios.
+        // Setting BOTH would be technically valid but redundant; SRs
+        // pick the matching one for the parent role.
+        if (isTabs) extra["aria-selected"] = active;
+        else        extra["aria-checked"]  = active;
         return (
           <button
             key={t.label}
             ref={(el) => { buttonRefs.current[i] = el; }}
             type="button"
-            role="tab"
-            aria-selected={active}
-            // Roving tabindex — only the active tab is in the
+            role={itemRole}
+            // Roving tabindex — only the active item is in the
             // page's tab order, the rest are reachable via Arrow.
             tabIndex={active ? 0 : -1}
             onClick={() => onChange(t.value)}

@@ -222,6 +222,26 @@ function EditorPanel({
     return () => clearTimeout(t);
   }, [m.isSuccess, m]);
 
+  // Round-8 review-pass: warn before tab close / hard reload when the
+  // editor has unsaved bytes.  Without this an operator paste-and-
+  // walk-away loses the entire draft to a stray ⌘W with no recourse
+  // (the server has no auto-save and the textarea isn't persisted to
+  // local storage).  Client-side route changes within the SPA are
+  // handled by the ``lastSyncedRevIdRef`` anti-clobber upstream — this
+  // guard covers the browser-level exit only.
+  useEffect(() => {
+    if (!dirty) return;
+    function onBeforeUnload(e: BeforeUnloadEvent) {
+      // Modern browsers ignore the custom string and show their own
+      // dialog, but ``preventDefault`` + ``returnValue`` are still
+      // required to opt into the prompt at all.
+      e.preventDefault();
+      e.returnValue = "";
+    }
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [dirty]);
+
   if (q.isPending) {
     return (
       <Card>
@@ -269,7 +289,7 @@ function EditorPanel({
           setPushError(null);
         }}
         rows={24}
-        className="block w-full resize-y rounded border border-[var(--color-border)] bg-[var(--color-bg-card)] p-2 font-mono text-xs leading-tight text-[var(--color-fg)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--color-accent)]"
+        className="block w-full resize-y rounded border border-[var(--color-border)] bg-[var(--color-bg)] p-2 font-mono text-xs leading-tight text-[var(--color-fg)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--color-accent)]"
       />
       {pushError && (
         // Round-7 review-pass: ``<pre>`` + whitespace-pre-wrap so a

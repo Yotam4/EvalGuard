@@ -15,8 +15,15 @@ function makeTabs(): TabSpec<T>[] {
 }
 
 
-describe("<Tabs>", () => {
-  it("renders a tablist with one tab per spec", () => {
+describe("<Tabs> — radiogroup (default, used for filters)", () => {
+  // Round-8 review-pass: the default variant flipped from "tabs" to
+  // "radiogroup" because every in-repo caller (/runs source filter,
+  // /assets kind filter) is a single-select filter, NOT a tab strip
+  // revealing a tabpanel.  ``role="tab"`` without an ``aria-controls``
+  // panel made screen readers announce "tab, 1 of N" and look for a
+  // region that doesn't exist.
+
+  it("renders a radiogroup with one radio per spec", () => {
     render(
       <Tabs<T>
         value="all"
@@ -25,15 +32,12 @@ describe("<Tabs>", () => {
         ariaLabel="Filter by source"
       />,
     );
-    expect(screen.getByRole("tablist", { name: /filter by source/i }))
+    expect(screen.getByRole("radiogroup", { name: /filter by source/i }))
       .toBeInTheDocument();
-    expect(screen.getAllByRole("tab")).toHaveLength(3);
+    expect(screen.getAllByRole("radio")).toHaveLength(3);
   });
 
-  it("uses aria-selected (not aria-pressed) on the active tab", () => {
-    // The audit specifically flagged the previous ``aria-pressed``
-    // semantic as wrong for tabs — pin the new shape so a refactor
-    // can't regress.
+  it("uses aria-checked (not aria-selected, not aria-pressed) on the active item", () => {
     render(
       <Tabs<T>
         value="cli"
@@ -42,20 +46,17 @@ describe("<Tabs>", () => {
         ariaLabel="Filter by source"
       />,
     );
-    const cli  = screen.getByRole("tab", { name: /cli push/i });
-    const otlp = screen.getByRole("tab", { name: /otlp traces/i });
-    expect(cli.getAttribute("aria-selected")).toBe("true");
-    expect(otlp.getAttribute("aria-selected")).toBe("false");
-    // aria-pressed must NOT appear — it would confuse screen
-    // readers into announcing the tabs as toggle buttons.
+    const cli  = screen.getByRole("radio", { name: /cli push/i });
+    const otlp = screen.getByRole("radio", { name: /otlp traces/i });
+    expect(cli.getAttribute("aria-checked")).toBe("true");
+    expect(otlp.getAttribute("aria-checked")).toBe("false");
+    // The legacy attributes must NOT appear — they would confuse
+    // screen readers into announcing the wrong pattern.
     expect(cli.hasAttribute("aria-pressed")).toBe(false);
-    expect(otlp.hasAttribute("aria-pressed")).toBe(false);
+    expect(cli.hasAttribute("aria-selected")).toBe(false);
   });
 
-  it("uses roving tabindex: active tab is 0, others are -1", () => {
-    // ARIA Authoring Practices pattern — the inactive tabs are
-    // taken out of the page's tab order so Tab key moves past the
-    // whole strip in one step.  Arrow keys move within it.
+  it("uses roving tabindex: active item is 0, others are -1", () => {
     render(
       <Tabs<T>
         value="otlp"
@@ -64,13 +65,13 @@ describe("<Tabs>", () => {
         ariaLabel="Filter by source"
       />,
     );
-    const tabs = screen.getAllByRole("tab");
-    expect(tabs.map((t) => t.getAttribute("tabindex"))).toEqual([
-      "-1", "-1", "0",   // only the active OTLP tab is reachable via Tab
+    const radios = screen.getAllByRole("radio");
+    expect(radios.map((t) => t.getAttribute("tabindex"))).toEqual([
+      "-1", "-1", "0",   // only the active OTLP option is reachable via Tab
     ]);
   });
 
-  it("calls onChange when a tab is clicked", () => {
+  it("calls onChange when a radio is clicked", () => {
     const onChange = vi.fn();
     render(
       <Tabs<T>
@@ -80,11 +81,11 @@ describe("<Tabs>", () => {
         ariaLabel="Filter by source"
       />,
     );
-    fireEvent.click(screen.getByRole("tab", { name: /otlp traces/i }));
+    fireEvent.click(screen.getByRole("radio", { name: /otlp traces/i }));
     expect(onChange).toHaveBeenCalledWith("otlp");
   });
 
-  it("ArrowRight moves selection to the next tab (with wrap)", () => {
+  it("ArrowRight moves selection to the next item (with wrap)", () => {
     const onChange = vi.fn();
     render(
       <Tabs<T>
@@ -94,18 +95,14 @@ describe("<Tabs>", () => {
         ariaLabel="Filter by source"
       />,
     );
-    // ArrowRight on the tablist — should advance from ``cli`` (idx 1)
-    // to ``otlp`` (idx 2).
     fireEvent.keyDown(
-      screen.getByRole("tablist"),
+      screen.getByRole("radiogroup"),
       { key: "ArrowRight" },
     );
     expect(onChange).toHaveBeenLastCalledWith("otlp");
   });
 
-  it("ArrowLeft wraps from the first tab to the last", () => {
-    // Wrap-around is the standard tab-pattern behaviour and prevents
-    // the focus getting "stuck" at an edge.
+  it("ArrowLeft wraps from the first item to the last", () => {
     const onChange = vi.fn();
     render(
       <Tabs<T>
@@ -116,13 +113,13 @@ describe("<Tabs>", () => {
       />,
     );
     fireEvent.keyDown(
-      screen.getByRole("tablist"),
+      screen.getByRole("radiogroup"),
       { key: "ArrowLeft" },
     );
     expect(onChange).toHaveBeenLastCalledWith("otlp");
   });
 
-  it("Home / End jump to the first / last tab", () => {
+  it("Home / End jump to the first / last item", () => {
     const onChange = vi.fn();
     render(
       <Tabs<T>
@@ -132,10 +129,10 @@ describe("<Tabs>", () => {
         ariaLabel="Filter by source"
       />,
     );
-    const tablist = screen.getByRole("tablist");
-    fireEvent.keyDown(tablist, { key: "End" });
+    const group = screen.getByRole("radiogroup");
+    fireEvent.keyDown(group, { key: "End" });
     expect(onChange).toHaveBeenLastCalledWith("otlp");
-    fireEvent.keyDown(tablist, { key: "Home" });
+    fireEvent.keyDown(group, { key: "Home" });
     expect(onChange).toHaveBeenLastCalledWith("all");
   });
 
@@ -149,9 +146,6 @@ describe("<Tabs>", () => {
         dataAttrName="source-tab"
       />,
     );
-    // Pin the exact attribute name so Playwright selectors keep
-    // working (the /runs/ spec addresses tabs via
-    // ``[data-source-tab="cli"]``).
     expect(
       document.querySelector('[data-source-tab="cli"]'),
     ).not.toBeNull();
@@ -169,10 +163,32 @@ describe("<Tabs>", () => {
         ariaLabel="Filter by source"
       />,
     );
-    // ``dataAttrName`` is optional — when the parent doesn't pass
-    // one, no per-button attribute should land.
     expect(
       document.querySelector('[data-source-tab]'),
     ).toBeNull();
+  });
+});
+
+
+describe("<Tabs variant=\"tabs\"> — real tabs (reveals a tabpanel)", () => {
+  it("renders tablist + tabs with aria-selected when variant=tabs", () => {
+    // Pin the explicit-opt-in tablist semantics so a future caller
+    // wiring up a panel-revealing tab strip gets the right ARIA.
+    render(
+      <Tabs<T>
+        value="cli"
+        onChange={() => {}}
+        tabs={makeTabs()}
+        ariaLabel="Pick a tab"
+        variant="tabs"
+      />,
+    );
+    expect(screen.getByRole("tablist", { name: /pick a tab/i }))
+      .toBeInTheDocument();
+    const tabs = screen.getAllByRole("tab");
+    expect(tabs).toHaveLength(3);
+    const cli = screen.getByRole("tab", { name: /cli push/i });
+    expect(cli.getAttribute("aria-selected")).toBe("true");
+    expect(cli.hasAttribute("aria-checked")).toBe(false);
   });
 });

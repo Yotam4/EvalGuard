@@ -74,7 +74,7 @@ function Inner() {
           data-testid="golden-project-picker"
           value={project}
           onChange={(e) => pick(e.target.value)}
-          className="rounded border border-[var(--color-border)] bg-[var(--color-bg-card)] px-2 py-1 text-sm"
+          className="rounded border border-[var(--color-border)] bg-[var(--color-bg)] px-2 py-1 text-sm"
         >
           <option value="">— select —</option>
           {(projectsQ.data?.projects ?? []).map((p) => (
@@ -113,6 +113,8 @@ function Inner() {
 
 function Body({ projectSlug }: { projectSlug: string }) {
   const qc = useQueryClient();
+  const router = useRouter();
+  const params = useSearchParams();
   const q  = useQuery({
     queryKey: ["golden-candidates", projectSlug, "expanded"],
     // ``expand: row`` so the preview + download have content without
@@ -121,8 +123,27 @@ function Body({ projectSlug }: { projectSlug: string }) {
     refetchOnWindowFocus: false,
   });
 
-  const [filter, setFilter]   = useState("");
-  const [sortKey, setSortKey] = useState<SortKey>("when");
+  // Round-8 review-pass: filter + sort live on the URL so a curated
+  // view ("the 12 refund-related candidates I'm reviewing") is
+  // shareable and survives reload.  Previously both were
+  // ``useState`` — the search box reset on every reload and operators
+  // couldn't link a teammate to the same slice.  ``expand`` stays
+  // local: it changes on every chevron click and would otherwise
+  // thrash the URL bar.
+  const filter = params.get("q") ?? "";
+  const rawSort = params.get("sort");
+  const sortKey: SortKey =
+    rawSort === "reviewer" || rawSort === "row" ? rawSort : "when";
+  function setFilter(next: string) {
+    const qs = new URLSearchParams(params);
+    if (next) qs.set("q", next); else qs.delete("q");
+    router.replace(qs.toString() ? `/golden/?${qs}` : "/golden/");
+  }
+  function setSortKey(next: SortKey) {
+    const qs = new URLSearchParams(params);
+    if (next === "when") qs.delete("sort"); else qs.set("sort", next);
+    router.replace(qs.toString() ? `/golden/?${qs}` : "/golden/");
+  }
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [expandedId, setExpandedId] = useState<number | null>(null);
   const [copiedId, setCopiedId]     = useState<number | null>(null);
@@ -223,7 +244,7 @@ function Body({ projectSlug }: { projectSlug: string }) {
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
           placeholder="filter by row / note / reviewer / content"
-          className="flex-1 rounded border border-[var(--color-border)] bg-[var(--color-bg-card)] px-2 py-1 text-sm"
+          className="flex-1 rounded border border-[var(--color-border)] bg-[var(--color-bg)] px-2 py-1 text-sm"
         />
         <button
           type="button"
@@ -280,6 +301,7 @@ function Body({ projectSlug }: { projectSlug: string }) {
             No candidates match <code className="rounded bg-[var(--color-bg-row)] px-1 py-0.5">{filter}</code>.
           </p>
         ) : (
+          <div className="overflow-x-auto">
           <table className="w-full text-sm">
             <thead className="text-xs uppercase tracking-wide text-[var(--color-fg-muted)]">
               <tr className="border-b border-[var(--color-border)]">
@@ -319,6 +341,7 @@ function Body({ projectSlug }: { projectSlug: string }) {
               ))}
             </tbody>
           </table>
+          </div>
         )}
       </Card>
 

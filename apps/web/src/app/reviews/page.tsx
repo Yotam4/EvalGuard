@@ -67,7 +67,7 @@ function Inner() {
             id="run_id" name="run_id"
             defaultValue={runId ?? ""}
             placeholder="run_xxxxxxxx"
-            className="flex-1 rounded border border-[var(--color-border)] bg-[var(--color-bg-card)] px-2 py-1 font-mono text-xs"
+            className="flex-1 rounded border border-[var(--color-border)] bg-[var(--color-bg)] px-2 py-1 font-mono text-xs"
           />
           <button
             type="submit"
@@ -159,7 +159,18 @@ function ReviewBody({ runId }: { runId: string }) {
               <ReviewItem
                 key={it.row_id}
                 item={it}
-                submitting={submitter.isPending}
+                // Round-8 review-pass: only the row whose verdict is
+                // in flight is "submitting".  Previously
+                // ``submitter.isPending`` was passed flat, so one
+                // pending mutation disabled every other row's submit
+                // — a fast reviewer couldn't queue up the next
+                // verdict while the previous one finalised.
+                // ``mutation.variables`` carries the row_id of the
+                // in-flight call.
+                submitting={
+                  submitter.isPending &&
+                  submitter.variables?.row_id === it.row_id
+                }
                 onSubmit={(verdict, note) =>
                   submitter.mutate({ row_id: it.row_id, verdict, note })
                 }
@@ -191,6 +202,7 @@ function ReviewBody({ runId }: { runId: string }) {
 
 function ReviewsTable({ reviews }: { reviews: Review[] }) {
   return (
+    <div className="overflow-x-auto">
     <table className="w-full text-sm">
       <thead className="text-xs uppercase tracking-wide text-[var(--color-fg-muted)]">
         <tr className="border-b border-[var(--color-border)]">
@@ -219,6 +231,7 @@ function ReviewsTable({ reviews }: { reviews: Review[] }) {
         ))}
       </tbody>
     </table>
+    </div>
   );
 }
 

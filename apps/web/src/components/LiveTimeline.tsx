@@ -190,7 +190,7 @@ function TimelineBar({
             : passRate >= 0.98
               ? "var(--color-pass)"
               : passRate >= 0.9
-                ? "var(--color-warn, #d4a017)"
+                ? "var(--color-warn)"
                 : "var(--color-fail)",
         }}
         aria-label={isEmpty

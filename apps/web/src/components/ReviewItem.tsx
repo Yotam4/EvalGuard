@@ -108,7 +108,7 @@ export function ReviewItem({
           onChange={(e) => setNote(e.target.value)}
           maxLength={4000}
           rows={2}
-          className="w-full rounded border border-[var(--color-border)] bg-[var(--color-bg-card)] px-2 py-1 text-xs"
+          className="w-full rounded border border-[var(--color-border)] bg-[var(--color-bg)] px-2 py-1 text-xs"
         />
         <div className="flex justify-end">
           <button

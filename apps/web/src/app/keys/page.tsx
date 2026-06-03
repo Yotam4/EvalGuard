@@ -8,6 +8,7 @@ import { Badge } from "@/components/Badge";
 import { ConfirmButton } from "@/components/ConfirmButton";
 import { ConnectionGate } from "@/components/ConnectionGate";
 import {
+  ApiError,
   createApiKey, listApiKeys, listOrgs, revokeApiKey,
   type ApiKeyCreated, type ApiKeySummary,
 } from "@/lib/api";
@@ -65,7 +66,12 @@ function Inner() {
       setErrMsg(null);
       qc.invalidateQueries({ queryKey: ["keys"] });
     },
-    onError: (e: Error) => setErrMsg(e.message),
+    // Surface the server's clean ``detail`` (e.g. "Name already in
+    // use") rather than the ``"422: detail"`` collapsed form
+    // ``e.message`` produces.  The config editor already does this
+    // — keys/projects/orgs were the stragglers.
+    onError: (e: Error) =>
+      setErrMsg(e instanceof ApiError ? e.detail : e.message),
   });
 
   const revoke = useMutation({
@@ -149,22 +155,24 @@ function Inner() {
       </Card>
 
       <Card title="Existing keys">
-        {!effectiveOrg && <p className="text-sm text-[var(--color-fg-muted)]">Pick an org above.</p>}
-        {keys.isPending && effectiveOrg && (
-          <p className="text-sm text-[var(--color-fg-muted)]">Loading…</p>
-        )}
-        {keys.error && (
-          <p className="text-sm text-[var(--color-fail)]">
-            {keys.error instanceof Error ? keys.error.message : String(keys.error)}
-          </p>
-        )}
-        {keys.data && (
-          <KeysTable
-            keys={keys.data.keys}
-            onRevoke={(id) => revoke.mutate(id)}
-            revokingId={revoke.isPending ? (revoke.variables ?? null) : null}
-          />
-        )}
+        <div className="min-h-[200px]">
+          {!effectiveOrg && <p className="text-sm text-[var(--color-fg-muted)]">Pick an org above.</p>}
+          {keys.isPending && effectiveOrg && (
+            <p className="text-sm text-[var(--color-fg-muted)]">Loading…</p>
+          )}
+          {keys.error && (
+            <p className="text-sm text-[var(--color-fail)]">
+              {keys.error instanceof Error ? keys.error.message : String(keys.error)}
+            </p>
+          )}
+          {keys.data && (
+            <KeysTable
+              keys={keys.data.keys}
+              onRevoke={(id) => revoke.mutate(id)}
+              revokingId={revoke.isPending ? (revoke.variables ?? null) : null}
+            />
+          )}
+        </div>
       </Card>
     </div>
   );
@@ -244,6 +252,7 @@ function KeysTable({
     return <p className="text-sm text-[var(--color-fg-muted)]">No keys yet.</p>;
   }
   return (
+    <div className="overflow-x-auto">
     <table className="w-full text-sm">
       <thead className="text-xs uppercase tracking-wide text-[var(--color-fg-muted)]">
         <tr className="border-b border-[var(--color-border)]">
@@ -292,5 +301,6 @@ function KeysTable({
         })}
       </tbody>
     </table>
+    </div>
   );
 }

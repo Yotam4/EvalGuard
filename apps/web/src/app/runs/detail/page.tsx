@@ -295,6 +295,7 @@ function TrialsList({ trials }: { trials: Trial[] }) {
 
 function GatesTable({ gates }: { gates: Gate[] }) {
   return (
+    <div className="overflow-x-auto">
     <table className="w-full text-sm">
       <thead className="text-xs uppercase tracking-wide text-[var(--color-fg-muted)]">
         <tr className="border-b border-[var(--color-border)]">
@@ -331,6 +332,7 @@ function GatesTable({ gates }: { gates: Gate[] }) {
         ))}
       </tbody>
     </table>
+    </div>
   );
 }
 
@@ -341,6 +343,7 @@ function AssetsTable({
   assets: NonNullable<RunOut["assets"]>;
 }) {
   return (
+    <div className="overflow-x-auto">
     <table className="w-full text-sm">
       <thead className="text-xs uppercase tracking-wide text-[var(--color-fg-muted)]">
         <tr className="border-b border-[var(--color-border)]">
@@ -365,6 +368,7 @@ function AssetsTable({
         ))}
       </tbody>
     </table>
+    </div>
   );
 }
 

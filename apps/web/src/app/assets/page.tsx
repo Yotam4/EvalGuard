@@ -76,20 +76,22 @@ function Inner() {
           value={project}
           onChange={(e) => setProject(e.target.value)}
           placeholder="filter by project"
-          className="ml-auto rounded border border-[var(--color-border)] bg-[var(--color-bg-card)] px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+          className="ml-auto rounded border border-[var(--color-border)] bg-[var(--color-bg)] px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
         />
       </div>
 
       <KindTabs value={kind} onChange={setKind} />
 
       <Card>
-        {q.isPending && <p className="text-sm text-[var(--color-fg-muted)]">Loading…</p>}
-        {q.error && (
-          <p className="text-sm text-[var(--color-fail)]">
-            {q.error instanceof Error ? q.error.message : String(q.error)}
-          </p>
-        )}
-        {q.data && <AssetsTable kind={kind} assets={q.data.assets} />}
+        <div className="min-h-[200px]">
+          {q.isPending && <p className="text-sm text-[var(--color-fg-muted)]">Loading…</p>}
+          {q.error && (
+            <p className="text-sm text-[var(--color-fail)]">
+              {q.error instanceof Error ? q.error.message : String(q.error)}
+            </p>
+          )}
+          {q.data && <AssetsTable kind={kind} assets={q.data.assets} />}
+        </div>
       </Card>
     </div>
   );

@@ -85,20 +85,26 @@ function RunsList() {
           value={project}
           onChange={(e) => setProject(e.target.value)}
           placeholder="filter by project"
-          className="ml-auto rounded border border-[var(--color-border)] bg-[var(--color-bg-card)] px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+          className="ml-auto rounded border border-[var(--color-border)] bg-[var(--color-bg)] px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
         />
       </div>
 
       <SourceTabs value={source} onChange={setSource} />
 
+      {/* Round-8 review-pass: reserve enough vertical space during
+          the pending state so the table doesn't pop in 100-200ms
+          later and shove the page down.  ``LiveTimeline`` solved
+          this with the same fixed-height skeleton pattern. */}
       <Card>
-        {q.isPending && <p className="text-sm text-[var(--color-fg-muted)]">Loading…</p>}
-        {q.error && (
-          <p className="text-sm text-[var(--color-fail)]">
-            {q.error instanceof Error ? q.error.message : String(q.error)}
-          </p>
-        )}
-        {q.data && <RunsTable runs={q.data.runs} />}
+        <div className="min-h-[200px]">
+          {q.isPending && <p className="text-sm text-[var(--color-fg-muted)]">Loading…</p>}
+          {q.error && (
+            <p className="text-sm text-[var(--color-fail)]">
+              {q.error instanceof Error ? q.error.message : String(q.error)}
+            </p>
+          )}
+          {q.data && <RunsTable runs={q.data.runs} />}
+        </div>
       </Card>
     </div>
   );

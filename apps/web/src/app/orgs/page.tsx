@@ -5,7 +5,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { Card } from "@/components/Card";
 import { ConnectionGate } from "@/components/ConnectionGate";
-import { createOrg, listOrgs, type Org } from "@/lib/api";
+import { ApiError, createOrg, listOrgs, type Org } from "@/lib/api";
 
 /**
  * /orgs — list every visible org and (admin-only) create new ones.
@@ -40,7 +40,8 @@ function Inner() {
       setErrMsg(null);
       qc.invalidateQueries({ queryKey: ["orgs"] });
     },
-    onError: (e: Error) => setErrMsg(e.message),
+    onError: (e: Error) =>
+      setErrMsg(e instanceof ApiError ? e.detail : e.message),
   });
 
   return (
@@ -48,13 +49,15 @@ function Inner() {
       <h1 className="text-xl font-semibold">Organizations</h1>
 
       <Card title="All orgs">
-        {list.isPending && <p className="text-sm text-[var(--color-fg-muted)]">Loading…</p>}
-        {list.error && (
-          <p className="text-sm text-[var(--color-fail)]">
-            {list.error instanceof Error ? list.error.message : String(list.error)}
-          </p>
-        )}
-        {list.data && <OrgsTable orgs={list.data.orgs} />}
+        <div className="min-h-[200px]">
+          {list.isPending && <p className="text-sm text-[var(--color-fg-muted)]">Loading…</p>}
+          {list.error && (
+            <p className="text-sm text-[var(--color-fail)]">
+              {list.error instanceof Error ? list.error.message : String(list.error)}
+            </p>
+          )}
+          {list.data && <OrgsTable orgs={list.data.orgs} />}
+        </div>
       </Card>
 
       <Card title="Create new org (admin)">
@@ -119,27 +122,29 @@ function OrgsTable({ orgs }: { orgs: Org[] }) {
     return <p className="text-sm text-[var(--color-fg-muted)]">No orgs yet.</p>;
   }
   return (
-    <table className="w-full text-sm">
-      <thead className="text-xs uppercase tracking-wide text-[var(--color-fg-muted)]">
-        <tr className="border-b border-[var(--color-border)]">
-          <th className="px-2 py-1.5 text-left font-medium">Slug</th>
-          <th className="px-2 py-1.5 text-left font-medium">Name</th>
-          <th className="px-2 py-1.5 text-left font-medium">Org id</th>
-          <th className="px-2 py-1.5 text-left font-medium">Created</th>
-        </tr>
-      </thead>
-      <tbody>
-        {orgs.map((o) => (
-          <tr key={o.org_id} className="border-b border-[var(--color-border)]">
-            <td className="px-2 py-1.5 font-mono text-xs">{o.slug}</td>
-            <td className="px-2 py-1.5">{o.name}</td>
-            <td className="px-2 py-1.5 font-mono text-xs text-[var(--color-fg-muted)]">{o.org_id}</td>
-            <td className="px-2 py-1.5 text-xs text-[var(--color-fg-muted)]">
-              {new Date(o.created_at).toLocaleString()}
-            </td>
+    <div className="overflow-x-auto">
+      <table className="w-full text-sm">
+        <thead className="text-xs uppercase tracking-wide text-[var(--color-fg-muted)]">
+          <tr className="border-b border-[var(--color-border)]">
+            <th className="px-2 py-1.5 text-left font-medium">Slug</th>
+            <th className="px-2 py-1.5 text-left font-medium">Name</th>
+            <th className="px-2 py-1.5 text-left font-medium">Org id</th>
+            <th className="px-2 py-1.5 text-left font-medium">Created</th>
           </tr>
-        ))}
-      </tbody>
-    </table>
+        </thead>
+        <tbody>
+          {orgs.map((o) => (
+            <tr key={o.org_id} className="border-b border-[var(--color-border)]">
+              <td className="px-2 py-1.5 font-mono text-xs">{o.slug}</td>
+              <td className="px-2 py-1.5">{o.name}</td>
+              <td className="px-2 py-1.5 font-mono text-xs text-[var(--color-fg-muted)]">{o.org_id}</td>
+              <td className="px-2 py-1.5 text-xs text-[var(--color-fg-muted)]">
+                {new Date(o.created_at).toLocaleString()}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 }

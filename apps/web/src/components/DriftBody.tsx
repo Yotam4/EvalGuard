@@ -48,6 +48,7 @@ export function DriftBody({ report }: { report: DriftReport }) {
 
 function DriftTable({ metrics }: { metrics: DriftMetric[] }) {
   return (
+    <div className="overflow-x-auto">
     <table className="w-full text-sm">
       <thead className="text-xs uppercase tracking-wide text-[var(--color-fg-muted)]">
         <tr className="border-b border-[var(--color-border)]">
@@ -86,6 +87,7 @@ function DriftTable({ metrics }: { metrics: DriftMetric[] }) {
         ))}
       </tbody>
     </table>
+    </div>
   );
 }
 
