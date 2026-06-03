@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useEffect, useState } from "react";
+import { Suspense, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -141,16 +141,34 @@ function EditorPanel({
   const [draft, setDraft] = useState<string>("");
   const [dirty, setDirty] = useState<boolean>(false);
   const [pushError, setPushError] = useState<string | null>(null);
+  // PROXY-4 review-pass: track the last revision we synced into the
+  // editor so the effect below can tell "the operator changed the
+  // ``rev=`` param" from "react-query re-fetched the same revision
+  // (e.g. after a save invalidated the latest-config query)".  Only
+  // the former should reset the draft — overwriting on a same-id
+  // re-fetch would silently wipe edits made between save completion
+  // and refetch resolution.  ``null`` is the chain-origin id for
+  // the empty-state branch so re-renders of an empty project don't
+  // re-seed the template on top of operator edits.
+  const lastSyncedRevIdRef = useRef<number | null | "uninit">("uninit");
 
   // Sync the editor buffer when a new revision lands.  Resetting
   // ``dirty`` on revision change means switching to "view a prior
   // revision" doesn't strand the operator's edits across the swap.
   useEffect(() => {
+    if (q.isPending) return;
+    const incomingId = q.data?.id ?? null;
+    if (lastSyncedRevIdRef.current === incomingId) {
+      // Same revision as last sync — likely a same-id refetch (post-
+      // save invalidation, background poll).  Do NOT overwrite the
+      // operator's in-progress edits.
+      return;
+    }
     if (q.data) {
       setDraft(q.data.content);
       setDirty(false);
       setPushError(null);
-    } else if (q.data === null && !q.isPending) {
+    } else if (q.data === null) {
       // No revisions yet — seed the editor with a minimal template
       // so the first push is one keystroke from succeeding.
       setDraft(
@@ -161,6 +179,7 @@ function EditorPanel({
       setDirty(true);   // template needs to be saved
       setPushError(null);
     }
+    lastSyncedRevIdRef.current = incomingId;
   }, [q.data, q.isPending, project]);
 
   const qc = useQueryClient();

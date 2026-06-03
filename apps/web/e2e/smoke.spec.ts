@@ -291,6 +291,37 @@ test.beforeEach(async ({ context }) => {
         }),
       });
     }
+    // Prior-revision per-id GET so the rev-switch test in Phase 9
+    // can verify the editor reloads with the historical bytes.
+    if (path === "/v1/projects/demo/config/6") {
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          id: 6, project_id: "proj_e2e",
+          content_sha256: "feed111122223333444455556666777788889999aaaabbbbccccddddeeeefffe",
+          content: "version: 1\nproject: demo\nproviders:\n  - id: 'mock:m'\n# revision 6 — older config\n",
+          pushed_by: "key_e2e", pushed_at: "2026-05-14T08:00:00",
+        }),
+      });
+    }
+    // Empty-project shape: /v1/projects/freshly-created returns 404
+    // on its /config + history endpoints so the editor's first-push
+    // path (template seed) can be exercised.
+    if (path === "/v1/projects/freshly-created/config") {
+      return route.fulfill({
+        status: 404,
+        contentType: "application/json",
+        body: JSON.stringify({ detail: "No config has been pushed for project 'freshly-created'." }),
+      });
+    }
+    if (path === "/v1/projects/freshly-created/config/history") {
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ configs: [] }),
+      });
+    }
 
     // Fall through to a 404 so an un-mocked endpoint surfaces
     // clearly in the test output (rather than the test hanging
@@ -440,4 +471,42 @@ test("settings → runs → run detail → assets → asset detail → calls →
   await expect(saveButton).toBeEnabled();
   await saveButton.click();
   await expect(page.getByTestId("config-save-ok")).toContainText("deadbeef0000…");
+
+  // 9a. PROXY-4 review-pass — Discard reverts the editor to the
+  // server's stored content and disables Save again.  The post-
+  // save effect-guard MUST hold the operator's draft against the
+  // refetch (a previous revision regressed and overwrote edits).
+  // We type more, then click Discard, then assert the textarea
+  // shows the server content and Save is back to disabled.
+  await editor.focus();
+  await editor.press("End");
+  await editor.pressSequentially(" # again");
+  await expect(saveButton).toBeEnabled();
+  await page.getByRole("button", { name: /^discard$/i }).click();
+  // After discard the editor shows whatever the latest revision
+  // currently is (id=8 from the POST mock).
+  await expect(editor).not.toHaveValue(/# again/);
+  await expect(saveButton).toBeDisabled();
+
+  // 9b. PROXY-4 review-pass — switching to a prior revision via the
+  // history rail reloads the editor with that revision's bytes.
+  // Click row #6 (the older revision in the history mock); the URL
+  // gains ?rev=6, /config/6 is fetched, and the editor shows its
+  // content.
+  const revRow6 = page.locator('[data-testid="config-history-row"][data-rev-id="6"]');
+  await revRow6.click();
+  await expect(editor).toHaveValue(/revision 6 — older config/);
+  await expect(revRow6).toHaveAttribute("aria-pressed", "true");
+
+  // 9c. PROXY-4 review-pass — first-push empty-state for a project
+  // that has never had a config pushed.  Server 404 on GET → editor
+  // seeds a minimal YAML template AND starts with Save enabled (no
+  // existing revision to "match" against — the template is itself
+  // the unsaved draft).
+  await page.goto("/config/?project=freshly-created");
+  await expect(page.getByRole("heading", { name: /^first push$/i })).toBeVisible();
+  const newEditor = page.getByTestId("config-editor");
+  await expect(newEditor).toHaveValue(/version: 1/);
+  await expect(newEditor).toHaveValue(/project: freshly-created/);
+  await expect(page.getByTestId("config-save")).toBeEnabled();
 });
