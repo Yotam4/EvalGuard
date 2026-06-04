@@ -30,7 +30,8 @@ golden set, your own rubric, your own thresholds.
 2. **Each pyramid step is its own control panel.** Every gate has its
    own severity (`block` / `warn` / `log`), aggregation (`pass_rate`,
    `mean`, `pass_rate_by_tag`, …), and threshold. Inspect, configure,
-   and reason about each step in isolation.
+   and reason about each step in isolation. See
+   [`docs/gates.md`](docs/gates.md) for the full reference.
 3. **Python is the escape hatch.** Built-in evaluators cover common
    cases. When they don't fit, register a plugin (`evalguard.evaluators`
    entry-point) or drop a `custom_check: { module: my_pkg:my_func }` on

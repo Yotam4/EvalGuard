@@ -6,6 +6,7 @@ surfaces.
 
 | Doc | Covers |
 |---|---|
+| [gates.md](gates.md) | The gate model — severity, aggregations, threshold types (absolute / relative / t-test), per-tag overrides, custom Python check, `run_mode` short-circuit, `gate_strategy` |
 | [observability.md](observability.md) | Per-call stream (`/calls/`), live timeline + aggregate, OTLP ingest, drift, audit chain (`/audit/events`, `/audit/verify`), sampler |
 | [golden-dataset.md](golden-dataset.md) | Promote-to-golden loop, `/golden/` DB view, `evalguard golden` CLI export |
 
