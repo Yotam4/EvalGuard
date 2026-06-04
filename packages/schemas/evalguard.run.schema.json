@@ -198,7 +198,9 @@
             "evaluator.metric.invoked",
             "evaluator.judge.invoked",
             "gate.evaluated",
-            "gate.custom_check.invoked"
+            "gate.custom_check.invoked",
+            "guardrail.blocked",
+            "guardrail.timeout"
           ]
         },
         "run_id":          { "type": "string" },

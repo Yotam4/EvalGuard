@@ -80,6 +80,16 @@ EVENT_KINDS: dict[str, tuple[str, str | None]] = {
     "evaluator.judge.invoked":   ("Activity", "judge"),
     "gate.evaluated":            ("Activity", "gate"),
     "gate.custom_check.invoked": ("Activity", "custom_check"),
+    # Layer-4 guardrail / judge_online enforcement on the proxy
+    # /invoke path.  ``guardrail.blocked`` fires when an L4 gate
+    # verdict refused the response (with mode=block); ``guardrail.timeout``
+    # fires when an L4 evaluator exceeded its ``timeout_ms`` budget
+    # (and we synthesised a Score per the ``on_timeout`` policy).
+    # Both belong to the project chain; ``subject_id`` carries the
+    # layer-gate id so the audit trail can pin which policy rule
+    # acted.
+    "guardrail.blocked":         ("Activity", "guardrail"),
+    "guardrail.timeout":         ("Activity", "guardrail"),
 }
 
 

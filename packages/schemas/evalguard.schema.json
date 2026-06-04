@@ -90,6 +90,20 @@
         }
       }
     },
+    "guardrails": {
+      "type": "array",
+      "description": "Layer-4 (judge_online) evaluators that run inline on every /invoke. Each entry must declare 'timeout_ms' (how long the evaluator may run before the proxy aborts it) and 'on_timeout' (fail_open releases the request, fail_closed blocks). Both knobs are required - guardrails sit on the production hot path and the fail-mode is too consequential to default. Entry type is resolved via the 'guardrail.<type>' entry-point name.",
+      "items": {
+        "type": "object",
+        "required": ["type", "timeout_ms", "on_timeout"],
+        "properties": {
+          "id":         { "type": "string" },
+          "type":       { "type": "string", "minLength": 1 },
+          "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 60000 },
+          "on_timeout": { "type": "string", "enum": ["fail_open", "fail_closed"] }
+        }
+      }
+    },
     "gates": {
       "type": "array",
       "description": "Legacy global gates. Per-layer gates under top-level 'layers' supersede this; both shapes are accepted simultaneously.",
@@ -183,6 +197,28 @@
           "description": "When true, strip rendered prompts / raw responses / judge reasons from event payloads but keep their content hashes so the chain still verifies."
         }
       }
+    },
+    "refusal_response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "description": "How the proxy returns when a layer-4 guardrail with mode=block refuses a response. 'mode' has no default - the choice between an HTTP-honest refusal and a chatbot-friendly 200 is too consequential to pick for the operator. Required as soon as any 'guardrails:' evaluator is configured.",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["http_error", "http_200_refusal"],
+          "description": "'http_error' returns HTTP 'status' (default 403) with the reason in the body; raw API consumers handle this as a typed error. 'http_200_refusal' returns 200 with the configured 'text' in the response 'output' field and 'blocked_by' populated; chatbot UIs render this as a polite refusal turn."
+        },
+        "status": {
+          "type": "integer", "minimum": 400, "maximum": 499, "default": 403,
+          "description": "Only used when mode == 'http_error'. 403 Forbidden is the default; 451 (legal) is the standards-aligned alternative for policy refusals."
+        },
+        "text": {
+          "type": "string", "minLength": 1,
+          "default": "This response was blocked by the project's guardrail policy.",
+          "description": "Human-readable refusal string. Used as the response 'output' when mode == 'http_200_refusal' and as the body 'detail' when mode == 'http_error'."
+        }
+      }
     }
   },
   "$defs": {
@@ -202,6 +238,18 @@
       "required": ["severity"],
       "properties": {
         "severity":   { "type": "string", "enum": ["block", "warn", "log"] },
+        "mode": {
+          "type": "string", "enum": ["block", "warn", "log"],
+          "description": "Inline-gate dispatch policy used by the layer-4 'judge_online' guardrail on the /invoke path. 'block' refuses the response per the project's 'refusal_response' config; 'warn' annotates the row as failed without blocking; 'log' records the verdict without changing the response. Parallel to 'severity' (which drives batch-shape gate verdicts on completed runs)."
+        },
+        "timeout_ms": {
+          "type": "integer", "minimum": 1, "maximum": 60000,
+          "description": "Per-evaluator timeout for inline (layer-4) dispatch. Falls back to each evaluator's own 'timeout_ms' when set there; this is the layer-wide default."
+        },
+        "on_timeout": {
+          "type": "string", "enum": ["fail_open", "fail_closed"],
+          "description": "What to do when an inline evaluator hits 'timeout_ms'. 'fail_open' lets the request through (industry-standard for inline guardrails - don't degrade live traffic on a guardrail outage). 'fail_closed' refuses per 'mode'. No default - the policy is too consequential to pick for the operator."
+        },
         "aggregation": {
           "type": "string",
           "enum": ["pass_rate", "row_pass_rate", "mean", "p50", "p95", "count_failures", "pass_rate_by_tag"],

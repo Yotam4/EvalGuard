@@ -57,6 +57,7 @@ logger = logging.getLogger("evalguard.api.invoke")
 from evalguard_api.audit_persistence import emit_event
 from evalguard_api.auth import Principal, require_principal
 from evalguard_api.db import apply_rls_context, resolve_project_or_404
+from evalguard_api.guardrails import InlineVerdict, evaluate_inline_gate
 from evalguard_api.live import (
     LiveCallRecord, ensure_live_run, ensure_live_trial,
     parse_provider_id, record_call,
@@ -274,7 +275,7 @@ async def invoke(
     # server at startup.  The dep IS hard-required now (PROXY-2
     # added it to ``apps/api/pyproject.toml``); the laziness is
     # purely a graceful-degradation choice.
-    from evalguard_evaluators.base import EvalContext
+    from evalguard_evaluators.base import EvalContext, Score
     from evalguard_evaluators.registry import load_evaluator, load_provider
 
     try:
@@ -358,6 +359,16 @@ async def invoke(
     # --- evaluators -----------------------------------------------------------
     scores_payload: list[dict[str, Any]] = []
     passed = error is None  # default-pass for vacuous configs; default-fail on provider error
+    # Layer-4 guardrail state — populated only when ``guardrails:`` is
+    # configured AND a guardrail score with the layer's gate mode fires.
+    # ``is_guardrail_blocked`` drives the final status-code branch
+    # (4xx when ``refusal_response.mode == "http_error"``); ``blocked_by``
+    # surfaces on the ``InvokeResponse`` so HTTP-200-refusal clients can
+    # route on which policy fired.
+    is_guardrail_blocked = False
+    guardrail_blocked_by: str | None = None
+    guardrail_reason: str | None = None
+    refusal_status: int = status.HTTP_403_FORBIDDEN
     if error is None:
         ctx = EvalContext(
             row_id=row_id, input=body.input, expected=body.expected,
@@ -365,30 +376,79 @@ async def invoke(
             extra=body.extra or {},
         )
         # Mirror ``local_executor._build_evaluators``: the YAML keys
-        # ``heuristics:`` / ``metrics:`` / ``judges:`` map to entry-
-        # point name prefixes ``heuristic.`` / ``metric.`` / ``judge.``
-        # so a YAML spec ``- type: length`` under ``heuristics:`` loads
-        # the ``heuristic.length`` evaluator.  Without the prefix the
-        # registry lookup fails and we'd silently pass every call.
+        # ``heuristics:`` / ``metrics:`` / ``judges:`` / ``guardrails:``
+        # map to entry-point name prefixes so a YAML spec ``- type:
+        # length`` under ``heuristics:`` loads the ``heuristic.length``
+        # evaluator.  Without the prefix the registry lookup fails and
+        # we'd silently pass every call.  ``guardrails:`` is the
+        # layer-4 (judge_online) seam — evaluators registered there
+        # run inline on every /invoke and a fail+block verdict refuses
+        # the response (see the verdict-application block below).
         ev_specs: list[tuple[str, dict]] = []
         for yaml_key, ep_kind in (("heuristics", "heuristic"),
                                    ("metrics", "metric"),
-                                   ("judges", "judge")):
+                                   ("judges", "judge"),
+                                   ("guardrails", "guardrail")):
             for spec in cfg.get(yaml_key) or []:
                 if isinstance(spec, dict) and isinstance(spec.get("type"), str):
                     ev_specs.append((ep_kind, spec))
 
+        # Layer-wide inline defaults — fall back from per-evaluator
+        # ``timeout_ms`` / ``on_timeout`` to the layer gate's values
+        # when an entry doesn't set its own.  Pull once outside the
+        # loop so we don't re-resolve per evaluator.
+        _layer_judge_online = (cfg.get("layers") or {}).get("judge_online") or {}
+        _layer_timeout_ms = _layer_judge_online.get("timeout_ms")
+        _layer_on_timeout = _layer_judge_online.get("on_timeout")
+
         all_scores = []
+        guardrail_scores: list[Score] = []
         for ep_kind, spec in ev_specs:
             ev_type = spec["type"]
             ep_name = f"{ep_kind}.{ev_type}"
             ev_cfg = {k: v for k, v in spec.items()
                       if k not in {"type", "version_id",
-                                   "schema_version_id", "rubric_version_id"}}
+                                   "schema_version_id", "rubric_version_id",
+                                   "timeout_ms", "on_timeout"}}
             ev_cfg.setdefault("id", ev_type)
+            # Per-evaluator inline knobs.  Only guardrails (layer 4)
+            # actually use these today; L1–L3 evaluators ignore them
+            # because they don't run on the production hot path.  The
+            # schema keeps the knobs scoped to ``guardrails:`` entries
+            # so this lookup only ever finds them there.
+            timeout_ms = spec.get("timeout_ms", _layer_timeout_ms)
+            on_timeout = spec.get("on_timeout", _layer_on_timeout)
             try:
                 ev = load_evaluator(ep_name, ev_cfg)
-                ev_scores = await ev.evaluate(ctx)
+                if ep_kind == "guardrail" and isinstance(timeout_ms, int) and timeout_ms > 0:
+                    # Wrap guardrail dispatch in a hard deadline so a
+                    # slow classifier can't pin the request thread.
+                    # Timeouts are not exceptions in the operator's
+                    # eyes — they're a policy decision (fail_open
+                    # lets the call through, fail_closed refuses) —
+                    # so we synthesise a Score per ``on_timeout``
+                    # below rather than re-raising.
+                    try:
+                        ev_scores = await asyncio.wait_for(
+                            ev.evaluate(ctx), timeout=timeout_ms / 1000.0,
+                        )
+                    except asyncio.TimeoutError:
+                        fail_open = (on_timeout == "fail_open")
+                        synthesised = Score(
+                            evaluator_id=ev_cfg.get("id", ev_type),
+                            evaluator_kind="guardrail",
+                            layer=4,
+                            value=1.0 if fail_open else 0.0,
+                            passed=fail_open,
+                            raw={
+                                "timeout_ms": int(timeout_ms),
+                                "on_timeout": on_timeout,
+                                "synthesised": True,
+                            },
+                        )
+                        ev_scores = [synthesised]
+                else:
+                    ev_scores = await ev.evaluate(ctx)
             except Exception as e:
                 # One broken evaluator must not poison the whole call —
                 # surface as a failed pseudo-score so the operator can
@@ -397,7 +457,7 @@ async def invoke(
                 scores_payload.append({
                     "evaluator_id":   ev_cfg.get("id", ev_type),
                     "evaluator_kind": ep_kind,
-                    "layer":          int(spec.get("layer", 1)),
+                    "layer":          int(spec.get("layer", 4 if ep_kind == "guardrail" else 1)),
                     "value":          0.0,
                     "passed":         False,
                     "raw":            {"error": f"{type(e).__name__}: {e}"},
@@ -414,9 +474,60 @@ async def invoke(
                     "raw":            s.raw,
                 })
                 all_scores.append(s.passed)
+                if s.layer == 4 or s.evaluator_kind == "guardrail":
+                    guardrail_scores.append(s)
         # All-pass aggregation matches the CLI executor (line 597
         # of local_executor.py).  Empty score set = vacuous pass.
         passed = all(all_scores) if all_scores else True
+
+        # --- Layer-4 inline gate verdict ----------------------------
+        # Evaluate the project's ``layers.judge_online`` policy against
+        # the guardrail scores this call produced.  The verdict drives
+        # the refusal-response branch below; non-guardrail layers
+        # (L1–L3) are batch-shaped and not enforced here.
+        guardrail_verdict = evaluate_inline_gate(
+            guardrail_scores,
+            _layer_judge_online,
+            layer_gate_id="judge_online",
+        )
+        if guardrail_scores and not guardrail_verdict.allow:
+            # Block / warn-fail aggregate into the call's ``passed``
+            # flag so ``/calls/?tab=failures`` surfaces the rejection.
+            # Pure ``log`` mode keeps the row in the passing tab —
+            # the operator opted in to observe-only enforcement.
+            passed = False
+        elif guardrail_scores and guardrail_verdict.mode == "warn" and guardrail_verdict.failed_scores:
+            passed = False
+
+        # Apply the refusal-response policy.  ``mode == "block"`` is
+        # the only verdict that mutates the response body / status —
+        # ``warn`` leaves the response intact and ``log`` records
+        # silently.  ``refusal_response`` MUST be present in the
+        # project config when any guardrail is configured (the schema
+        # enforces this at push time), so the lookup below should
+        # always find it; we still tolerate the legacy shape so a
+        # config that pre-dates the L4 rollout doesn't 500.
+        if guardrail_scores and not guardrail_verdict.allow and guardrail_verdict.mode == "block":
+            refusal_cfg = cfg.get("refusal_response") or {}
+            refusal_mode = refusal_cfg.get("mode", "http_error")
+            refusal_text = refusal_cfg.get(
+                "text",
+                "This response was blocked by the project's guardrail policy.",
+            )
+            is_guardrail_blocked = True
+            guardrail_blocked_by = guardrail_verdict.layer_gate_id or "judge_online"
+            guardrail_reason = guardrail_verdict.reason
+            if refusal_mode == "http_200_refusal":
+                # Replace the provider's output with the refusal
+                # string so the row that lands in /calls/ shows what
+                # the customer actually received.
+                output = refusal_text
+            else:
+                # http_error: the existing ``error`` field carries
+                # the rejection reason for /calls/?tab=failures + the
+                # ``provider.called`` audit payload.
+                error = f"guardrail_blocked: {guardrail_verdict.reason or 'policy refused'}"
+                refusal_status = int(refusal_cfg.get("status", status.HTTP_403_FORBIDDEN))
 
     # --- Phase 3: persist (short transaction) ------------------------
     # Conn re-acquired here; provider call ran with no pool slot held.
@@ -481,14 +592,62 @@ async def invoke(
                     "provider":     provider_name,
                     "model":        model,
                     "error":        error,
-                    "is_rate_limited": is_rate_limited,
-                    "is_cost_capped":  is_cost_capped,
+                    "is_rate_limited":     is_rate_limited,
+                    "is_cost_capped":      is_cost_capped,
+                    "is_guardrail_blocked": is_guardrail_blocked,
+                    "blocked_by":          guardrail_blocked_by,
                     "passed":       passed and error is None,
                     "n_scores":     len(scores_payload),
                 },
                 cost_usd=cost_usd,
                 duration_ms=latency_ms,
             )
+            # Layer-4 audit trail: emit one ``guardrail.blocked`` event
+            # per blocked call so the immutable chain records which
+            # policy refused.  ``guardrail.timeout`` follows the same
+            # shape and fires per synthesised timeout score, regardless
+            # of whether the call was ultimately blocked (a fail_open
+            # timeout still merits an audit breadcrumb).
+            if is_guardrail_blocked:
+                emit_event(
+                    conn,
+                    kind="guardrail.blocked",
+                    run_id=run_id,
+                    project_id=project_id,
+                    trial_id=trial_id,
+                    row_id=row_id,
+                    actor_id=principal.key_id,
+                    actor_type="api_key",
+                    subject_id=guardrail_blocked_by or "judge_online",
+                    payload={
+                        "layer_gate_id": guardrail_blocked_by,
+                        "reason":        guardrail_reason,
+                        "refusal_mode":  (cfg.get("refusal_response") or {}).get("mode"),
+                    },
+                )
+            timeout_scores = [
+                s for s in scores_payload
+                if s.get("evaluator_kind") == "guardrail"
+                and isinstance(s.get("raw"), dict)
+                and s["raw"].get("synthesised") is True
+            ]
+            for ts in timeout_scores:
+                emit_event(
+                    conn,
+                    kind="guardrail.timeout",
+                    run_id=run_id,
+                    project_id=project_id,
+                    trial_id=trial_id,
+                    row_id=row_id,
+                    actor_id=principal.key_id,
+                    actor_type="api_key",
+                    subject_id=ts.get("evaluator_id") or "judge_online",
+                    payload={
+                        "evaluator_id": ts.get("evaluator_id"),
+                        "timeout_ms":   ts.get("raw", {}).get("timeout_ms"),
+                        "on_timeout":   ts.get("raw", {}).get("on_timeout"),
+                    },
+                )
             # Post-write cost-cap detection (round-4 ultra-review,
             # Agent-1 B / Agent-3 C).  The Phase-1 cap check is
             # advisory: two concurrent calls can both pass it when
@@ -556,6 +715,14 @@ async def invoke(
         elif is_rate_limited:
             response.status_code = status.HTTP_429_TOO_MANY_REQUESTS
             response.headers["Retry-After"] = "60"
+        elif is_guardrail_blocked:
+            # Project chose ``refusal_response.mode: http_error`` —
+            # surface the configured status (default 403 Forbidden).
+            # The body's ``error`` field carries "guardrail_blocked:
+            # <reason>" so the caller's retry logic can distinguish
+            # policy refusals from upstream failures without parsing
+            # status codes.
+            response.status_code = refusal_status
         else:
             response.status_code = status.HTTP_502_BAD_GATEWAY
 
@@ -564,6 +731,7 @@ async def invoke(
         cost_usd=cost_usd, latency_ms=latency_ms,
         run_id=run_id, trial_id=trial_id, row_id=row_id,
         scores=scores_payload, error=error,
+        blocked_by=guardrail_blocked_by,
     )
 
 

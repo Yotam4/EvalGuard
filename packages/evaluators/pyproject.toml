@@ -27,6 +27,7 @@ textsql = ["sqlglot>=23.0"]
 "metric.lex.context_recall"             = "evalguard_evaluators.metrics.rag:ContextRecallLexMetric"
 "judge.pointwise"          = "evalguard_evaluators.judges.pointwise:PointwiseJudge"
 "judge.mock_pointwise"     = "evalguard_evaluators.judges.pointwise:MockPointwiseJudge"
+"guardrail.mock"           = "evalguard_evaluators.guardrails.mock:MockGuardrail"
 
 [project.entry-points."evalguard.providers"]
 "openai" = "evalguard_evaluators.providers.openai_provider:OpenAIProvider"

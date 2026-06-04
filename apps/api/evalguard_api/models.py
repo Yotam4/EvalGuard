@@ -850,6 +850,15 @@ class InvokeResponse(_Loose):
     row_id:     str
     scores:     list[InvokeScoreOut]
     error:      str | None = None
+    # Layer-4 (judge_online) refusal indicator.  Populated when a
+    # guardrail with mode=block fired and ``refusal_response.mode ==
+    # "http_200_refusal"`` (the caller sees a normal 200 response
+    # with the refusal text in ``output``).  Carries the layer-gate
+    # id that fired so the client can route on the policy that
+    # refused.  ``None`` for non-refusal responses and for the
+    # ``http_error`` refusal mode (in which case the call returned
+    # a 4xx and never built an ``InvokeResponse``).
+    blocked_by: str | None = None
 
 
 # ---------------------------------------------------------------------------

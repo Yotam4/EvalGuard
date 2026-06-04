@@ -24,18 +24,18 @@ class Score:
     """A single evaluator's verdict on one row."""
 
     evaluator_id: str
-    evaluator_kind: str  # "heuristic" | "metric" | "judge"
-    layer: int           # 1..5
-    value: float         # heuristic: 0/1 ; judge: 1..5 (or rubric scale) ; metric: native
+    evaluator_kind: str  # "heuristic" | "metric" | "judge" | "guardrail"
+    layer: int           # 1..5  (4 == guardrail / judge_online)
+    value: float         # heuristic: 0/1 ; judge: 1..5 (or rubric scale) ; metric: native ; guardrail: 0/1 or 0..1
     passed: bool
     raw: dict[str, Any] = field(default_factory=dict)
 
 
 @runtime_checkable
 class Evaluator(Protocol):
-    """All heuristics, metrics, and judges share this protocol."""
+    """All heuristics, metrics, judges, and guardrails share this protocol."""
 
-    kind: str   # "heuristic" | "metric" | "judge" | "agent_metric"
+    kind: str   # "heuristic" | "metric" | "judge" | "agent_metric" | "guardrail"
     layer: int
 
     def configure(self, cfg: dict[str, Any]) -> None: ...
