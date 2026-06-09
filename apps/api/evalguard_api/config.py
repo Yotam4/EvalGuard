@@ -39,6 +39,20 @@ class Settings:
     # When true, install ``HTTPSRedirectMiddleware``. Defaults off so
     # local dev on http://localhost works without flags.
     require_https: bool = False
+    # Allowlist of provider ``base_url`` origins the proxy ``/invoke``
+    # endpoint may dial.  The provider config is tenant-controlled
+    # (pushed via ``POST /v1/projects/{slug}/config``), so an
+    # unrestricted ``base_url`` would let any project member redirect
+    # the server's outbound LLM call to an arbitrary host — an SSRF,
+    # and a credential leak when the provider falls back to the
+    # server's environment API key (e.g. ``OPENAI_API_KEY``).  Empty
+    # by default: no custom ``base_url`` is accepted, so a config that
+    # omits ``base_url`` (the default provider endpoint) is the only
+    # thing that works out of the box.  Operators who route the proxy
+    # at a self-hosted / OpenAI-compatible server set this to an
+    # explicit comma-separated allowlist of full base URLs; only a
+    # request whose scheme+host+port matches one of them is allowed.
+    proxy_allowed_base_urls: tuple[str, ...] = ()
     # Explicit opt-in for open mode (no API key). Defaults to false —
     # missing ``EVALGUARD_API_KEY`` alone now refuses to boot, instead
     # of silently exposing the API. Set ``EVALGUARD_OPEN_MODE=1`` to
@@ -119,6 +133,8 @@ def load_settings() -> Settings:
         cors_origins=cors_origins,
         trusted_hosts=_split_csv(os.environ.get("EVALGUARD_TRUSTED_HOSTS", "*")) or ("*",),
         require_https=os.environ.get("EVALGUARD_REQUIRE_HTTPS", "0") in {"1", "true", "TRUE"},
+        proxy_allowed_base_urls=_split_csv(
+            os.environ.get("EVALGUARD_PROXY_ALLOWED_BASE_URLS", "")),
         open_mode_opt_in=os.environ.get("EVALGUARD_OPEN_MODE", "0") in {"1", "true", "TRUE"},
         bind_host=os.environ.get("EVALGUARD_HOST", Settings.bind_host),
         bind_port=int(os.environ.get("EVALGUARD_PORT", Settings.bind_port)),

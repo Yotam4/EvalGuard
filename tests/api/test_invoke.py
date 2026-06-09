@@ -293,6 +293,119 @@ def test_invoke_unauthenticated_returns_401(client):
 
 
 # ---------------------------------------------------------------------------
+# SSRF / credential-exfiltration guard on a tenant-controlled base_url
+#
+# The provider config is pushed by any project member; an unrestricted
+# ``base_url`` would let that member redirect the server's outbound
+# provider call (and the server's env-held API key) to an arbitrary
+# host.  The proxy only dials origins on the operator's allowlist.
+
+
+def _config_with_base_url(base_url: str, project: str = "default") -> str:
+    return (
+        "version: 1\n"
+        f"project: {project}\n"
+        "providers:\n"
+        "  - id: 'mock:m'\n"
+        f"    config: {{ mode: echo, latency_ms: 0, base_url: '{base_url}' }}\n"
+    )
+
+
+def test_invoke_rejects_custom_base_url_by_default(client, auth_headers):
+    """With no allowlist configured (the default), a config carrying a
+    custom ``base_url`` is refused at invoke time — the server won't
+    dial an arbitrary host."""
+    client.post(
+        "/v1/projects/default/config",
+        json={"content": _config_with_base_url("https://attacker.example/v1")},
+        headers=auth_headers,
+    )
+    r = client.post(
+        "/v1/projects/default/invoke",
+        json={"input": "exfil"},
+        headers=auth_headers,
+    )
+    assert r.status_code == 422, r.text
+    assert "allowlist" in r.json()["detail"].lower()
+
+
+def _client_with_allowlist(tmp_path, allowed):
+    """Build an isolated TestClient whose Settings carry an explicit
+    proxy base-url allowlist."""
+    from fastapi.testclient import TestClient
+    from evalguard_api.config import Settings
+    from evalguard_api.main import build_app
+    from evalguard_api.quotas import reset_rate_limiter
+
+    reset_rate_limiter()
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path}/allow.db",
+        api_key="test-secret",
+        cors_origins=("*",),
+        proxy_allowed_base_urls=tuple(allowed),
+    )
+    return TestClient(build_app(settings=settings))
+
+
+def test_invoke_allows_allowlisted_base_url(tmp_path):
+    """An origin the operator explicitly allowlisted passes the guard
+    and the call proceeds (mock provider ignores base_url, so the
+    request shape stays air-gap clean)."""
+    headers = {"Authorization": "Bearer test-secret"}
+    with _client_with_allowlist(
+        tmp_path, ["https://llm.internal.example:8443/v1"]
+    ) as client:
+        client.post(
+            "/v1/projects/default/config",
+            json={"content": _config_with_base_url(
+                "https://llm.internal.example:8443/v1")},
+            headers=headers,
+        )
+        r = client.post(
+            "/v1/projects/default/invoke",
+            json={"input": "ok"},
+            headers=headers,
+        )
+        assert r.status_code == 200, r.text
+
+
+def test_invoke_rejects_host_not_on_allowlist(tmp_path):
+    """A different host than the allowlisted one is refused even when
+    an allowlist is configured."""
+    headers = {"Authorization": "Bearer test-secret"}
+    with _client_with_allowlist(
+        tmp_path, ["https://llm.internal.example/v1"]
+    ) as client:
+        client.post(
+            "/v1/projects/default/config",
+            json={"content": _config_with_base_url("https://evil.example/v1")},
+            headers=headers,
+        )
+        r = client.post(
+            "/v1/projects/default/invoke",
+            json={"input": "x"},
+            headers=headers,
+        )
+        assert r.status_code == 422, r.text
+
+
+def test_base_url_allowed_rejects_origin_masquerade():
+    """Origin comparison (not raw prefix) defeats both the
+    ``allowed.example.evil.com`` subdomain trick and the
+    ``allowed.example@evil.com`` userinfo trick."""
+    from evalguard_api.routes.invoke import _base_url_allowed
+
+    allowed = ("https://allowed.example/v1",)
+    assert _base_url_allowed("https://allowed.example/v1/chat", allowed)
+    assert not _base_url_allowed("https://allowed.example.evil.com/v1", allowed)
+    assert not _base_url_allowed("https://allowed.example@evil.com/v1", allowed)
+    assert not _base_url_allowed("http://allowed.example/v1", allowed)   # scheme
+    assert not _base_url_allowed("https://allowed.example:8443/v1", allowed)  # port
+    assert not _base_url_allowed("not a url", allowed)
+    assert not _base_url_allowed("https://allowed.example/v1", ())       # empty
+
+
+# ---------------------------------------------------------------------------
 # Review-pass: post-PROXY-2.5 hardening
 
 
