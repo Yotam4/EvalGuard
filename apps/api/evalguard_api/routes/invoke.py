@@ -268,6 +268,34 @@ async def invoke(
     provider_name, model = parse_provider_id(provider_id)
     provider_cfg = provider_spec.get("config") or {}
 
+    # SSRF / credential-exfiltration guard.  ``provider_cfg`` comes
+    # straight from the project's stored config, which any project
+    # member can push (``POST /v1/projects/{slug}/config``).  A
+    # tenant-controlled ``base_url`` would otherwise let that member
+    # redirect the server's outbound provider call to an arbitrary
+    # host — exfiltrating the server's environment API key (the
+    # OpenAI-compatible providers fall back to ``$OPENAI_API_KEY`` /
+    # ``$OLLAMA_HOST`` when the config omits credentials) and reaching
+    # internal-only endpoints (cloud metadata, private services).
+    # Only origins on the operator's explicit allowlist are permitted;
+    # absent the env var the allowlist is empty and any custom
+    # ``base_url`` is rejected (a config without ``base_url`` uses the
+    # provider's safe default endpoint and is unaffected).
+    base_url = provider_cfg.get("base_url")
+    if base_url not in (None, ""):
+        allowed = request.app.state.settings.proxy_allowed_base_urls
+        if not _base_url_allowed(str(base_url), allowed):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    "Provider ``base_url`` is not on the server's allowlist. "
+                    "The proxy refuses to dial an arbitrary host (SSRF / "
+                    "credential-leak protection). Ask the operator to add "
+                    "the URL to EVALGUARD_PROXY_ALLOWED_BASE_URLS, or remove "
+                    "``base_url`` to use the provider's default endpoint."
+                ),
+            )
+
     # Deferred to call time so a misconfigured venv (missing
     # ``evalguard-evaluators`` dep, broken entry-point registration)
     # surfaces as a 422 on /invoke rather than killing the whole
@@ -565,6 +593,41 @@ async def invoke(
         run_id=run_id, trial_id=trial_id, row_id=row_id,
         scores=scores_payload, error=error,
     )
+
+
+def _url_origin(url: str) -> tuple[str, str, int | None] | None:
+    """Return the ``(scheme, host, port)`` origin of ``url`` lowercased,
+    or ``None`` if it can't be parsed into a usable absolute URL.
+
+    Comparison is on the parsed origin — never a raw string prefix —
+    so neither ``https://allowed.example.evil.com`` nor
+    ``https://allowed.example@evil.com`` can masquerade as an
+    allowlisted host.
+    """
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(url.strip())
+    except ValueError:
+        return None
+    if not parts.scheme or not parts.hostname:
+        return None
+    try:
+        port = parts.port
+    except ValueError:
+        # Malformed port (e.g. ``host:notaport``) — treat as unusable
+        # rather than letting it slip past the origin comparison.
+        return None
+    return (parts.scheme.lower(), parts.hostname.lower(), port)
+
+
+def _base_url_allowed(base_url: str, allowed: tuple[str, ...]) -> bool:
+    """True iff ``base_url``'s origin matches one of the allowlisted
+    base URLs' origins.  Empty allowlist ⇒ nothing is allowed."""
+    target = _url_origin(base_url)
+    if target is None:
+        return False
+    return any(_url_origin(entry) == target for entry in allowed)
 
 
 def _to_prompt(value: Any) -> str:
