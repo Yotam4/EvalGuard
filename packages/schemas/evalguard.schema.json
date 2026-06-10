@@ -201,6 +201,43 @@
         }
       }
     },
+    "alerts": {
+      "type": "object",
+      "description": "Rolling-window alert rules.  The cron-driven engine (in the evalguard-evaluator-worker) re-evaluates every rule on a schedule and fires notifiers when a pass-rate window crosses the threshold.  Each rule has a stable id (the object key) and a window/gate/threshold/notify shape.",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["window", "gate", "threshold", "notify"],
+        "additionalProperties": false,
+        "properties": {
+          "description":   { "type": "string" },
+          "window":        { "type": "string", "pattern": "^[0-9]+[mhd]$",
+                             "description": "Rolling-window duration. Forms: 5m, 1h, 24h, 7d." },
+          "gate":          { "type": "string", "enum": ["pass_rate"],
+                             "description": "Which aggregate to evaluate. v1 ships pass_rate; future gates (p95_latency, cost_per_call, failure_count) plug in here." },
+          "threshold":     {
+            "type": "object", "additionalProperties": false,
+            "properties": {
+              "min": { "type": "number", "description": "Fail when observed_value < min." },
+              "max": { "type": "number", "description": "Fail when observed_value > max." }
+            }
+          },
+          "notify":        {
+            "type": "array", "minItems": 1,
+            "items": {
+              "type": "object", "required": ["kind"],
+              "properties": {
+                "kind":   { "type": "string", "description": "Notifier name from the evalguard.notifiers entry-point group (e.g. webhook, mock)." },
+                "config": { "type": "object", "description": "Free-form notifier-specific config (URL, secrets, channel names, ...)." }
+              }
+            }
+          },
+          "min_samples":   { "type": "integer", "minimum": 1, "default": 10,
+                             "description": "Minimum row count in the window before the gate evaluates. Below this, the check skips non-blockingly so a quiet period doesn't fire false alerts." },
+          "suppress_secs": { "type": "integer", "minimum": 0, "default": 600,
+                             "description": "After a pass→fail transition fires, suppress re-fires for this many seconds; the state machine still records suppressed history but emits no notifier." }
+        }
+      }
+    },
     "refusal_response": {
       "type": "object",
       "additionalProperties": false,

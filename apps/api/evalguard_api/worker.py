@@ -45,6 +45,7 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
+from arq import cron
 from arq import create_pool as _arq_create_pool
 from arq.connections import ArqRedis, RedisSettings
 from arq.worker import Worker
@@ -402,6 +403,25 @@ async def _worker_shutdown(ctx: dict[str, Any]) -> None:
         engine.dispose()
 
 
+async def cron_evaluate_alerts(ctx: dict[str, Any]) -> dict[str, Any]:
+    """Cron entry — re-evaluates every project's alert rules.
+
+    Lives on the same Arq worker as ``run_async_evaluator`` so we
+    don't need a second process or scheduler.  Errors per rule are
+    isolated by the engine; this wrapper only handles the worker-
+    level shape.
+    """
+    from evalguard_api.alerts import evaluate_all_alert_rules
+    engine: Engine = ctx["engine"]
+    outcomes = await evaluate_all_alert_rules(engine)
+    return {
+        "checked":   len(outcomes),
+        "fired":     sum(1 for o in outcomes if o.fired),
+        "resolved":  sum(1 for o in outcomes if o.resolved),
+        "suppressed": sum(1 for o in outcomes if o.suppressed),
+    }
+
+
 class WorkerSettings:
     """Arq ``WorkerSettings`` for ``evalguard-evaluator-worker``.
 
@@ -412,6 +432,12 @@ class WorkerSettings:
     """
 
     functions = [run_async_evaluator]
+    # Slice C: re-evaluate every project's alert rules once a minute.
+    # Per-rule windows can be longer (10m, 1h, 24h) — the cron just
+    # decides "is it time to check?", the engine does the actual
+    # window math.  Sub-minute windows aren't supported in v1; if
+    # they ever are, switch to ``cron(..., second={0, 30})``.
+    cron_jobs = [cron(cron_evaluate_alerts, minute=set(range(0, 60)))]
     on_startup = _worker_startup
     on_shutdown = _worker_shutdown
     max_tries = 3
@@ -440,6 +466,7 @@ def main() -> None:
     WorkerSettings.redis_settings = _redis_settings(url)  # type: ignore[attr-defined]
     worker = Worker(
         functions=WorkerSettings.functions,
+        cron_jobs=WorkerSettings.cron_jobs,
         redis_settings=WorkerSettings.redis_settings,  # type: ignore[attr-defined]
         on_startup=WorkerSettings.on_startup,
         on_shutdown=WorkerSettings.on_shutdown,

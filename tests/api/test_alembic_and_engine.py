@@ -122,6 +122,7 @@ def test_alembic_version_recorded(client):
     engine = client.app.state.engine
     with engine.connect() as conn:
         ver = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-    # Head bumps as we ship migrations.  ``0012_event_rows`` adds the
-    # per-event audit chain for proxy ingest — PROXY-3.5 ticket #8.
-    assert ver == "0012_event_rows"
+    # Head bumps as we ship migrations.  ``0013_alerts`` adds the
+    # ``alerts`` + ``alert_state`` tables for the rolling-window
+    # alerting engine — PROXY-3 Slice C.
+    assert ver == "0013_alerts"

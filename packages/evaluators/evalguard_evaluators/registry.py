@@ -10,6 +10,7 @@ from evalguard_evaluators.base import Evaluator, Provider
 
 _EVALUATOR_GROUP = "evalguard.evaluators"
 _PROVIDER_GROUP = "evalguard.providers"
+_NOTIFIER_GROUP = "evalguard.notifiers"
 
 
 # Entry-point discovery is the slowest single op in the hot path —
@@ -32,6 +33,15 @@ def _evaluator_classes() -> dict[str, type[Evaluator]]:
 @lru_cache(maxsize=1)
 def _provider_classes() -> dict[str, type[Provider]]:
     return {ep.name: ep.load() for ep in entry_points(group=_PROVIDER_GROUP)}
+
+
+@lru_cache(maxsize=1)
+def _notifier_classes() -> dict[str, type]:
+    """Notifier plugins from the ``evalguard.notifiers`` entry-point
+    group.  Type kept loose — ``Notifier`` is a Protocol defined in
+    the evaluators subpackage and circular-imports if we pin it
+    here."""
+    return {ep.name: ep.load() for ep in entry_points(group=_NOTIFIER_GROUP)}
 
 
 def iter_evaluators() -> dict[str, type[Evaluator]]:
@@ -66,8 +76,24 @@ def load_provider(name: str, cfg: dict[str, Any]) -> Provider:
     return inst
 
 
+def load_notifier(name: str, cfg: dict[str, Any]) -> Any:
+    cls = _notifier_classes().get(name)
+    if cls is None:
+        raise KeyError(
+            f"unknown notifier '{name}' (available: {sorted(_notifier_classes())})"
+        )
+    inst = cls()
+    inst.configure(cfg)
+    return inst
+
+
+def iter_notifiers() -> dict[str, type]:
+    return dict(_notifier_classes())
+
+
 def reset_registry_cache() -> None:
     """Drop the entry-point caches. Used by tests that install plugins
     via temporary entry points; production code never needs this."""
     _evaluator_classes.cache_clear()
     _provider_classes.cache_clear()
+    _notifier_classes.cache_clear()

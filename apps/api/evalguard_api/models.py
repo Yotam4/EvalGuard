@@ -932,6 +932,33 @@ class AuditEventList(_Loose):
     truncated:    bool = False
 
 
+class AlertEvent(_Loose):
+    """One fired-alert history row.  Returned by
+    ``GET /v1/projects/{slug}/alerts``.
+
+    Loose-shape so future fields (notifier delivery latency,
+    operator acknowledgement) don't break clients pinned to a
+    specific Pydantic version.
+    """
+
+    id:               int
+    project_id:       str
+    rule_id:          str
+    fired_at:         str
+    window_start:     str
+    window_end:       str
+    gate:             str
+    observed_value:   float | None = None
+    threshold:        dict[str, Any] = Field(default_factory=dict)
+    transition:       str
+    suppressed:       bool = False
+    notify_results:   list[dict[str, Any]] = Field(default_factory=list)
+
+
+class AlertList(_Strict):
+    alerts: list[AlertEvent]
+
+
 class AuditVerifyResponse(_Strict):
     """``GET /v1/projects/{slug}/audit/verify`` response.
 

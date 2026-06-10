@@ -98,6 +98,14 @@ EVENT_KINDS: dict[str, tuple[str, str | None]] = {
     # the audit trail records the loss).
     "evaluator.scored_async":    ("Activity", "evaluator"),
     "evaluator.failed_async":    ("Activity", "evaluator"),
+    # Slice C: rolling-window alerting.  ``alert.fired`` is one per
+    # pass→fail transition (suppressed re-checks emit no event);
+    # ``alert.resolved`` is one per fail→pass transition.  Both land
+    # in the project chain with ``run_id = NULL`` because alerts are
+    # cross-run by design (they evaluate rolling windows, not run
+    # boundaries).
+    "alert.fired":               ("Activity", "alert"),
+    "alert.resolved":            ("Activity", "alert"),
 }
 
 

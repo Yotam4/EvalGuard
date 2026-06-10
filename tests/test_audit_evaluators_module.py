@@ -38,6 +38,7 @@ def test_event_kinds_includes_every_lifecycle_kind():
         "gate.evaluated", "gate.custom_check.invoked",
         "guardrail.blocked", "guardrail.timeout",
         "evaluator.scored_async", "evaluator.failed_async",
+        "alert.fired", "alert.resolved",
     }
     assert must_have == set(EVENT_KINDS)
 

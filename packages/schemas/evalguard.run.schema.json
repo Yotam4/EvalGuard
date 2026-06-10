@@ -202,7 +202,9 @@
             "guardrail.blocked",
             "guardrail.timeout",
             "evaluator.scored_async",
-            "evaluator.failed_async"
+            "evaluator.failed_async",
+            "alert.fired",
+            "alert.resolved"
           ]
         },
         "run_id":          { "type": "string" },

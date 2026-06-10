@@ -28,7 +28,7 @@ from __future__ import annotations
 
 from sqlalchemy import (
     Column, ForeignKey, Index, Integer, MetaData, Float,
-    Table, Text, UniqueConstraint, text,
+    PrimaryKeyConstraint, Table, Text, UniqueConstraint, text,
 )
 
 
@@ -387,4 +387,46 @@ event_rows = Table(
           postgresql_where=text("prev_event_hash IS NULL")),
     Index("idx_event_rows_run",  "run_id", "id"),
     Index("idx_event_rows_proj", "project_id", "ingested_at", "id"),
+)
+
+
+# ---------------------------------------------------------------------------
+# Slice C — rolling-window alerting (migration 0013_alerts).
+#
+# ``alerts`` is append-only fired-alert history; ``alert_state`` is the
+# one-row-per-rule dedup tracker the cron worker reads + writes.
+# Project-scoped RLS mirrors the audit-chain pattern; alerts and state
+# rows outlive the runs they describe (forensics + post-mortem use).
+
+
+alerts = Table(
+    "alerts", metadata,
+    Column("id",             Integer, primary_key=True, autoincrement=True),
+    Column("project_id",     Text, nullable=False),
+    Column("rule_id",        Text, nullable=False),
+    Column("fired_at",       Text, nullable=False),
+    Column("window_start",   Text, nullable=False),
+    Column("window_end",     Text, nullable=False),
+    Column("gate",           Text, nullable=False),
+    Column("observed_value", Float),
+    Column("threshold_json", Text),
+    Column("transition",     Text, nullable=False),
+    Column("suppressed",     Integer, nullable=False, server_default="0"),
+    Column("notify_results_json", Text),
+    Index("idx_alerts_project_fired",
+          "project_id", "fired_at", "id"),
+)
+
+
+alert_state = Table(
+    "alert_state", metadata,
+    Column("project_id",         Text, nullable=False),
+    Column("rule_id",            Text, nullable=False),
+    Column("state",              Text, nullable=False,
+           server_default="pass"),
+    Column("last_transition_at", Text),
+    Column("last_fire_at",       Text),
+    Column("last_check_at",      Text),
+    PrimaryKeyConstraint("project_id", "rule_id",
+                         name="pk_alert_state"),
 )
