@@ -369,6 +369,10 @@ async def invoke(
     guardrail_blocked_by: str | None = None
     guardrail_reason: str | None = None
     refusal_status: int = status.HTTP_403_FORBIDDEN
+    # Phase-4 enqueue list — populated only when error is None.  Kept
+    # at function scope so the provider-failure path (where the
+    # evaluator block is skipped) still has a defined symbol.
+    deferred_async: list[tuple[str, dict]] = []
     if error is None:
         ctx = EvalContext(
             row_id=row_id, input=body.input, expected=body.expected,
@@ -403,13 +407,17 @@ async def invoke(
 
         all_scores = []
         guardrail_scores: list[Score] = []
+        # PROXY-3 Slice B: evaluators tagged ``dispatch: async`` skip
+        # inline scoring; we collect them here and enqueue after the
+        # row is persisted (Phase 3) so the queue payload can carry
+        # the row's primary key for the worker's UPDATE.
         for ep_kind, spec in ev_specs:
             ev_type = spec["type"]
             ep_name = f"{ep_kind}.{ev_type}"
             ev_cfg = {k: v for k, v in spec.items()
                       if k not in {"type", "version_id",
                                    "schema_version_id", "rubric_version_id",
-                                   "timeout_ms", "on_timeout"}}
+                                   "timeout_ms", "on_timeout", "dispatch"}}
             ev_cfg.setdefault("id", ev_type)
             # Per-evaluator inline knobs.  Only guardrails (layer 4)
             # actually use these today; L1–L3 evaluators ignore them
@@ -418,6 +426,50 @@ async def invoke(
             # so this lookup only ever finds them there.
             timeout_ms = spec.get("timeout_ms", _layer_timeout_ms)
             on_timeout = spec.get("on_timeout", _layer_on_timeout)
+            dispatch = spec.get("dispatch", "inline")
+            if dispatch == "async":
+                if ep_kind == "guardrail":
+                    # L4 guardrails MUST be inline — they gate the
+                    # response.  An async-dispatched guardrail would
+                    # arrive after the customer already saw the
+                    # output.  Refuse at request time so the operator
+                    # discovers the misconfig immediately.
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail=(
+                            f"Evaluator {ep_name!r} is a layer-4 guardrail; "
+                            f"``dispatch: async`` is not supported (guardrails "
+                            f"must run inline to gate the response)."
+                        ),
+                    )
+                if request.app.state.arq_pool is None:
+                    # Operator opted into async dispatch but no broker
+                    # is available.  Refusing with 503 is louder than
+                    # falling back to inline — the operator chose
+                    # async for a reason.
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail=(
+                            f"Evaluator {ep_name!r} requested ``dispatch: async`` "
+                            f"but the API is running without ``EVALGUARD_REDIS_URL``. "
+                            f"Configure Redis + start the async-evaluator worker, "
+                            f"or change ``dispatch: inline`` in the project config."
+                        ),
+                    )
+                # Record under a pending pseudo-score so the row's
+                # initial ``scores_payload`` shows the deferred entry —
+                # the operator can see "judge.pointwise: pending" in
+                # /calls/ before the async worker lands the real score.
+                scores_payload.append({
+                    "evaluator_id":   ev_cfg.get("id", ev_type),
+                    "evaluator_kind": ep_kind,
+                    "layer":          int(spec.get("layer", 3 if ep_kind == "judge" else 1)),
+                    "value":          0.0,
+                    "passed":         True,    # don't fail the call inline
+                    "raw":            {"dispatch": "async", "pending": True},
+                })
+                deferred_async.append((ep_name, ev_cfg))
+                continue
             try:
                 ev = load_evaluator(ep_name, ev_cfg)
                 if ep_kind == "guardrail" and isinstance(timeout_ms, int) and timeout_ms > 0:
@@ -531,6 +583,7 @@ async def invoke(
 
     # --- Phase 3: persist (short transaction) ------------------------
     # Conn re-acquired here; provider call ran with no pool slot held.
+    row_pk: int | None = None
     rec = LiveCallRecord(
         row_id=row_id, raw_input=body.input, raw_expected=body.expected,
         output=output, passed=passed and error is None,
@@ -551,7 +604,7 @@ async def invoke(
                 conn, run_id=run_id, project_id=project_id,
                 provider_id=provider_id, provider=provider_name, model=model,
             )
-            record_call(
+            row_pk = record_call(
                 conn, run_id=run_id, trial_id=trial_id,
                 project_id=project_id, rec=rec,
             )
@@ -705,6 +758,48 @@ async def invoke(
     # conservative Retry-After so a polite client backs off cleanly
     # (and a misbehaving one is at least labeled correctly in
     # ``/calls/?tab=failures``).  Everything else stays 502.
+    # --- Phase 4: enqueue async evaluators ---------------------------
+    # Runs AFTER Phase 3 so the queue payload can carry the row's
+    # primary key (the worker UPDATEs that row in place when its score
+    # lands).  Enqueue failure is logged + captured in the response's
+    # ``error`` field so the operator notices, but doesn't crash the
+    # call — the inline + guardrail verdicts already shaped the
+    # response.  ``error`` is only set when ``error is None`` (the
+    # upstream call itself succeeded) to avoid mangling provider-
+    # failure messages.
+    if deferred_async and row_pk is not None and error is None:
+        pool = request.app.state.arq_pool
+        from evalguard_api.worker import AsyncEvalJob, job_id_for
+        eval_ctx_payload = {
+            "row_id":   row_id,
+            "input":    body.input,
+            "expected": body.expected,
+            "output":   output,
+            "provider": provider_name,
+            "model":    model,
+            "extra":    body.extra or {},
+        }
+        for ep_name, ev_cfg in deferred_async:
+            job = AsyncEvalJob(
+                project_id=project_id, org_id=principal.org_id,
+                run_id=run_id, trial_id=trial_id, row_id=row_id,
+                row_pk=int(row_pk), ep_name=ep_name, ev_cfg=ev_cfg,
+                eval_context=eval_ctx_payload,
+                actor_key_id=principal.key_id,
+                actor_scopes=list(principal.scopes),
+            )
+            try:
+                await pool.enqueue_job(
+                    "run_async_evaluator", job.as_dict(),
+                    _job_id=job_id_for(row_id, ep_name),
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    '{"evt":"async_enqueue_failed","row_id":%r,'
+                    '"ep_name":%r,"error":%r}',
+                    row_id, ep_name, f"{type(e).__name__}: {e}",
+                )
+
     if error is not None:
         if is_cost_capped:
             # 402 Payment Required is the semantically correct status —

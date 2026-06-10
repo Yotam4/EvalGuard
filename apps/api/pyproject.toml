@@ -17,6 +17,11 @@ dependencies = [
   # same way through the proxy. ``pyyaml`` parses the stored blob.
   "evalguard-evaluators",
   "pyyaml>=6.0",
+  # PROXY-3 Slice B: async evaluator dispatch.  Arq is small and
+  # pure-Python; it pulls in ``redis``.  The dep is hard so the
+  # worker module always imports cleanly; the API only opens an
+  # actual pool when ``EVALGUARD_REDIS_URL`` is set.
+  "arq>=0.25",
 ]
 
 [project.optional-dependencies]
@@ -27,6 +32,10 @@ postgres = ["psycopg[binary]>=3.1"]
 
 [project.scripts]
 evalguard-api = "evalguard_api.main:run"
+# Async evaluator worker — dequeues ``run_async_evaluator`` jobs
+# the API enqueued from ``/invoke`` when an evaluator was tagged
+# ``dispatch: async``.  Requires ``EVALGUARD_REDIS_URL`` set.
+evalguard-evaluator-worker = "evalguard_api.worker:main"
 
 [build-system]
 requires = ["hatchling"]

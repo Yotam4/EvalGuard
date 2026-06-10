@@ -174,14 +174,39 @@ async def lifespan(app: FastAPI):
                     "(from $EVALGUARD_API_KEY).", org_id,
                 )
 
+    # 5. Optional Arq pool for async evaluator dispatch.  When
+    #    ``EVALGUARD_REDIS_URL`` is set, /invoke can enqueue
+    #    ``dispatch: async`` evaluators to a worker process; when
+    #    unset, the same configs are refused with a 503 so the
+    #    operator notices a missing broker rather than silently
+    #    losing scores.  The import is lazy so the optional ``arq``
+    #    runtime dep doesn't load when nobody's using it.
+    arq_pool = None
+    if settings.redis_url:
+        from evalguard_api.worker import create_arq_pool
+        try:
+            arq_pool = await create_arq_pool(settings.redis_url)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "Failed to open Arq pool against %r: %s.  "
+                "Async dispatch will be refused with 503 until "
+                "Redis is reachable.",
+                settings.redis_url, e,
+            )
+            arq_pool = None
+    app.state.arq_pool = arq_pool
+
     logger.info(
-        "EvalGuard API ready · dialect=%s · mode=%s",
+        "EvalGuard API ready · dialect=%s · mode=%s · async=%s",
         engine.dialect.name,
         "open" if settings.is_open_mode else "auth",
+        "on" if arq_pool is not None else "off",
     )
     try:
         yield
     finally:
+        if arq_pool is not None:
+            await arq_pool.aclose()
         engine.dispose()
 
 

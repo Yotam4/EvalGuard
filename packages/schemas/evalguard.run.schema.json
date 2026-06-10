@@ -200,7 +200,9 @@
             "gate.evaluated",
             "gate.custom_check.invoked",
             "guardrail.blocked",
-            "guardrail.timeout"
+            "guardrail.timeout",
+            "evaluator.scored_async",
+            "evaluator.failed_async"
           ]
         },
         "run_id":          { "type": "string" },

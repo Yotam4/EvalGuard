@@ -37,6 +37,7 @@ def test_event_kinds_includes_every_lifecycle_kind():
         "evaluator.judge.invoked",
         "gate.evaluated", "gate.custom_check.invoked",
         "guardrail.blocked", "guardrail.timeout",
+        "evaluator.scored_async", "evaluator.failed_async",
     }
     assert must_have == set(EVENT_KINDS)
 

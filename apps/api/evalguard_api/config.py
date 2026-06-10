@@ -73,6 +73,15 @@ class Settings:
     # safety net for misconfigured collectors emitting orders of
     # magnitude more traces than expected.
     otlp_sample_rate: float = 1.0
+    # Phase PROXY-3 — async evaluator dispatch via Arq + Redis.  When
+    # set, the API creates an Arq pool at startup and ``/invoke`` can
+    # enqueue evaluators tagged ``dispatch: async`` to run in a worker
+    # process (``evalguard-evaluator-worker``).  When empty, configs
+    # that request ``dispatch: async`` are refused at request time
+    # with a 503 — we fail fast rather than silently fall back to
+    # inline (operators who configured async expect it to actually
+    # happen).
+    redis_url: str = ""
 
     @property
     def is_open_mode(self) -> bool:
@@ -134,6 +143,7 @@ def load_settings() -> Settings:
                                               Settings.db_pool_recycle_s)),
         otlp_sample_rate=float(os.environ.get("EVALGUARD_OTLP_SAMPLE_RATE",
                                                Settings.otlp_sample_rate)),
+        redis_url=os.environ.get("EVALGUARD_REDIS_URL", Settings.redis_url),
     )
 
 

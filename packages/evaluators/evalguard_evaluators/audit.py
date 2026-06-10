@@ -90,6 +90,14 @@ EVENT_KINDS: dict[str, tuple[str, str | None]] = {
     # acted.
     "guardrail.blocked":         ("Activity", "guardrail"),
     "guardrail.timeout":         ("Activity", "guardrail"),
+    # Slice B: async evaluator dispatch via the Arq worker.
+    # ``evaluator.scored_async`` fires when the worker successfully
+    # scores a deferred evaluator and lands the score on the row;
+    # ``evaluator.failed_async`` fires when the evaluator raised
+    # OR the persist step failed (the row stays inline-only and
+    # the audit trail records the loss).
+    "evaluator.scored_async":    ("Activity", "evaluator"),
+    "evaluator.failed_async":    ("Activity", "evaluator"),
 }
 
 
